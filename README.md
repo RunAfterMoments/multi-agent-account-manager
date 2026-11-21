@@ -13,6 +13,8 @@
 
 - **原生级多账号隔离**：macOS 使用独立 UUID `WKWebsiteDataStore`，Windows 使用独立 WebView2 `UserDataFolder`，Android 使用独立 WebView `MULTI_PROFILE`。
 - **桌面端快捷切号**：支持 `⌘1~9` / `Ctrl+1~9` 以及 `⌘↑`/`⌘↓`/`⌘[`/`⌘]`（Windows 为 `Ctrl`）快速切换账号。
+- **桌面端账号代理**可在新增账号或「账号设置」中填写。支持 `http://主机:端口` 格式的无认证 HTTP CONNECT 代理，仅作用于该账号的内嵌页面。留空时沿用系统网络设置。Windows 检测到可能覆盖账号代理的 WebView2 参数时会提示并阻止打开该账号。
+- **一键复制 Cookie**支持 macOS、Windows 和 Android。点击账号列表中该账号右侧的复制图标，将服务入口的 Cookie 写入系统剪贴板。桌面端悬停图标可看到「复制 Cookie」。请将 Cookie 当作登录凭据妥善保管。
 - **应用内检查更新**：支持在客户端内检查 GitHub Releases 最新版本、带进度条下载、`SHA-256` 校验及覆盖更新。
 
 ---
@@ -106,7 +108,7 @@
 
 - **客户端检查更新**：桌面端点击左侧栏底部「更新」按钮，Android 端点击右上角下载图标，可检查最新版本并一键下载校验安装；启动后也会静默检查一次并展示红点提醒。
 - **维护者发布新版本**：
-  1. 同步更新 [package.json](package.json)、[src-tauri/Cargo.toml](src-tauri/Cargo.toml) 与 [src-tauri/tauri.conf.json](src-tauri/tauri.conf.json) 中的版本号。
+  1. 同步更新 `package.json`、`package-lock.json`、`src-tauri/Cargo.toml`、`src-tauri/Cargo.lock` 和 `src-tauri/tauri.conf.json` 中的应用版本号。
   2. 提交并推送 `v*` 标签（GitHub Actions 将自动编译三端安装包、生成 `latest.json` 并创建 Release）：
 
      ```bash

@@ -918,6 +918,7 @@ struct WarmDesktopEntry {
   webview_label: String,
   popup_label: Option<String>,
   paint_ready: bool,
+  navigation_reached: bool,
   last_url: Option<Url>,
   captured_identity_hint: Option<String>,
   watcher_running: bool,
@@ -1400,6 +1401,7 @@ impl SessionManager {
     app: &AppHandle,
     raw_provider: &str,
     raw_alias: &str,
+    raw_proxy_url: Option<&str>,
   ) -> Result<ManagerSnapshot, String> {
     let provider_id = ProviderId::parse(raw_provider).ok_or_else(|| "无效的服务标识".to_string())?;
     if !get_provider(provider_id).info.enabled {
@@ -1414,6 +1416,8 @@ impl SessionManager {
     } else {
       (trimmed.to_string(), false)
     };
+    let proxy_url = platform::parse_account_proxy(raw_proxy_url.unwrap_or_default())?
+      .map(|url| platform::format_account_proxy(&url));
 
     let created_key = {
       let mut locked = self.inner.lock().await;
@@ -1436,13 +1440,17 @@ impl SessionManager {
         alias,
         created_at_ms: now_ms(),
         auto_alias,
+        proxy_url,
         avatar_url: None,
         quota_text: None,
         quota_percent: None,
         quota_detail: None,
         auth_state: AuthState::LoggedOut,
       });
-      save_store_atomic(&locked.store_path, &locked.store)?;
+      if let Err(err) = save_store_atomic(&locked.store_path, &locked.store) {
+        locked.store.accounts.pop();
+        return Err(err);
+      }
       locked.selected_provider_id = provider_id;
       AccountKey { provider_id, uuid }
     };
@@ -1450,34 +1458,79 @@ impl SessionManager {
     self.switch_account_internal(app, created_key, false).await
   }
 
-  pub async fn rename_account(
-    &self,
+  pub async fn update_account_settings(
+    self: &Arc<Self>,
     app: &AppHandle,
     raw_provider: &str,
     raw_uuid: &str,
     raw_alias: &str,
+    raw_proxy_url: Option<&str>,
   ) -> Result<ManagerSnapshot, String> {
     let provider_id = ProviderId::parse(raw_provider).ok_or_else(|| "无效的服务标识".to_string())?;
     let uuid = normalize_uuid(raw_uuid).ok_or_else(|| "无效的账号 UUID".to_string())?;
     let alias = raw_alias.trim();
-    if alias.is_empty() {
+    if alias.is_empty() && (raw_proxy_url.is_none() || !platform::SUPPORTS_ACCOUNT_PROXY) {
       return Err("账号别名不能为空".to_string());
     }
+    let proxy_update = raw_proxy_url.map(platform::parse_account_proxy).transpose()?;
 
     let mut locked = self.inner.lock().await;
-    let target = locked
+    let index = locked
       .store
       .accounts
-      .iter_mut()
-      .find(|a| a.provider_id == provider_id && a.uuid == uuid)
-      .ok_or_else(|| "未找到匹配的账号记录，拒绝跨服务改名".to_string())?;
-    target.alias = alias.to_string();
-    target.auto_alias = false;
-    save_store_atomic(&locked.store_path, &locked.store)?;
+      .iter()
+      .position(|a| a.provider_id == provider_id && a.uuid == uuid)
+      .ok_or_else(|| "未找到匹配的账号记录".to_string())?;
+    let mut updated = locked.store.accounts[index].clone();
+    if !alias.is_empty() {
+      updated.alias = alias.to_string();
+      updated.auto_alias = false;
+    }
+    if let Some(proxy) = proxy_update {
+      updated.proxy_url = proxy.map(|url| platform::format_account_proxy(&url));
+    }
+    let proxy_changed = updated.proxy_url != locked.store.accounts[index].proxy_url;
+    if proxy_changed && !locked.conflicts.is_empty() {
+      return Err("请先处理 UUID 归属冲突后再修改代理".to_string());
+    }
+    if updated == locked.store.accounts[index] {
+      return Ok(Self::snapshot_from_locked(&locked));
+    }
+    let previous = std::mem::replace(&mut locked.store.accounts[index], updated);
+    if let Err(err) = save_store_atomic(&locked.store_path, &locked.store) {
+      locked.store.accounts[index] = previous;
+      return Err(err);
+    }
+
+    #[cfg(any(target_os = "macos", windows))]
+    if proxy_changed {
+      let key = AccountKey { provider_id, uuid: uuid.clone() };
+      let was_active = locked.active_slot.as_ref().is_some_and(|slot| slot.account_key == key);
+      locked.prewarm_failed.remove(&key);
+      if let Some(entry) = locked.warm_pool.remove(&key) {
+        Self::close_warm_entry(app, entry);
+      }
+      if was_active {
+        let next_seq = self.current_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        self.hide_foreground_slot(app, next_seq, &mut locked).await;
+        locked.notice = None;
+        let account = locked.store.accounts[index].clone();
+        let app_data_dir = locked.app_data_dir.clone();
+        let view_instance_id = self.view_counter.fetch_add(1, Ordering::SeqCst);
+        drop(locked);
+        return self
+          .open_desktop_session(app, account, app_data_dir, next_seq, view_instance_id, false)
+          .await;
+      }
+    }
 
     if let Some(slot) = &locked.active_slot {
       if slot.committed && slot.account_key.provider_id == provider_id && slot.account_key.uuid == uuid {
-        let title = format!("{} · {}", get_provider(provider_id).info.short_name, alias);
+        let title = format!(
+          "{} · {}",
+          get_provider(provider_id).info.short_name,
+          locked.store.accounts[index].alias
+        );
         #[cfg(desktop)]
         if let Some(main_win) = app.get_window("main") {
           let _ = main_win.set_title(&title);
@@ -1490,6 +1543,110 @@ impl SessionManager {
     }
 
     Ok(Self::snapshot_from_locked(&locked))
+  }
+
+  pub async fn copy_account_cookie(
+    &self,
+    app: &AppHandle,
+    raw_provider: &str,
+    raw_uuid: &str,
+  ) -> Result<(), String> {
+    let provider_id = ProviderId::parse(raw_provider).ok_or_else(|| "无效的服务标识".to_string())?;
+    let uuid = normalize_uuid(raw_uuid).ok_or_else(|| "无效的账号 UUID".to_string())?;
+    let key = AccountKey { provider_id, uuid };
+    let locked = self.inner.lock().await;
+    if !locked.conflicts.is_empty() {
+      return Err("存在 UUID 归属冲突，请先完成归属裁决".to_string());
+    }
+    if locked.store.pending_cleanup.contains(&key)
+      || !locked.store.accounts.iter().any(|account| {
+        account.provider_id == key.provider_id && account.uuid == key.uuid
+      })
+    {
+      return Err("账号归属核对失败，未找到可用的账号".to_string());
+    }
+    let spec = get_provider(provider_id);
+    if !spec.info.enabled {
+      return Err("该服务尚未开放应用内嵌".to_string());
+    }
+    let url = Url::parse(spec.info.entry_url).map_err(|_| "服务入口地址无效".to_string())?;
+
+    #[cfg(target_os = "macos")]
+    {
+      let uuid = Uuid::parse_str(&key.uuid).map_err(|_| "账号资料标识无效".to_string())?;
+      let header = platform::read_macos_cookie_header(app, uuid, url).await?;
+      platform::write_cookie_clipboard(app, header).await
+    }
+    #[cfg(windows)]
+    {
+      let header = self.read_windows_cookie_header(app, &locked, &key, url).await?;
+      platform::write_cookie_clipboard(app, header).await
+    }
+    #[cfg(target_os = "android")]
+    {
+      platform::android::copy_profile_cookie(app, &key.uuid, url.as_str()).await
+    }
+    #[cfg(not(any(target_os = "macos", windows, target_os = "android")))]
+    {
+      let _ = (app, url);
+      Err("当前平台不支持复制 Cookie".to_string())
+    }
+  }
+
+  #[cfg(windows)]
+  async fn read_windows_cookie_header(
+    &self,
+    app: &AppHandle,
+    locked: &InnerState,
+    key: &AccountKey,
+    url: Url,
+  ) -> Result<String, String> {
+    let profile_dir = locked.app_data_dir.join("profiles").join(&key.uuid);
+    let uuid = Uuid::parse_str(&key.uuid).map_err(|_| "账号资料标识无效".to_string())?;
+    let existing = locked.warm_pool.get(key).and_then(|entry| app.get_webview(&entry.webview_label));
+    let temporary = existing.is_none();
+    let webview = match existing {
+      Some(webview) => webview,
+      None => {
+        if !profile_dir.is_dir() {
+          return Err("该账号暂无可复制的 Cookie，请先登录".to_string());
+        }
+        let account = locked.store.accounts.iter().find(|account| {
+          account.provider_id == key.provider_id && account.uuid == key.uuid
+        }).ok_or_else(|| "未找到可用的账号".to_string())?;
+        let proxy = platform::parse_account_proxy(account.proxy_url.as_deref().unwrap_or_default())?;
+        let window = app.get_window("main").ok_or_else(|| "主窗口不存在".to_string())?;
+        let instance_id = self.view_counter.fetch_add(1, Ordering::SeqCst);
+        let builder = tauri::webview::WebviewBuilder::new(
+          format!("cookie-{instance_id}"),
+          tauri::WebviewUrl::External("about:blank".parse().expect("valid blank url")),
+        )
+        .data_directory(profile_dir.clone())
+        .on_navigation(|url| url.as_str() == "about:blank")
+        .focused(false);
+        let builder =
+          platform::with_windows_account_proxy(builder, proxy.as_ref(), &app.config().identifier)?;
+        let (position, size) = Self::initial_hidden_child_rect(&window);
+        window.add_child(builder, position, size)
+          .map_err(|_| "无法打开该账号的会话资料，请重试".to_string())?
+      }
+    };
+
+    let result = async {
+      platform::verify_desktop_profile_binding(&webview, uuid, &profile_dir).await?;
+      let read_view = webview.clone();
+      tauri::async_runtime::spawn_blocking(move || {
+        let cookies = read_view.cookies_for_url(url).map_err(|_| "读取账号 Cookie 失败".to_string())?;
+        Ok(cookies.iter().map(|cookie| format!("{}={}", cookie.name(), cookie.value()))
+          .collect::<Vec<_>>().join("; "))
+      })
+      .await
+      .map_err(|_| "读取账号 Cookie 中断".to_string())?
+    }.await;
+    if temporary {
+      let _ = webview.close();
+    }
+    result
   }
 
   pub async fn remove_account(
@@ -1896,7 +2053,9 @@ impl SessionManager {
               }
             }
           } else {
-            locked.warm_pool.remove(&key);
+            if let Some(entry) = locked.warm_pool.remove(&key) {
+              Self::close_warm_entry(app, entry);
+            }
             let vid = self.view_counter.fetch_add(1, Ordering::SeqCst);
             let dir = locked.app_data_dir.clone();
             DesktopSwitchPlan::CreateCold {
@@ -1969,6 +2128,7 @@ impl SessionManager {
           locked.notice = Some("账号归属核对失败，已回到管理页".to_string());
           return Ok(Self::snapshot_from_locked(&locked));
         };
+        platform::parse_account_proxy(acc.proxy_url.as_deref().unwrap_or_default())?;
         locked.selected_provider_id = key.provider_id;
         locked.notice = None;
         self.hide_foreground_slot(app, next_seq, &mut locked).await;
@@ -1989,6 +2149,7 @@ impl SessionManager {
     key: AccountKey,
     parsed_uuid: Uuid,
     profile_dir: &std::path::Path,
+    proxy_url: Option<&Url>,
     webview_label: &str,
     view_instance_id: u64,
     allow_blank: Arc<AtomicBool>,
@@ -2012,6 +2173,7 @@ impl SessionManager {
     let mgr_for_load = Arc::clone(self);
     let app_for_load = app.clone();
     let key_for_load = key;
+    let handle_page_load = !cfg!(windows) || proxy_url.is_none();
 
     let mut builder = tauri::webview::WebviewBuilder::new(
       webview_label,
@@ -2146,7 +2308,7 @@ impl SessionManager {
       }
     })
     .on_page_load(move |_wv, payload| {
-      if payload.event() != tauri::webview::PageLoadEvent::Finished {
+      if !handle_page_load || payload.event() != tauri::webview::PageLoadEvent::Finished {
         return;
       }
       if payload.url().as_str() == "about:blank" {
@@ -2206,6 +2368,229 @@ impl SessionManager {
   }
 
   #[cfg(desktop)]
+  fn discard_desktop_view_locked(
+    &self,
+    app: &AppHandle,
+    locked: &mut InnerState,
+    key: &AccountKey,
+    view_instance_id: u64,
+    notice: String,
+  ) -> bool {
+    if !Self::is_view_instance_valid(locked, key, view_instance_id) {
+      return false;
+    }
+    if let Some(entry) = locked.warm_pool.remove(key) {
+      Self::close_warm_entry(app, entry);
+    }
+    if locked.active_slot.as_ref().is_some_and(|slot| slot.view_instance_id == view_instance_id) {
+      locked.active_slot = None;
+      self.active_view_id.store(0, Ordering::SeqCst);
+      locked.notice = Some(notice);
+      Self::apply_desktop_layout_locked(app, locked);
+    }
+    true
+  }
+
+  #[cfg(desktop)]
+  #[allow(clippy::too_many_arguments)]
+  async fn attach_desktop_account_webview(
+    self: &Arc<Self>,
+    app: &AppHandle,
+    key: &AccountKey,
+    parsed_uuid: Uuid,
+    profile_dir: &std::path::Path,
+    webview_label: &str,
+    view_instance_id: u64,
+    alive_flag: &Arc<AtomicBool>,
+  ) -> Result<(), String> {
+    let main_win = app.get_window("main").ok_or_else(|| "主窗口不存在".to_string())?;
+    let (init_pos, init_size) = Self::initial_hidden_child_rect(&main_win);
+    #[cfg(windows)]
+    let retry_until = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+
+    loop {
+      let proxy_url = {
+        let locked = self.inner.lock().await;
+        if !Self::is_view_instance_valid(&locked, key, view_instance_id) {
+          return Ok(());
+        }
+        let account = locked
+          .store
+          .accounts
+          .iter()
+          .find(|account| account.provider_id == key.provider_id && account.uuid == key.uuid)
+          .ok_or_else(|| "账号不存在，已阻止加载".to_string())?;
+        platform::parse_account_proxy(account.proxy_url.as_deref().unwrap_or_default())?
+      };
+      let builder = self.build_desktop_account_webview(
+        app,
+        key.clone(),
+        parsed_uuid,
+        profile_dir,
+        proxy_url.as_ref(),
+        webview_label,
+        view_instance_id,
+        Arc::new(AtomicBool::new(true)),
+        Arc::clone(alive_flag),
+      );
+      #[cfg(windows)]
+      let builder =
+        platform::with_windows_account_proxy(builder, proxy_url.as_ref(), &app.config().identifier)?;
+      let result = main_win.add_child(builder, init_pos, init_size);
+
+      match result {
+        Ok(webview) => {
+          let _ = webview.hide();
+          return self.navigate_desktop_account(app, &webview, key, view_instance_id).await;
+        }
+        #[cfg(windows)]
+        Err(err) if platform::windows_webview_options_in_use(&err) => {
+          if tokio::time::Instant::now() >= retry_until {
+            return Err("该账号的旧 WebView2 会话尚未退出，请稍后重新打开账号".to_string());
+          }
+          tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        }
+        Err(err) => return Err(format!("创建独立账号视图失败: {err}")),
+      }
+    }
+  }
+
+  #[cfg(desktop)]
+  async fn navigate_desktop_account(
+    self: &Arc<Self>,
+    app: &AppHandle,
+    webview: &tauri::Webview,
+    key: &AccountKey,
+    view_instance_id: u64,
+  ) -> Result<(), String> {
+    let (proxy_url, uuid, profile_dir) = {
+      let locked = self.inner.lock().await;
+      if !Self::is_view_instance_valid(&locked, key, view_instance_id) {
+        drop(locked);
+        let _ = webview.close();
+        return Ok(());
+      }
+      let account = locked
+        .store
+        .accounts
+        .iter()
+        .find(|account| account.provider_id == key.provider_id && account.uuid == key.uuid)
+        .ok_or_else(|| "账号不存在，已阻止加载".to_string())?;
+      let proxy_url = platform::parse_account_proxy(account.proxy_url.as_deref().unwrap_or_default())?;
+      let uuid = Uuid::parse_str(&key.uuid).map_err(|err| format!("非法 UUID: {err}"))?;
+      let profile_dir = locked.app_data_dir.join("profiles").join(&key.uuid);
+      (proxy_url, uuid, profile_dir)
+    };
+    let uses_proxy = proxy_url.is_some();
+
+    platform::verify_desktop_profile_binding(webview, uuid, &profile_dir).await?;
+    #[cfg(target_os = "macos")]
+    platform::configure_desktop_proxy(webview, proxy_url).await?;
+    #[cfg(target_os = "macos")]
+    if uses_proxy {
+      let mgr = Arc::clone(self);
+      let app = app.clone();
+      let key = key.clone();
+      platform::on_macos_navigation_failed(webview, move || {
+        let mgr = Arc::clone(&mgr);
+        let app = app.clone();
+        let key = key.clone();
+        tauri::async_runtime::spawn(async move {
+          mgr
+            .fail_initial_proxy_load(
+              &app,
+              key,
+              view_instance_id,
+              "页面加载失败，请检查该账号的代理地址和连接",
+            )
+            .await;
+        });
+      })
+      .await?;
+    }
+    #[cfg(windows)]
+    if uses_proxy {
+      let mgr = Arc::clone(self);
+      let app = app.clone();
+      let key = key.clone();
+      platform::on_windows_navigation_completed(webview, move |result| {
+        let mgr = Arc::clone(&mgr);
+        let app = app.clone();
+        let key = key.clone();
+        tauri::async_runtime::spawn(async move {
+          match result {
+            Ok(url) => mgr.wait_paint_and_finalize_desktop(&app, key, view_instance_id, url).await,
+            Err(()) => {
+              mgr.fail_initial_proxy_load(
+                &app,
+                key,
+                view_instance_id,
+                "页面加载失败，请检查该账号的代理地址和连接",
+              )
+              .await;
+            }
+          }
+        });
+      })
+      .await?;
+    }
+
+    let entry_url = get_provider(key.provider_id)
+      .info
+      .entry_url
+      .parse()
+      .map_err(|err| format!("服务入口地址错误: {err}"))?;
+    {
+      let locked = self.inner.lock().await;
+      if !Self::is_view_instance_valid(&locked, key, view_instance_id) {
+        drop(locked);
+        let _ = webview.close();
+        return Ok(());
+      }
+    }
+    webview.navigate(entry_url).map_err(|err| format!("导航到服务入口失败: {err}"))?;
+
+    if uses_proxy {
+      let mgr = Arc::clone(self);
+      let app = app.clone();
+      let key = key.clone();
+      tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        mgr.fail_initial_proxy_load(
+          &app,
+          key,
+          view_instance_id,
+          "页面加载超时，请检查该账号的代理地址和连接",
+        )
+        .await;
+      });
+    }
+    Ok(())
+  }
+
+  #[cfg(desktop)]
+  async fn fail_initial_proxy_load(
+    &self,
+    app: &AppHandle,
+    key: AccountKey,
+    view_instance_id: u64,
+    notice: &str,
+  ) {
+    let mut locked = self.inner.lock().await;
+    if locked
+      .warm_pool
+      .get(&key)
+      .is_some_and(|entry| entry.paint_ready || entry.navigation_reached)
+    {
+      return;
+    }
+    if self.discard_desktop_view_locked(app, &mut locked, &key, view_instance_id, notice.to_owned()) {
+      locked.prewarm_failed.insert(key);
+      self.emit_snapshot(app, &Self::snapshot_from_locked(&locked));
+    }
+  }
+
+  #[cfg(desktop)]
   async fn open_desktop_session(
     self: &Arc<Self>,
     app: &AppHandle,
@@ -2230,12 +2615,7 @@ impl SessionManager {
     #[cfg(windows)]
     std::fs::create_dir_all(&profile_dir).map_err(|e| format!("创建资料目录失败: {e}"))?;
 
-    let main_win = app
-      .get_window("main")
-      .ok_or_else(|| "主窗口不存在".to_string())?;
-
     let webview_label = format!("account-{view_instance_id}");
-    let allow_blank = Arc::new(AtomicBool::new(true));
     let alive_flag = Arc::new(AtomicBool::new(true));
     let key = AccountKey {
       provider_id: account.provider_id,
@@ -2246,6 +2626,9 @@ impl SessionManager {
       let mut locked = self.inner.lock().await;
       if self.current_seq.load(Ordering::SeqCst) != expected_seq {
         return Ok(Self::snapshot_from_locked(&locked));
+      }
+      if let Some(entry) = locked.warm_pool.remove(&key) {
+        Self::close_warm_entry(app, entry);
       }
       locked.active_slot = Some(ActiveSessionSlot {
         account_key: key.clone(),
@@ -2262,6 +2645,7 @@ impl SessionManager {
           webview_label: webview_label.clone(),
           popup_label: None,
           paint_ready: false,
+          navigation_reached: false,
           last_url: None,
           captured_identity_hint: None,
           watcher_running: false,
@@ -2272,73 +2656,14 @@ impl SessionManager {
       Self::evict_warm_pool_if_needed(app, &mut locked, Some(&key), MAX_WARM_DESKTOP_VIEWS);
     }
 
-    let builder = self.build_desktop_account_webview(
-      app,
-      key.clone(),
-      parsed_uuid,
-      &profile_dir,
-      &webview_label,
-      view_instance_id,
-      allow_blank,
-      Arc::clone(&alive_flag),
-    );
-
-    let (init_pos, init_size) = Self::initial_hidden_child_rect(&main_win);
-    let created_wv = match main_win.add_child(builder, init_pos, init_size) {
-      Ok(wv) => wv,
-      Err(err) => {
-        alive_flag.store(false, Ordering::SeqCst);
-        let mut locked = self.inner.lock().await;
-        locked.warm_pool.remove(&key);
-        if self.current_seq.load(Ordering::SeqCst) == expected_seq {
-          locked.active_slot = None;
-          self.active_view_id.store(0, Ordering::SeqCst);
-          locked.notice = Some(format!("创建独立账号视图失败: {err}"));
-          Self::apply_desktop_layout_locked(app, &locked);
-        }
-        return Ok(Self::snapshot_from_locked(&locked));
-      }
-    };
-    let _ = created_wv.hide();
-
-    if let Err(verify_err) =
-      platform::verify_desktop_profile_binding(&created_wv, parsed_uuid, &profile_dir).await
-    {
-      alive_flag.store(false, Ordering::SeqCst);
-      let _ = created_wv.close();
+    let result = self
+      .attach_desktop_account_webview(
+        app, &key, parsed_uuid, &profile_dir, &webview_label, view_instance_id, &alive_flag,
+      )
+      .await;
+    if let Err(err) = result {
       let mut locked = self.inner.lock().await;
-      locked.warm_pool.remove(&key);
-      if self.current_seq.load(Ordering::SeqCst) == expected_seq {
-        locked.active_slot = None;
-        self.active_view_id.store(0, Ordering::SeqCst);
-        locked.notice = Some(verify_err);
-        Self::apply_desktop_layout_locked(app, &locked);
-      }
-      return Ok(Self::snapshot_from_locked(&locked));
-    }
-
-    if !alive_flag.load(Ordering::SeqCst) {
-      let _ = created_wv.close();
-      return Ok(self.get_snapshot().await);
-    }
-
-    let entry_url: Url = get_provider(account.provider_id)
-      .info
-      .entry_url
-      .parse()
-      .map_err(|e| format!("服务入口地址错误: {e}"))?;
-
-    if let Err(nav_err) = created_wv.navigate(entry_url) {
-      alive_flag.store(false, Ordering::SeqCst);
-      let _ = created_wv.close();
-      let mut locked = self.inner.lock().await;
-      locked.warm_pool.remove(&key);
-      if self.current_seq.load(Ordering::SeqCst) == expected_seq {
-        locked.active_slot = None;
-        self.active_view_id.store(0, Ordering::SeqCst);
-        locked.notice = Some(format!("导航到服务入口失败: {nav_err}"));
-        Self::apply_desktop_layout_locked(app, &locked);
-      }
+      self.discard_desktop_view_locked(app, &mut locked, &key, view_instance_id, err);
       return Ok(Self::snapshot_from_locked(&locked));
     }
 
@@ -2380,9 +2705,10 @@ impl SessionManager {
     }
 
     let wv_label_opt = {
-      let locked = self.inner.lock().await;
-      locked.warm_pool.get(&key).and_then(|e| {
+      let mut locked = self.inner.lock().await;
+      locked.warm_pool.get_mut(&key).and_then(|e| {
         if e.view_instance_id == view_instance_id {
+          e.navigation_reached = true;
           Some((e.webview_label.clone(), e.paint_ready))
         } else {
           None
@@ -2436,19 +2762,8 @@ impl SessionManager {
     {
       let snap = {
         let mut locked = self.inner.lock().await;
-        if let Some(entry) = locked.warm_pool.remove(&key) {
-          Self::close_warm_entry(app, entry);
-        }
-        let is_fg = locked
-          .active_slot
-          .as_ref()
-          .map(|s| s.account_key == key && s.view_instance_id == view_instance_id)
-          .unwrap_or(false);
-        if is_fg {
-          locked.active_slot = None;
-          self.active_view_id.store(0, Ordering::SeqCst);
-          locked.notice = Some(err);
-          Self::apply_desktop_layout_locked(app, &locked);
+        if !self.discard_desktop_view_locked(app, &mut locked, &key, view_instance_id, err) {
+          return;
         }
         Self::snapshot_from_locked(&locked)
       };
@@ -2579,12 +2894,17 @@ impl SessionManager {
 
     let view_instance_id = self.view_counter.fetch_add(1, Ordering::SeqCst);
     let webview_label = format!("account-{view_instance_id}");
-    let allow_blank = Arc::new(AtomicBool::new(true));
     let alive_flag = Arc::new(AtomicBool::new(true));
 
     {
       let mut locked = self.inner.lock().await;
-      if locked.warm_pool.contains_key(&key) || locked.warm_pool.len() >= MAX_WARM_DESKTOP_VIEWS {
+      if locked.warm_pool.contains_key(&key)
+        || locked.store.pending_cleanup.contains(&key)
+        || locked.warm_pool.len() >= MAX_WARM_DESKTOP_VIEWS
+        || !locked.store.accounts.iter().any(|record| {
+          record.provider_id == key.provider_id && record.uuid == key.uuid
+        })
+      {
         return Ok(());
       }
       locked.warm_pool.insert(
@@ -2595,6 +2915,7 @@ impl SessionManager {
           webview_label: webview_label.clone(),
           popup_label: None,
           paint_ready: false,
+          navigation_reached: false,
           last_url: None,
           captured_identity_hint: None,
           watcher_running: false,
@@ -2604,66 +2925,16 @@ impl SessionManager {
       );
     }
 
-    let builder = self.build_desktop_account_webview(
-      app,
-      key.clone(),
-      parsed_uuid,
-      &profile_dir,
-      &webview_label,
-      view_instance_id,
-      allow_blank,
-      Arc::clone(&alive_flag),
-    );
-
-    let sync_res = (|| {
-      let main_win = app.get_window("main").ok_or_else(|| "主窗口不存在".to_string())?;
-      let (init_pos, init_size) = Self::initial_hidden_child_rect(&main_win);
-      let created_wv = main_win
-        .add_child(builder, init_pos, init_size)
-        .map_err(|err| format!("创建预热视图失败: {err}"))?;
-      let _ = created_wv.hide();
-      Ok(platform::verify_desktop_profile_binding(
-        &created_wv,
-        parsed_uuid,
-        &profile_dir,
-      ))
-    })();
-
-    let verify_fut = match sync_res {
-      Ok(fut) => fut,
-      Err(err) => {
-        alive_flag.store(false, Ordering::SeqCst);
-        let mut locked = self.inner.lock().await;
-        locked.warm_pool.remove(&key);
+    let result = self
+      .attach_desktop_account_webview(
+        app, &key, parsed_uuid, &profile_dir, &webview_label, view_instance_id, &alive_flag,
+      )
+      .await;
+    if let Err(err) = result {
+      let mut locked = self.inner.lock().await;
+      if self.discard_desktop_view_locked(app, &mut locked, &key, view_instance_id, err.clone()) {
         return Err(err);
       }
-    };
-
-    if let Err(err) = verify_fut.await {
-      alive_flag.store(false, Ordering::SeqCst);
-      if let Some(wv) = app.get_webview(&webview_label) {
-        let _ = wv.close();
-      }
-      let mut locked = self.inner.lock().await;
-      locked.warm_pool.remove(&key);
-      return Err(format!("验证预热隔离失败: {err}"));
-    }
-
-    if !alive_flag.load(Ordering::SeqCst) {
-      if let Some(wv) = app.get_webview(&webview_label) {
-        let _ = wv.close();
-      }
-      return Ok(());
-    }
-
-    let entry_url: Url = get_provider(account.provider_id)
-      .info
-      .entry_url
-      .parse()
-      .map_err(|e| format!("服务入口地址错误: {e}"))?;
-
-    if let Some(wv) = app.get_webview(&webview_label) {
-      let _ = wv.navigate(entry_url);
     }
 
     Ok(())

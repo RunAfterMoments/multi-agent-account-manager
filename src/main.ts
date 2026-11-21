@@ -13,10 +13,12 @@ import type {
   UpdateProgressEvent,
 } from "./types";
 
+type AccountDraft = { draft: string; proxyDraft: string; error?: string; saving?: boolean };
+
 type ModalMode =
   | { kind: "none" }
-  | { kind: "add"; providerId: ProviderId; draft: string }
-  | { kind: "rename"; account: AccountRecord; draft: string }
+  | ({ kind: "add"; providerId: ProviderId } & AccountDraft)
+  | ({ kind: "rename"; account: AccountRecord } & AccountDraft)
   | { kind: "remove"; account: AccountRecord }
   | { kind: "update" };
 
@@ -37,6 +39,7 @@ let modal: ModalMode = { kind: "none" };
 let optimisticSwitching: AccountKey | null = null;
 let busy = false;
 let lastRenderedUpdateStage: string | null = null;
+const copyingCookies = new Set<string>();
 
 const updateState: {
   checking: boolean;
@@ -425,8 +428,8 @@ async function callCommand(
   cmd: string,
   args: Record<string, unknown> = {},
   optimisticTarget: AccountKey | null = null
-): Promise<void> {
-  if (busy) return;
+): Promise<boolean> {
+  if (busy) return false;
   busy = true;
   saveScrollPosition();
   if (optimisticTarget) {
@@ -439,10 +442,17 @@ async function callCommand(
   }
   try {
     snapshot = await invoke<ManagerSnapshot>(cmd, args);
+    return true;
   } catch (err) {
-    if (snapshot) {
+    if (
+      (cmd === "add_account" && modal.kind === "add") ||
+      (cmd === "rename_account" && modal.kind === "rename")
+    ) {
+      modal.error = String(err);
+    } else if (snapshot) {
       snapshot = { ...snapshot, notice: String(err) };
     }
+    return false;
   } finally {
     optimisticSwitching = null;
     busy = false;
@@ -567,36 +577,39 @@ function renderUpdateModal(): string {
   `;
 }
 
-function renderModal(provider: ProviderInfo): string {
+function supportsAccountProxy(platform: ManagerSnapshot["platform"]): boolean {
+  return platform === "macos" || platform === "windows";
+}
+
+function renderModal(provider: ProviderInfo, platform: ManagerSnapshot["platform"]): string {
   if (modal.kind === "none") return "";
   if (modal.kind === "update") {
     return renderUpdateModal();
   }
-  if (modal.kind === "add") {
+  if (modal.kind === "add" || modal.kind === "rename") {
+    const creating = modal.kind === "add";
+    const saving = Boolean(modal.saving);
+    const supportsProxy = supportsAccountProxy(platform);
+    const title = creating
+      ? `新增 ${escapeHtml(provider.shortName)} 账号`
+      : supportsProxy ? "账号设置" : "修改备注名称";
+    const aliasPlaceholder = creating
+      ? "备注名称（留空则自动获取登录邮箱）"
+      : supportsProxy ? "备注名称（留空保留原备注）" : "输入新的备注名称";
     return `
       <div class="inline-modal" role="dialog" aria-modal="true">
         <div class="modal-card">
-          <div class="modal-title">新增 ${escapeHtml(provider.shortName)} 账号</div>
-          <div class="modal-desc">每个账号拥有独立隔离的登录态。备注可留空，登录成功后将自动显示邮箱名称。</div>
-          <input id="modal-alias-input" class="modal-input" maxlength="60" placeholder="备注名称（留空则自动获取登录邮箱）" value="${escapeHtml(modal.draft)}" />
+          <div class="modal-title">${title}</div>
+          <input id="modal-alias-input" class="modal-input" maxlength="60" placeholder="${aliasPlaceholder}" aria-label="备注名称" value="${escapeHtml(modal.draft)}" ${saving ? "disabled" : ""} />
+          ${supportsProxy ? `
+            <label class="modal-desc" for="modal-proxy-input">HTTP CONNECT 代理（留空使用系统网络）</label>
+            <input id="modal-proxy-input" class="modal-input" maxlength="512" placeholder="http://127.0.0.1:7890" value="${escapeHtml(modal.proxyDraft)}" autocomplete="off" spellcheck="false" ${saving ? "disabled" : ""} />
+            <div class="modal-hint">仅作用于内嵌页面；外部浏览器登录与更新检查不走此代理。</div>
+          ` : ""}
+          ${modal.error ? `<div id="modal-error-box" class="update-error-box" role="alert">${escapeHtml(modal.error)}</div>` : ""}
           <div class="modal-footer">
-            <button id="modal-cancel-btn" class="btn" type="button">取消</button>
-            <button id="modal-confirm-btn" class="btn primary" type="button">创建并打开</button>
-          </div>
-        </div>
-      </div>
-    `;
-  }
-  if (modal.kind === "rename") {
-    return `
-      <div class="inline-modal" role="dialog" aria-modal="true">
-        <div class="modal-card">
-          <div class="modal-title">修改备注名称</div>
-          <div class="modal-desc">仅更新本机列表中的显示名称，不影响已登录的官方会话。</div>
-          <input id="modal-alias-input" class="modal-input" maxlength="60" placeholder="输入新的备注名称" value="${escapeHtml(modal.draft)}" />
-          <div class="modal-footer">
-            <button id="modal-cancel-btn" class="btn" type="button">取消</button>
-            <button id="modal-confirm-btn" class="btn primary" type="button">保存</button>
+            <button id="modal-cancel-btn" class="btn" type="button" ${saving ? "disabled" : ""}>取消</button>
+            <button id="modal-confirm-btn" class="btn primary" type="button" ${saving ? "disabled" : ""}>${saving ? (creating ? "创建中..." : "保存中...") : (creating ? "创建并打开" : "保存")}</button>
           </div>
         </div>
       </div>
@@ -620,6 +633,8 @@ function renderMiddleContent(state: ManagerSnapshot, provider: ProviderInfo): st
   const providerAccounts = state.accounts.filter((a) => a.providerId === provider.id);
   const switchingKey = effectiveSwitchingKey(state);
   const isAndroid = state.platform === "android";
+  const supportsProxy = supportsAccountProxy(state.platform);
+  const supportsCookieCopy = supportsProxy || isAndroid;
 
   const noticeHtml = state.notice
     ? `
@@ -702,6 +717,10 @@ function renderMiddleContent(state: ManagerSnapshot, provider: ProviderInfo): st
           !isAndroid && idx < 9
             ? `<span class="shortcut-pill" title="快捷切号">${isMac ? "⌘" : "^"}${idx + 1}</span>`
             : "";
+        const proxyBadgeHtml =
+          supportsProxy && acc.proxyUrl
+            ? `<span class="proxy-pill" title="代理：${escapeHtml(acc.proxyUrl)}">代理</span>`
+            : "";
         const alertBadgeHtml = isLoggedOut
           ? `<span class="auth-status-badge">未登录</span>`
           : alertStatus !== "normal"
@@ -773,12 +792,18 @@ function renderMiddleContent(state: ManagerSnapshot, provider: ProviderInfo): st
                 <div class="account-alias-row">
                   <span class="account-alias">${escapeHtml(acc.alias)}</span>
                   ${shortcutHint}
+                  ${proxyBadgeHtml}
                   ${alertBadgeHtml}
                 </div>
                 ${compactSubHtml}
               </div>
               <div class="row-ops">
-                <button class="action-icon-btn" data-rename-uuid="${escapeHtml(acc.uuid)}" title="修改备注" type="button">${ICON_EDIT}</button>
+                ${supportsCookieCopy ? `
+                  <button class="action-icon-btn copy-cookie-btn" data-copy-cookie-uuid="${escapeHtml(acc.uuid)}" data-copy-label="复制 Cookie" aria-label="复制 Cookie" type="button">
+                    <span class="copy-cookie-icon" aria-hidden="true"></span>
+                  </button>
+                ` : ""}
+                <button class="action-icon-btn" data-rename-uuid="${escapeHtml(acc.uuid)}" title="${supportsProxy ? "账号设置" : "修改备注"}" type="button">${ICON_EDIT}</button>
                 <button class="action-icon-btn danger" data-remove-uuid="${escapeHtml(acc.uuid)}" title="从本机移除" type="button">${ICON_TRASH}</button>
               </div>
             </div>
@@ -806,7 +831,7 @@ function renderMiddleContent(state: ManagerSnapshot, provider: ProviderInfo): st
     ${noticeHtml}
     ${conflictsHtml}
     <div class="account-list">${listBody}</div>
-    ${renderModal(provider)}
+    ${renderModal(provider, state.platform)}
   `;
 }
 
@@ -863,6 +888,17 @@ function renderRightStage(state: ManagerSnapshot, provider: ProviderInfo): strin
 function render(): void {
   const root = document.querySelector<HTMLElement>("#app");
   if (!root || !snapshot) return;
+
+  const focusedInput = document.activeElement;
+  const accountInputSelection = focusedInput instanceof HTMLInputElement &&
+    (focusedInput.id === "modal-alias-input" || focusedInput.id === "modal-proxy-input")
+    ? {
+        id: focusedInput.id,
+        start: focusedInput.selectionStart,
+        end: focusedInput.selectionEnd,
+        direction: focusedInput.selectionDirection,
+      }
+    : null;
 
   const provider = currentProvider(snapshot);
   const isAndroid = snapshot.platform === "android";
@@ -928,6 +964,15 @@ function render(): void {
   }
 
   bindEvents(snapshot, provider);
+  if (accountInputSelection) {
+    const input = document.querySelector<HTMLInputElement>(`#${accountInputSelection.id}`);
+    input?.focus({ preventScroll: true });
+    input?.setSelectionRange(
+      accountInputSelection.start,
+      accountInputSelection.end,
+      accountInputSelection.direction ?? undefined
+    );
+  }
 }
 
 function bindEvents(state: ManagerSnapshot, provider: ProviderInfo): void {
@@ -959,7 +1004,7 @@ function bindEvents(state: ManagerSnapshot, provider: ProviderInfo): void {
   });
 
   const openAddModal = async () => {
-    await setModal({ kind: "add", providerId: provider.id, draft: "" });
+    await setModal({ kind: "add", providerId: provider.id, draft: "", proxyDraft: "" });
   };
   document.querySelector("#add-account-btn")?.addEventListener("click", openAddModal);
   document.querySelector("#stage-add-btn")?.addEventListener("click", openAddModal);
@@ -1005,6 +1050,38 @@ function bindEvents(state: ManagerSnapshot, provider: ProviderInfo): void {
     });
   });
 
+  document.querySelectorAll<HTMLButtonElement>("[data-copy-cookie-uuid]").forEach((button) => {
+    let feedbackTimer: number | undefined;
+    button.addEventListener("click", async (event) => {
+      event.stopPropagation();
+      const uuid = button.dataset.copyCookieUuid;
+      if (!uuid) return;
+      const copyKey = `${provider.id}:${uuid}`;
+      if (copyingCookies.has(copyKey)) return;
+      copyingCookies.add(copyKey);
+      window.clearTimeout(feedbackTimer);
+      button.classList.remove("copied");
+      button.dataset.copyLabel = "复制中…";
+      try {
+        await invoke<void>("copy_account_cookie", { providerId: provider.id, uuid });
+        button.dataset.copyLabel = "已复制 Cookie";
+        button.classList.add("copied");
+        feedbackTimer = window.setTimeout(() => {
+          button.classList.remove("copied");
+          button.dataset.copyLabel = "复制 Cookie";
+        }, 1800);
+      } catch (err) {
+        button.dataset.copyLabel = "复制 Cookie";
+        if (snapshot?.selectedProviderId === provider.id) {
+          snapshot = { ...snapshot, notice: String(err) };
+          rerenderPreservingScroll();
+        }
+      } finally {
+        copyingCookies.delete(copyKey);
+      }
+    });
+  });
+
   document.querySelectorAll<HTMLElement>("[data-rename-uuid]").forEach((btn) => {
     btn.addEventListener("click", async (ev) => {
       ev.stopPropagation();
@@ -1015,6 +1092,7 @@ function bindEvents(state: ManagerSnapshot, provider: ProviderInfo): void {
           kind: "rename",
           account: acc,
           draft: acc.autoAlias ? "" : acc.alias,
+          proxyDraft: acc.proxyUrl ?? "",
         });
       }
     });
@@ -1054,45 +1132,68 @@ function bindEvents(state: ManagerSnapshot, provider: ProviderInfo): void {
     });
   });
 
-  const aliasInput = document.querySelector<HTMLInputElement>("#modal-alias-input");
-  aliasInput?.addEventListener("input", () => {
-    if (modal.kind === "add" || modal.kind === "rename") {
-      modal.draft = aliasInput.value;
-    }
-  });
-  aliasInput?.addEventListener("keydown", async (ev) => {
-    if (ev.key === "Enter") {
-      ev.preventDefault();
-      document.querySelector<HTMLButtonElement>("#modal-confirm-btn")?.click();
-    } else if (ev.key === "Escape") {
-      ev.preventDefault();
-      await setModal({ kind: "none" });
-    }
+  document.querySelectorAll<HTMLInputElement>("#modal-alias-input, #modal-proxy-input").forEach((input) => {
+    input.addEventListener("input", () => {
+      if (modal.kind === "add" || modal.kind === "rename") {
+        if (input.id === "modal-proxy-input") {
+          modal.proxyDraft = input.value;
+        } else {
+          modal.draft = input.value;
+        }
+        if (modal.error) {
+          modal.error = undefined;
+          document.querySelector("#modal-error-box")?.remove();
+        }
+      }
+    });
+    input.addEventListener("keydown", async (ev) => {
+      if (ev.key === "Enter" && !ev.isComposing) {
+        ev.preventDefault();
+        document.querySelector<HTMLButtonElement>("#modal-confirm-btn")?.click();
+      } else if (ev.key === "Escape") {
+        if ((modal.kind === "add" || modal.kind === "rename") && modal.saving) return;
+        ev.preventDefault();
+        await setModal({ kind: "none" });
+      }
+    });
   });
 
   document.querySelector("#modal-cancel-btn")?.addEventListener("click", async () => {
     if (modal.kind === "update" && updateState.installing) return;
+    if ((modal.kind === "add" || modal.kind === "rename") && modal.saving) return;
     await setModal({ kind: "none" });
   });
 
   document.querySelector("#modal-confirm-btn")?.addEventListener("click", async () => {
     const currentModal = modal;
-    if (currentModal.kind === "add") {
+    if (currentModal.kind === "add" || currentModal.kind === "rename") {
+      if (currentModal.saving) return;
+      const supportsProxy = supportsAccountProxy(state.platform);
       const alias = currentModal.draft.trim();
-      await setModal({ kind: "none" });
-      await callCommand("add_account", {
-        providerId: currentModal.providerId,
-        alias,
-      });
-    } else if (currentModal.kind === "rename") {
-      const alias = currentModal.draft.trim();
-      if (!alias) return;
-      await setModal({ kind: "none" });
-      await callCommand("rename_account", {
-        providerId: currentModal.account.providerId,
-        uuid: currentModal.account.uuid,
-        alias,
-      });
+      const proxyUrl = supportsProxy ? currentModal.proxyDraft.trim() : undefined;
+      if (currentModal.kind === "rename" && !supportsProxy && !alias) return;
+      currentModal.error = undefined;
+      currentModal.saving = true;
+      render();
+      let saved = false;
+      try {
+        saved = currentModal.kind === "add"
+          ? await callCommand("add_account", { providerId: currentModal.providerId, alias, proxyUrl })
+          : await callCommand("rename_account", {
+            providerId: currentModal.account.providerId,
+            uuid: currentModal.account.uuid,
+            alias,
+            proxyUrl,
+          });
+      } finally {
+        currentModal.saving = false;
+        if (modal === currentModal && !saved) {
+          render();
+        }
+      }
+      if (saved && modal === currentModal) {
+        await setModal({ kind: "none" });
+      }
     } else if (currentModal.kind === "remove") {
       await setModal({ kind: "none" });
       await callCommand("remove_account", {

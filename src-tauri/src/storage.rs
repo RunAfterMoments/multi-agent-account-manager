@@ -57,6 +57,8 @@ pub struct AccountRecord {
   #[serde(default)]
   pub auto_alias: bool,
   #[serde(default)]
+  pub proxy_url: Option<String>,
+  #[serde(default)]
   pub avatar_url: Option<String>,
   #[serde(default)]
   pub quota_text: Option<String>,
@@ -206,6 +208,12 @@ fn migrate_from_value(root: Value) -> Result<(AccountsStoreFile, bool), String> 
         .or_else(|| item_obj.get("auto_alias"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+      let proxy_url = item_obj
+        .get("proxyUrl")
+        .or_else(|| item_obj.get("proxy_url"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
       let avatar_url = item_obj
         .get("avatarUrl")
         .or_else(|| item_obj.get("avatar_url"))
@@ -249,6 +257,7 @@ fn migrate_from_value(root: Value) -> Result<(AccountsStoreFile, bool), String> 
         alias,
         created_at_ms,
         auto_alias,
+        proxy_url,
         avatar_url,
         quota_text,
         quota_percent,
@@ -385,5 +394,52 @@ pub fn load_or_migrate_store(path: &Path) -> LoadedAccountsStore {
     store,
     conflicts: Vec::new(),
     startup_notice: None,
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::migrate_from_value;
+  use serde_json::json;
+
+  #[test]
+  fn migrate_proxy_url_accepts_camel_snake_and_malformed_types() {
+    let raw = json!({
+      "version": 2,
+      "accounts": [
+        {
+          "providerId": "muse",
+          "uuid": "00000000-0000-4000-8000-000000000001",
+          "alias": "camel",
+          "proxyUrl": " http://127.0.0.1:7890 "
+        },
+        {
+          "providerId": "muse",
+          "uuid": "00000000-0000-4000-8000-000000000002",
+          "alias": "snake",
+          "proxy_url": "http://127.0.0.1:8888"
+        },
+        {
+          "providerId": "muse",
+          "uuid": "00000000-0000-4000-8000-000000000003",
+          "alias": "null_and_empty",
+          "proxyUrl": null,
+          "proxy_url": "   "
+        },
+        {
+          "providerId": "muse",
+          "uuid": "00000000-0000-4000-8000-000000000004",
+          "alias": "bad_type",
+          "proxyUrl": 12345
+        }
+      ]
+    });
+
+    let (store, _) = migrate_from_value(raw).expect("migrate should tolerate malformed proxyUrl");
+    assert_eq!(store.accounts.len(), 4);
+    assert_eq!(store.accounts[0].proxy_url.as_deref(), Some("http://127.0.0.1:7890"));
+    assert_eq!(store.accounts[1].proxy_url.as_deref(), Some("http://127.0.0.1:8888"));
+    assert_eq!(store.accounts[2].proxy_url, None);
+    assert_eq!(store.accounts[3].proxy_url, None);
   }
 }

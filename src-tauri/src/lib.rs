@@ -29,8 +29,9 @@ async fn add_account(
   mgr: State<'_, Arc<SessionManager>>,
   provider_id: String,
   alias: String,
+  proxy_url: Option<String>,
 ) -> Result<ManagerSnapshot, String> {
-  mgr.add_account(&app, &provider_id, &alias).await
+  mgr.add_account(&app, &provider_id, &alias, proxy_url.as_deref()).await
 }
 
 #[tauri::command]
@@ -40,8 +41,25 @@ async fn rename_account(
   provider_id: String,
   uuid: String,
   alias: String,
+  proxy_url: Option<String>,
 ) -> Result<ManagerSnapshot, String> {
-  mgr.rename_account(&app, &provider_id, &uuid, &alias).await
+  mgr
+    .update_account_settings(&app, &provider_id, &uuid, &alias, proxy_url.as_deref())
+    .await
+}
+
+#[tauri::command]
+async fn copy_account_cookie(
+  app: AppHandle,
+  mgr: State<'_, Arc<SessionManager>>,
+  webview: tauri::Webview,
+  provider_id: String,
+  uuid: String,
+) -> Result<(), String> {
+  if webview.label() != "manager" {
+    return Err("仅账号管理页可以复制 Cookie".to_string());
+  }
+  mgr.copy_account_cookie(&app, &provider_id, &uuid).await
 }
 
 #[tauri::command]
@@ -203,6 +221,7 @@ pub fn run() {
       select_provider,
       add_account,
       rename_account,
+      copy_account_cookie,
       remove_account,
       switch_account,
       set_modal_active,

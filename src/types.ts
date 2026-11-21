@@ -35,6 +35,7 @@ export interface AccountRecord {
   alias: string;
   createdAtMs: number;
   autoAlias: boolean;
+  proxyUrl: string | null;
   avatarUrl: string | null;
   quotaText: string | null;
   quotaPercent: number | null;

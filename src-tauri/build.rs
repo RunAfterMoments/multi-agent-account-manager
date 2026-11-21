@@ -3,6 +3,7 @@ const APP_COMMANDS: &[&str] = &[
   "select_provider",
   "add_account",
   "rename_account",
+  "copy_account_cookie",
   "remove_account",
   "switch_account",
   "set_modal_active",
