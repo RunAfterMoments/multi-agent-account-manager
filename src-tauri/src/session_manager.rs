@@ -8,9 +8,9 @@ use crate::storage::{
   AccountRecord, AccountsStoreFile, AuthState, ConflictItem, QuotaDetail,
 };
 use serde::Serialize;
-use std::collections::HashMap;
 #[cfg(desktop)]
-use std::collections::HashSet;
+use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -24,6 +24,8 @@ pub const APP_TITLE: &str = "叠号";
 const LEFT_PANE_WIDTH: f64 = 380.0;
 #[cfg(desktop)]
 const MAX_WARM_DESKTOP_VIEWS: usize = 6;
+#[cfg(desktop)]
+const MAX_CONCURRENT_PREWARMS: usize = 2;
 
 #[cfg(desktop)]
 const LOGIN_CAPTURE_INIT_JS: &str = r#"(() => {
@@ -487,16 +489,15 @@ const LOGIN_CAPTURE_INIT_JS: &str = r#"(() => {
       }
       const OrigWS = window.WebSocket;
       if (typeof OrigWS === 'function') {
-        const WrappedWS = function(...args) {
-          const ws = new OrigWS(...args);
-          ws.addEventListener('message', (ev) => {
-            if (typeof ev.data === 'string') inspectText(ev.data);
-          });
-          return ws;
-        };
-        WrappedWS.prototype = OrigWS.prototype;
-        Object.assign(WrappedWS, OrigWS);
-        window.WebSocket = WrappedWS;
+        window.WebSocket = new Proxy(OrigWS, {
+          construct(target, args, newTarget) {
+            const ws = Reflect.construct(target, args, newTarget);
+            ws.addEventListener('message', (ev) => {
+              if (typeof ev.data === 'string') inspectText(ev.data);
+            });
+            return ws;
+          }
+        });
       }
     }
     const capture = (el) => {
@@ -624,7 +625,7 @@ const IDENTITY_PROBE_JS: &str = r#"(() => {
       return JSON.stringify({ auth: false, loggedOut: true, typed: typed || phone, email: '', avatar: '', quotaText: '', quotaPct: null, quotaDetail: null, pendingHotkey });
     };
     const makeLoading = () => JSON.stringify({ auth: false, loggedOut: false, typed: typed || phone, email: '', avatar: '', quotaText: '', quotaPct: null, quotaDetail: null, pendingHotkey });
-    if (document.readyState !== 'complete') {
+    if (document.readyState === 'loading') {
       return makeLoading();
     }
     const loginInputs = document.querySelectorAll('input[type="email"], input[type="password"], input[autocomplete="one-time-code"], input[placeholder*="邮箱"], input[placeholder*="手机"], input[placeholder*="email" i], input[placeholder*="phone" i]');
@@ -659,6 +660,9 @@ const IDENTITY_PROBE_JS: &str = r#"(() => {
     const bodyText = (document.body && document.body.innerText) || '';
     if (!hasChatComposer && /登录或创建账户|Log in or sign up|Sign in to|登录以继续|通过 Google 继续|Continue with Google|通过 Apple 继续|Continue with Apple/i.test(bodyText)) {
       return makeLoggedOut();
+    }
+    if (document.readyState !== 'complete') {
+      return makeLoading();
     }
 
     const extractAvatar = () => {
@@ -903,6 +907,16 @@ pub struct ManagerSnapshot {
   pub modal_active: bool,
 }
 
+#[cfg(desktop)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloadNoticeEvent {
+  pub id: u64,
+  pub filename: String,
+  pub status: &'static str,
+  pub error: Option<String>,
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct PendingExternalAuth {
@@ -922,6 +936,7 @@ struct WarmDesktopEntry {
   last_url: Option<Url>,
   captured_identity_hint: Option<String>,
   watcher_running: bool,
+  probe_notify: Arc<tokio::sync::Notify>,
   last_used_ms: u64,
   alive_flag: Arc<AtomicBool>,
 }
@@ -956,6 +971,10 @@ pub struct SessionManager {
   active_view_id: Arc<AtomicU64>,
   view_counter: AtomicU64,
   last_sync_timestamp: AtomicU64,
+  #[cfg(desktop)]
+  download_counter: AtomicU64,
+  #[cfg(desktop)]
+  recent_downloads: std::sync::Mutex<HashMap<u64, PathBuf>>,
   inner: Mutex<InnerState>,
 }
 
@@ -976,6 +995,10 @@ impl SessionManager {
       active_view_id: Arc::new(AtomicU64::new(0)),
       view_counter: AtomicU64::new(1),
       last_sync_timestamp: AtomicU64::new(0),
+      #[cfg(desktop)]
+      download_counter: AtomicU64::new(1),
+      #[cfg(desktop)]
+      recent_downloads: std::sync::Mutex::new(HashMap::new()),
       inner: Mutex::new(InnerState {
         store_path,
         app_data_dir,
@@ -1101,6 +1124,7 @@ impl SessionManager {
       }
     };
 
+    let had_startup_candidate = candidate.is_some();
     if let Some(key) = candidate {
       let _ = self.switch_account_internal(app, key, true).await;
     } else {
@@ -1111,8 +1135,12 @@ impl SessionManager {
     let mgr_prewarm = Arc::clone(self);
     let app_prewarm = app.clone();
     tauri::async_runtime::spawn(async move {
-      tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+      tokio::time::sleep(std::time::Duration::from_millis(600)).await;
       mgr_prewarm.prewarm_next_cold_account(&app_prewarm).await;
+      if !had_startup_candidate {
+        tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+        mgr_prewarm.prewarm_next_cold_account(&app_prewarm).await;
+      }
     });
   }
 
@@ -1158,6 +1186,7 @@ impl SessionManager {
   #[cfg(desktop)]
   fn close_warm_entry(app: &AppHandle, entry: WarmDesktopEntry) {
     entry.alive_flag.store(false, Ordering::SeqCst);
+    entry.probe_notify.notify_one();
     if let Some(popup_label) = entry.popup_label {
       if let Some(popup_win) = app.get_webview_window(&popup_label) {
         let _ = popup_win.close();
@@ -1280,8 +1309,11 @@ impl SessionManager {
     let Ok(scale) = main_win.scale_factor() else {
       return;
     };
-    let win_w = (phys_size.width as f64) / scale;
-    let win_h = (phys_size.height as f64) / scale;
+    let (win_w, win_h) = (
+      (phys_size.width as f64) / scale,
+      (phys_size.height as f64) / scale,
+    );
+    let _ = (win_w, win_h);
 
     let active_committed_label = locked.active_slot.as_ref().and_then(|slot| {
       if slot.committed {
@@ -1303,23 +1335,23 @@ impl SessionManager {
     }
 
     if let Some(active_label) = active_committed_label {
-      let left_w = win_w.min(LEFT_PANE_WIDTH);
-      let right_w = (win_w - left_w).max(0.0);
+      let left_phys = ((LEFT_PANE_WIDTH * scale).round().max(0.0) as u32).min(phys_size.width);
+      let right_phys = phys_size.width.saturating_sub(left_phys);
 
       if let Some(mgr_wv) = app.get_webview("manager") {
         let _ = mgr_wv.set_bounds(tauri::Rect {
-          position: tauri::LogicalPosition::new(0.0, 0.0).into(),
-          size: tauri::LogicalSize::new(left_w, win_h).into(),
+          position: tauri::PhysicalPosition::new(0, 0).into(),
+          size: tauri::PhysicalSize::new(left_phys, phys_size.height).into(),
         });
       }
 
       if let Some(acc_wv) = app.get_webview(&active_label) {
-        if right_w <= 1.0 {
+        if right_phys <= 1 {
           let _ = acc_wv.hide();
         } else {
           let _ = acc_wv.set_bounds(tauri::Rect {
-            position: tauri::LogicalPosition::new(left_w, 0.0).into(),
-            size: tauri::LogicalSize::new(right_w, win_h).into(),
+            position: tauri::PhysicalPosition::new(left_phys as i32, 0).into(),
+            size: tauri::PhysicalSize::new(right_phys, phys_size.height).into(),
           });
           let _ = acc_wv.show();
         }
@@ -1332,8 +1364,8 @@ impl SessionManager {
       }
     } else if let Some(mgr_wv) = app.get_webview("manager") {
       let _ = mgr_wv.set_bounds(tauri::Rect {
-        position: tauri::LogicalPosition::new(0.0, 0.0).into(),
-        size: tauri::LogicalSize::new(win_w, win_h).into(),
+        position: tauri::PhysicalPosition::new(0, 0).into(),
+        size: tauri::PhysicalSize::new(phys_size.width, phys_size.height).into(),
       });
     }
   }
@@ -1627,8 +1659,10 @@ impl SessionManager {
         let builder =
           platform::with_windows_account_proxy(builder, proxy.as_ref(), &app.config().identifier)?;
         let (position, size) = Self::initial_hidden_child_rect(&window);
-        window.add_child(builder, position, size)
-          .map_err(|_| "无法打开该账号的会话资料，请重试".to_string())?
+        let webview = window.add_child(builder, position, size)
+          .map_err(|_| "无法打开该账号的会话资料，请重试".to_string())?;
+        let _ = webview.hide();
+        webview
       }
     };
 
@@ -1724,6 +1758,86 @@ impl SessionManager {
     }
 
     Ok(self.get_snapshot().await)
+  }
+
+  pub async fn reorder_accounts(
+    &self,
+    raw_provider: &str,
+    ordered_uuids: Vec<String>,
+  ) -> Result<ManagerSnapshot, String> {
+    let provider_id = ProviderId::parse(raw_provider).ok_or_else(|| "无效的服务标识".to_string())?;
+    let mut locked = self.inner.lock().await;
+    if !locked.conflicts.is_empty() {
+      return Err("存在 UUID 归属冲突，请先处理冲突后再调整顺序".to_string());
+    }
+
+    let slot_indices: Vec<usize> = locked
+      .store
+      .accounts
+      .iter()
+      .enumerate()
+      .filter_map(|(idx, acc)| (acc.provider_id == provider_id).then_some(idx))
+      .collect();
+
+    if ordered_uuids.len() != slot_indices.len() {
+      return Err("账号数量变化，请刷新后重试".to_string());
+    }
+
+    let existing_by_uuid: HashMap<String, usize> = slot_indices
+      .iter()
+      .map(|&idx| (locked.store.accounts[idx].uuid.clone(), idx))
+      .collect();
+
+    let mut seen = HashSet::with_capacity(ordered_uuids.len());
+    let mut reordered = Vec::with_capacity(ordered_uuids.len());
+    for raw_uuid in ordered_uuids {
+      let uuid = normalize_uuid(&raw_uuid).ok_or_else(|| "无效的账号 UUID".to_string())?;
+      if !seen.insert(uuid.clone()) {
+        return Err("存在重复的账号排序项".to_string());
+      }
+      let &src_idx = existing_by_uuid
+        .get(&uuid)
+        .ok_or_else(|| "账号列表已变更，请刷新后重试".to_string())?;
+      reordered.push(locked.store.accounts[src_idx].clone());
+    }
+
+    let unchanged = slot_indices
+      .iter()
+      .zip(reordered.iter())
+      .all(|(&idx, record)| locked.store.accounts[idx].uuid == record.uuid);
+    if unchanged {
+      return Ok(Self::snapshot_from_locked(&locked));
+    }
+
+    let previous = locked.store.accounts.clone();
+    for (slot_idx, record) in slot_indices.into_iter().zip(reordered.into_iter()) {
+      locked.store.accounts[slot_idx] = record;
+    }
+    if let Err(err) = save_store_atomic(&locked.store_path, &locked.store) {
+      locked.store.accounts = previous;
+      return Err(err);
+    }
+
+    Ok(Self::snapshot_from_locked(&locked))
+  }
+
+  pub async fn reveal_downloaded_file(&self, download_id: u64) -> Result<(), String> {
+    #[cfg(desktop)]
+    {
+      let path = self
+        .recent_downloads
+        .lock()
+        .unwrap()
+        .get(&download_id)
+        .cloned()
+        .ok_or_else(|| "未找到对应的下载文件记录".to_string())?;
+      platform::reveal_path_in_file_manager(&path)
+    }
+    #[cfg(not(desktop))]
+    {
+      let _ = download_id;
+      Err("当前平台不支持打开本地文件夹".to_string())
+    }
   }
 
   pub async fn set_modal_active(
@@ -1946,6 +2060,7 @@ impl SessionManager {
         InstantWarm {
           view_instance_id: u64,
           need_identity_watcher: bool,
+          probe_notify: Arc<tokio::sync::Notify>,
         },
         AwaitWarmLoading {
           view_instance_id: u64,
@@ -1990,13 +2105,18 @@ impl SessionManager {
 
           let warm_state = locked.warm_pool.get(&key).and_then(|entry| {
             if app.get_webview(&entry.webview_label).is_some() {
-              Some((entry.view_instance_id, entry.paint_ready, entry.watcher_running))
+              Some((
+                entry.view_instance_id,
+                entry.paint_ready,
+                entry.watcher_running,
+                Arc::clone(&entry.probe_notify),
+              ))
             } else {
               None
             }
           });
 
-          if let Some((vid, paint_ready, watcher_running)) = warm_state {
+          if let Some((vid, paint_ready, watcher_running, probe_notify)) = warm_state {
             if paint_ready {
               let prev_last = locked.store.last_committed.clone();
               locked.store.last_committed = Some(key.clone());
@@ -2034,6 +2154,7 @@ impl SessionManager {
                 DesktopSwitchPlan::InstantWarm {
                   view_instance_id: vid,
                   need_identity_watcher: need_watcher,
+                  probe_notify,
                 }
               }
             } else {
@@ -2072,9 +2193,12 @@ impl SessionManager {
         DesktopSwitchPlan::InstantWarm {
           view_instance_id,
           need_identity_watcher,
+          probe_notify,
         } => {
           if need_identity_watcher {
-            self.spawn_desktop_identity_watcher(app.clone(), key, view_instance_id);
+            self.spawn_desktop_identity_watcher(app.clone(), key, view_instance_id, probe_notify);
+          } else {
+            probe_notify.notify_one();
           }
           Ok(self.get_snapshot().await)
         }
@@ -2142,6 +2266,110 @@ impl SessionManager {
   }
 
   #[cfg(desktop)]
+  fn extract_download_filename(path: Option<&std::path::Path>, url: &Url) -> String {
+    if let Some(name) = path
+      .and_then(|p| p.file_name())
+      .and_then(|s| s.to_str())
+      .map(str::trim)
+      .filter(|s| !s.is_empty())
+    {
+      return name.to_string();
+    }
+    url
+      .path_segments()
+      .and_then(|mut segments| segments.rfind(|s| !s.is_empty()))
+      .filter(|s| !s.is_empty())
+      .unwrap_or("下载文件")
+      .to_string()
+  }
+
+  #[cfg(desktop)]
+  fn record_recent_download(&self, download_id: u64, path: PathBuf) {
+    let mut recent = self.recent_downloads.lock().unwrap();
+    recent.insert(download_id, path);
+    while recent.len() > 32 {
+      if let Some(&oldest_id) = recent.keys().min() {
+        recent.remove(&oldest_id);
+      } else {
+        break;
+      }
+    }
+  }
+
+  #[cfg(desktop)]
+  fn handle_desktop_download_event(
+    &self,
+    app: &AppHandle,
+    pending: &std::sync::Mutex<HashMap<String, VecDeque<(u64, PathBuf)>>>,
+    event: tauri::webview::DownloadEvent<'_>,
+  ) -> bool {
+    match event {
+      tauri::webview::DownloadEvent::Requested { url, destination } => {
+        let download_id = self.download_counter.fetch_add(1, Ordering::SeqCst);
+        let filename = Self::extract_download_filename(Some(destination.as_path()), &url);
+        pending
+          .lock()
+          .unwrap()
+          .entry(url.as_str().to_string())
+          .or_default()
+          .push_back((download_id, destination.clone()));
+        let _ = app.emit(
+          "download-event",
+          DownloadNoticeEvent {
+            id: download_id,
+            filename,
+            status: "started",
+            error: None,
+          },
+        );
+        true
+      }
+      tauri::webview::DownloadEvent::Finished { url, path, success } => {
+        let entry = {
+          let mut map = pending.lock().unwrap();
+          let popped = map.get_mut(url.as_str()).and_then(VecDeque::pop_front);
+          if map.get(url.as_str()).is_some_and(VecDeque::is_empty) {
+            map.remove(url.as_str());
+          }
+          popped
+        };
+        let (download_id, fallback_path) = match entry {
+          Some((id, dest)) => (id, Some(dest)),
+          None => (self.download_counter.fetch_add(1, Ordering::SeqCst), None),
+        };
+        let final_path = path.or(fallback_path);
+        let filename = Self::extract_download_filename(final_path.as_deref(), &url);
+        if success {
+          if let Some(saved_path) = final_path {
+            self.record_recent_download(download_id, saved_path);
+          }
+          let _ = app.emit(
+            "download-event",
+            DownloadNoticeEvent {
+              id: download_id,
+              filename,
+              status: "completed",
+              error: None,
+            },
+          );
+        } else {
+          let _ = app.emit(
+            "download-event",
+            DownloadNoticeEvent {
+              id: download_id,
+              filename,
+              status: "failed",
+              error: Some("下载未完成或已取消".to_string()),
+            },
+          );
+        }
+        true
+      }
+      _ => true,
+    }
+  }
+
+  #[cfg(desktop)]
   #[allow(clippy::too_many_arguments)]
   fn build_desktop_account_webview(
     self: &Arc<Self>,
@@ -2174,6 +2402,15 @@ impl SessionManager {
     let app_for_load = app.clone();
     let key_for_load = key;
     let handle_page_load = !cfg!(windows) || proxy_url.is_none();
+
+    let pending_downloads: Arc<std::sync::Mutex<HashMap<String, VecDeque<(u64, PathBuf)>>>> =
+      Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let mgr_for_dl = Arc::clone(self);
+    let app_for_dl = app.clone();
+    let pending_for_dl = Arc::clone(&pending_downloads);
+    let mgr_for_popup_dl = Arc::clone(self);
+    let app_for_popup_dl = app.clone();
+    let pending_for_popup_dl = Arc::clone(&pending_downloads);
 
     let mut builder = tauri::webview::WebviewBuilder::new(
       webview_label,
@@ -2245,6 +2482,10 @@ impl SessionManager {
         .map(|h| format!("登录认证 · {h}"))
         .unwrap_or_else(|| "登录认证".to_string());
 
+      let popup_mgr_dl = Arc::clone(&mgr_for_popup_dl);
+      let popup_app_dl = app_for_popup_dl.clone();
+      let popup_pending_dl = Arc::clone(&pending_for_popup_dl);
+
       let popup_builder = tauri::WebviewWindowBuilder::new(
         &app_for_popup,
         &popup_label,
@@ -2253,6 +2494,9 @@ impl SessionManager {
       .window_features(features)
       .initialization_script(LOGIN_CAPTURE_INIT_JS)
       .title(&popup_title)
+      .on_download(move |_wv, event| {
+        popup_mgr_dl.handle_desktop_download_event(&popup_app_dl, &popup_pending_dl, event)
+      })
       .on_navigation(move |nav_url| {
         if !alive_popup_nav.load(Ordering::SeqCst)
           || active_vid_popup_nav.load(Ordering::SeqCst) != view_instance_id
@@ -2306,6 +2550,9 @@ impl SessionManager {
         }
         Err(_) => tauri::webview::NewWindowResponse::Deny,
       }
+    })
+    .on_download(move |_wv, event| {
+      mgr_for_dl.handle_desktop_download_event(&app_for_dl, &pending_for_dl, event)
     })
     .on_page_load(move |_wv, payload| {
       if !handle_page_load || payload.event() != tauri::webview::PageLoadEvent::Finished {
@@ -2649,6 +2896,7 @@ impl SessionManager {
           last_url: None,
           captured_identity_hint: None,
           watcher_running: false,
+          probe_notify: Arc::new(tokio::sync::Notify::new()),
           last_used_ms: now_ms(),
           alive_flag: Arc::clone(&alive_flag),
         },
@@ -2771,7 +3019,7 @@ impl SessionManager {
       return;
     }
 
-    let (snap_opt, start_watcher) = {
+    let (snap_opt, start_watcher, probe_notify_opt) = {
       let mut locked = self.inner.lock().await;
       if !locked.conflicts.is_empty() || locked.store.pending_cleanup.contains(&key) {
         if let Some(entry) = locked.warm_pool.remove(&key) {
@@ -2793,6 +3041,7 @@ impl SessionManager {
       };
 
       let mut need_watcher = false;
+      let probe_notify;
       if let Some(entry) = locked.warm_pool.get_mut(&key) {
         if entry.view_instance_id != view_instance_id {
           return;
@@ -2803,6 +3052,7 @@ impl SessionManager {
           entry.watcher_running = true;
           need_watcher = true;
         }
+        probe_notify = Arc::clone(&entry.probe_notify);
       } else {
         return;
       }
@@ -2822,7 +3072,7 @@ impl SessionManager {
           self.active_view_id.store(0, Ordering::SeqCst);
           locked.notice = Some(format!("提交账号记录写盘失败，已回退管理页: {err}"));
           Self::apply_desktop_layout_locked(app, &locked);
-          (Some(Self::snapshot_from_locked(&locked)), false)
+          (Some(Self::snapshot_from_locked(&locked)), false, None)
         } else {
           if let Some(slot) = &mut locked.active_slot {
             slot.committed = true;
@@ -2842,15 +3092,19 @@ impl SessionManager {
             let _ = main_win.set_title(&title);
           }
           Self::apply_desktop_layout_locked(app, &locked);
-          (Some(Self::snapshot_from_locked(&locked)), need_watcher)
+          (Some(Self::snapshot_from_locked(&locked)), need_watcher, Some(probe_notify))
         }
       } else {
-        (Some(Self::snapshot_from_locked(&locked)), need_watcher)
+        (Some(Self::snapshot_from_locked(&locked)), need_watcher, Some(probe_notify))
       }
     };
 
-    if start_watcher {
-      self.spawn_desktop_identity_watcher(app.clone(), key, view_instance_id);
+    if let Some(probe_notify) = probe_notify_opt {
+      if start_watcher {
+        self.spawn_desktop_identity_watcher(app.clone(), key, view_instance_id, probe_notify);
+      } else {
+        probe_notify.notify_one();
+      }
     }
 
     if let Some(snap) = snap_opt {
@@ -2860,7 +3114,7 @@ impl SessionManager {
     let mgr_next = Arc::clone(self);
     let app_next = app.clone();
     tauri::async_runtime::spawn(async move {
-      tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+      tokio::time::sleep(std::time::Duration::from_millis(350)).await;
       mgr_next.prewarm_next_cold_account(&app_next).await;
     });
   }
@@ -2919,6 +3173,7 @@ impl SessionManager {
           last_url: None,
           captured_identity_hint: None,
           watcher_running: false,
+          probe_notify: Arc::new(tokio::sync::Notify::new()),
           last_used_ms: 0,
           alive_flag: Arc::clone(&alive_flag),
         },
@@ -2950,23 +3205,29 @@ impl SessionManager {
     Box::pin(async move {
       let next_cold = {
         let locked = mgr.inner.lock().await;
-        if locked.warm_pool.len() >= MAX_WARM_DESKTOP_VIEWS {
+        let in_flight = locked.warm_pool.values().filter(|e| !e.paint_ready).count();
+        if locked.warm_pool.len() >= MAX_WARM_DESKTOP_VIEWS || in_flight >= MAX_CONCURRENT_PREWARMS {
           None
         } else {
+          let is_eligible_cold = |a: &&AccountRecord| {
+            if !get_provider(a.provider_id).info.enabled {
+              return false;
+            }
+            let k = AccountKey {
+              provider_id: a.provider_id,
+              uuid: a.uuid.clone(),
+            };
+            !locked.warm_pool.contains_key(&k)
+              && !locked.store.pending_cleanup.contains(&k)
+              && !locked.prewarm_failed.contains(&k)
+          };
           locked
             .store
             .accounts
             .iter()
-            .filter(|a| get_provider(a.provider_id).info.enabled)
-            .find(|a| {
-              let k = AccountKey {
-                provider_id: a.provider_id,
-                uuid: a.uuid.clone(),
-              };
-              !locked.warm_pool.contains_key(&k)
-                && !locked.store.pending_cleanup.contains(&k)
-                && !locked.prewarm_failed.contains(&k)
-            })
+            .filter(is_eligible_cold)
+            .find(|a| a.provider_id == locked.selected_provider_id)
+            .or_else(|| locked.store.accounts.iter().find(is_eligible_cold))
             .cloned()
         }
       };
@@ -2981,7 +3242,7 @@ impl SessionManager {
             let mut locked = mgr.inner.lock().await;
             locked.prewarm_failed.insert(failed_key);
           }
-          tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+          tokio::time::sleep(std::time::Duration::from_millis(400)).await;
           mgr.prewarm_next_cold_account(&app_handle).await;
         }
       }
@@ -3428,14 +3689,24 @@ impl SessionManager {
     app: AppHandle,
     key: AccountKey,
     view_instance_id: u64,
+    probe_notify: Arc<tokio::sync::Notify>,
   ) {
     let mgr = Arc::clone(self);
     tauri::async_runtime::spawn(async move {
       let mut tick_count: u32 = 0;
       let mut consecutive_logged_out: u8 = 0;
+      let mut next_delay_ms: Option<u64> = None;
       loop {
-        let delay_ms = if tick_count < 6 { 950 } else { 6500 };
-        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        if let Some(delay_ms) = next_delay_ms.take() {
+          if consecutive_logged_out == 1 {
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+          } else {
+            tokio::select! {
+              _ = tokio::time::sleep(std::time::Duration::from_millis(delay_ms)) => {},
+              _ = probe_notify.notified() => {},
+            }
+          }
+        }
         tick_count = tick_count.saturating_add(1);
 
         let labels_opt = {
@@ -3493,6 +3764,7 @@ impl SessionManager {
           break;
         };
         let Some(probe) = Self::eval_identity_probe(&main_wv).await else {
+          next_delay_ms = Some(if tick_count < 6 { 800 } else { 6500 });
           continue;
         };
 
@@ -3550,15 +3822,20 @@ impl SessionManager {
               probe.quota_detail,
             )
             .await;
+          next_delay_ms = Some(if tick_count < 6 { 950 } else { 6500 });
         } else if probe.logged_out {
           consecutive_logged_out = consecutive_logged_out.saturating_add(1);
           if consecutive_logged_out >= 2 {
             mgr
               .apply_logged_out_state(&app, key.clone(), view_instance_id)
               .await;
+            next_delay_ms = Some(if tick_count < 6 { 950 } else { 6500 });
+          } else {
+            next_delay_ms = Some(300);
           }
         } else {
           consecutive_logged_out = 0;
+          next_delay_ms = Some(if tick_count < 6 { 500 } else { 6500 });
         }
       }
     });
@@ -3831,4 +4108,80 @@ struct DesktopProbeResult {
   quota_pct: Option<u8>,
   quota_detail: Option<QuotaDetail>,
   pending_hotkey: Option<u8>,
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::storage::save_store_atomic;
+
+  fn make_test_account(provider_id: ProviderId, uuid: &str, alias: &str) -> AccountRecord {
+    AccountRecord {
+      provider_id,
+      uuid: uuid.to_string(),
+      alias: alias.to_string(),
+      created_at_ms: 1,
+      auto_alias: false,
+      proxy_url: None,
+      avatar_url: None,
+      quota_text: None,
+      quota_percent: None,
+      quota_detail: None,
+      auth_state: AuthState::Unknown,
+    }
+  }
+
+  #[tokio::test]
+  async fn reorder_accounts_updates_only_target_provider_and_validates() {
+    let temp_dir = std::env::temp_dir().join(format!("maam-reorder-test-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&temp_dir).unwrap();
+    let store_path = temp_dir.join("accounts.json");
+
+    let m1 = "00000000-0000-4000-8000-000000000001";
+    let h1 = "00000000-0000-4000-8000-000000000002";
+    let m2 = "00000000-0000-4000-8000-000000000003";
+    let m3 = "00000000-0000-4000-8000-000000000004";
+    let h2 = "00000000-0000-4000-8000-000000000005";
+
+    let initial = AccountsStoreFile {
+      version: crate::storage::STORE_VERSION,
+      accounts: vec![
+        make_test_account(ProviderId::Muse, m1, "m1"),
+        make_test_account(ProviderId::Hark, h1, "h1"),
+        make_test_account(ProviderId::Muse, m2, "m2"),
+        make_test_account(ProviderId::Muse, m3, "m3"),
+        make_test_account(ProviderId::Hark, h2, "h2"),
+      ],
+      last_committed: None,
+      pending_cleanup: Vec::new(),
+    };
+    save_store_atomic(&store_path, &initial).unwrap();
+
+    let mgr = SessionManager::new(temp_dir.clone());
+    let snap = mgr
+      .reorder_accounts("muse", vec![m3.to_string(), m1.to_string(), m2.to_string()])
+      .await
+      .unwrap();
+    let aliases: Vec<&str> = snap.accounts.iter().map(|a| a.alias.as_str()).collect();
+    assert_eq!(aliases, vec!["m3", "h1", "m1", "m2", "h2"]);
+
+    let reloaded = SessionManager::new(temp_dir.clone()).get_snapshot().await;
+    let reloaded_aliases: Vec<&str> = reloaded.accounts.iter().map(|a| a.alias.as_str()).collect();
+    assert_eq!(reloaded_aliases, vec!["m3", "h1", "m1", "m2", "h2"]);
+
+    assert!(mgr
+      .reorder_accounts("muse", vec![m1.to_string(), m2.to_string()])
+      .await
+      .is_err());
+    assert!(mgr
+      .reorder_accounts("muse", vec![m1.to_string(), m1.to_string(), m3.to_string()])
+      .await
+      .is_err());
+    assert!(mgr
+      .reorder_accounts("muse", vec![m1.to_string(), h1.to_string(), m3.to_string()])
+      .await
+      .is_err());
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+  }
 }

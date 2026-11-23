@@ -5,6 +5,8 @@ const APP_COMMANDS: &[&str] = &[
   "rename_account",
   "copy_account_cookie",
   "remove_account",
+  "reorder_accounts",
+  "reveal_downloaded_file",
   "switch_account",
   "set_modal_active",
   "open_official_site",

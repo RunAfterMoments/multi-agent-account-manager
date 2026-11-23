@@ -73,6 +73,31 @@ async fn remove_account(
 }
 
 #[tauri::command]
+async fn reorder_accounts(
+  mgr: State<'_, Arc<SessionManager>>,
+  webview: tauri::Webview,
+  provider_id: String,
+  ordered_uuids: Vec<String>,
+) -> Result<ManagerSnapshot, String> {
+  if webview.label() != "manager" {
+    return Err("仅账号管理页可以调整账号顺序".to_string());
+  }
+  mgr.reorder_accounts(&provider_id, ordered_uuids).await
+}
+
+#[tauri::command]
+async fn reveal_downloaded_file(
+  mgr: State<'_, Arc<SessionManager>>,
+  webview: tauri::Webview,
+  download_id: u64,
+) -> Result<(), String> {
+  if webview.label() != "manager" {
+    return Err("仅账号管理页可以打开下载文件夹".to_string());
+  }
+  mgr.reveal_downloaded_file(download_id).await
+}
+
+#[tauri::command]
 async fn switch_account(
   app: AppHandle,
   mgr: State<'_, Arc<SessionManager>>,
@@ -164,22 +189,27 @@ pub fn run() {
 
         let manager_builder =
           tauri::webview::WebviewBuilder::new("manager", tauri::WebviewUrl::App("index.html".into()))
+            .disable_drag_drop_handler()
             .on_navigation(|url| {
               url.scheme() == "tauri"
                 || url.domain() == Some("tauri.localhost")
                 || (cfg!(dev) && url.host_str() == Some("localhost"))
             });
 
-        main_window.add_child(
+        let _manager_wv = main_window.add_child(
           manager_builder,
           tauri::LogicalPosition::new(0.0, 0.0),
           tauri::LogicalSize::new(1240.0, 800.0),
         )?;
+        #[cfg(windows)]
+        platform::lock_windows_manager_webview_zoom(&_manager_wv);
 
         let app_for_resize = app.handle().clone();
         let mgr_for_resize = Arc::clone(&session_mgr);
         main_window.on_window_event(move |event| match event {
-          tauri::WindowEvent::Resized(_) | tauri::WindowEvent::ScaleFactorChanged { .. } => {
+          tauri::WindowEvent::Resized(_)
+          | tauri::WindowEvent::Moved(_)
+          | tauri::WindowEvent::ScaleFactorChanged { .. } => {
             let app_inner = app_for_resize.clone();
             let mgr_inner = Arc::clone(&mgr_for_resize);
             tauri::async_runtime::spawn(async move {
@@ -223,6 +253,8 @@ pub fn run() {
       rename_account,
       copy_account_cookie,
       remove_account,
+      reorder_accounts,
+      reveal_downloaded_file,
       switch_account,
       set_modal_active,
       open_official_site,

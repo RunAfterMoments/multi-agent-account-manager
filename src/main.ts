@@ -4,6 +4,7 @@ import "./styles.css";
 import type {
   AccountKey,
   AccountRecord,
+  DownloadNoticeEvent,
   InstallUpdateOutcome,
   ManagerSnapshot,
   ProviderId,
@@ -40,6 +41,25 @@ let optimisticSwitching: AccountKey | null = null;
 let busy = false;
 let lastRenderedUpdateStage: string | null = null;
 const copyingCookies = new Set<string>();
+let downloadToast: DownloadNoticeEvent | null = null;
+let downloadToastTimer: number | undefined;
+let draggingAccountUuid: string | null = null;
+
+function clearDownloadToastTimer(): void {
+  if (downloadToastTimer !== undefined) {
+    window.clearTimeout(downloadToastTimer);
+    downloadToastTimer = undefined;
+  }
+}
+
+function scheduleDownloadToastDismiss(): void {
+  clearDownloadToastTimer();
+  if (!downloadToast || downloadToast.status === "started") return;
+  downloadToastTimer = window.setTimeout(() => {
+    downloadToast = null;
+    rerenderPreservingScroll();
+  }, 12000);
+}
 
 const updateState: {
   checking: boolean;
@@ -635,6 +655,7 @@ function renderMiddleContent(state: ManagerSnapshot, provider: ProviderInfo): st
   const isAndroid = state.platform === "android";
   const supportsProxy = supportsAccountProxy(state.platform);
   const supportsCookieCopy = supportsProxy || isAndroid;
+  const canReorder = providerAccounts.length > 1 && state.conflicts.length === 0;
 
   const noticeHtml = state.notice
     ? `
@@ -781,7 +802,7 @@ function renderMiddleContent(state: ManagerSnapshot, provider: ProviderInfo): st
           : `<div class="${avatarClass}">${escapeHtml(avatarText)}</div>`;
 
         return `
-          <div class="${rowClass}" data-switch-uuid="${escapeHtml(acc.uuid)}">
+          <div class="${rowClass}" data-switch-uuid="${escapeHtml(acc.uuid)}" ${!isAndroid && canReorder ? `draggable="true"` : ""}>
             <div class="account-header">
               <div class="avatar-wrap">
                 ${avatarNodeHtml}
@@ -798,6 +819,12 @@ function renderMiddleContent(state: ManagerSnapshot, provider: ProviderInfo): st
                 ${compactSubHtml}
               </div>
               <div class="row-ops">
+                ${canReorder ? `
+                  <div class="reorder-stack">
+                    <button class="reorder-btn" data-move-uuid="${escapeHtml(acc.uuid)}" data-move-dir="up" title="上移" aria-label="上移" type="button" ${idx === 0 ? "disabled" : ""}>▲</button>
+                    <button class="reorder-btn" data-move-uuid="${escapeHtml(acc.uuid)}" data-move-dir="down" title="下移" aria-label="下移" type="button" ${idx === providerAccounts.length - 1 ? "disabled" : ""}>▼</button>
+                  </div>
+                ` : ""}
                 ${supportsCookieCopy ? `
                   <button class="action-icon-btn copy-cookie-btn" data-copy-cookie-uuid="${escapeHtml(acc.uuid)}" data-copy-label="复制 Cookie" aria-label="复制 Cookie" type="button">
                     <span class="copy-cookie-icon" aria-hidden="true"></span>
@@ -831,7 +858,27 @@ function renderMiddleContent(state: ManagerSnapshot, provider: ProviderInfo): st
     ${noticeHtml}
     ${conflictsHtml}
     <div class="account-list">${listBody}</div>
+    ${renderDownloadToast()}
     ${renderModal(provider, state.platform)}
+  `;
+}
+
+function renderDownloadToast(): string {
+  if (!downloadToast) return "";
+  const isStarted = downloadToast.status === "started";
+  const isDone = downloadToast.status === "completed";
+  const isFail = downloadToast.status === "failed";
+  const label = isStarted
+    ? `正在下载：${downloadToast.filename}`
+    : isDone
+      ? `下载完成：${downloadToast.filename}`
+      : `下载失败：${downloadToast.filename}${downloadToast.error ? `（${downloadToast.error}）` : ""}`;
+  return `
+    <div id="download-toast" class="download-toast ${isFail ? "error" : isDone ? "success" : ""}" role="status" aria-live="polite">
+      <span class="download-toast-text" title="${escapeHtml(label)}">${escapeHtml(label)}</span>
+      ${isDone ? `<button id="download-reveal-btn" class="download-toast-action" data-download-id="${downloadToast.id}" type="button">在文件夹中显示</button>` : ""}
+      <button id="download-close-btn" class="download-toast-close" type="button" aria-label="关闭下载提示">✕</button>
+    </div>
   `;
 }
 
@@ -1013,6 +1060,34 @@ function bindEvents(state: ManagerSnapshot, provider: ProviderInfo): void {
     await callCommand("dismiss_notice");
   });
 
+  const toastEl = document.querySelector("#download-toast");
+  if (toastEl) {
+    toastEl.addEventListener("mouseenter", () => {
+      clearDownloadToastTimer();
+    });
+    toastEl.addEventListener("mouseleave", () => {
+      scheduleDownloadToastDismiss();
+    });
+  }
+  document.querySelector<HTMLButtonElement>("#download-reveal-btn")?.addEventListener("click", async (ev) => {
+    const rawId = (ev.currentTarget as HTMLButtonElement).dataset.downloadId;
+    const downloadId = rawId ? Number(rawId) : NaN;
+    if (!Number.isFinite(downloadId)) return;
+    try {
+      await invoke<void>("reveal_downloaded_file", { downloadId });
+    } catch (err) {
+      if (snapshot) {
+        snapshot = { ...snapshot, notice: String(err) };
+        rerenderPreservingScroll();
+      }
+    }
+  });
+  document.querySelector("#download-close-btn")?.addEventListener("click", () => {
+    clearDownloadToastTimer();
+    downloadToast = null;
+    rerenderPreservingScroll();
+  });
+
   document.querySelector("#check-update-btn")?.addEventListener("click", async () => {
     if (modal.kind !== "none") return;
     await setModal({ kind: "update" });
@@ -1109,7 +1184,106 @@ function bindEvents(state: ManagerSnapshot, provider: ProviderInfo): void {
     });
   });
 
+  document.querySelectorAll<HTMLElement>(".row-ops").forEach((ops) => {
+    ops.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+    });
+  });
+
+  document.querySelectorAll<HTMLButtonElement>("[data-move-uuid]").forEach((btn) => {
+    btn.addEventListener("click", async (ev) => {
+      ev.stopPropagation();
+      if (modal.kind !== "none" || state.conflicts.length > 0) return;
+      const uuid = btn.dataset.moveUuid;
+      const dir = btn.dataset.moveDir;
+      if (!uuid || (dir !== "up" && dir !== "down")) return;
+      const ordered = state.accounts
+        .filter((a) => a.providerId === provider.id)
+        .map((a) => a.uuid);
+      const idx = ordered.indexOf(uuid);
+      if (idx === -1) return;
+      const targetIdx = dir === "up" ? idx - 1 : idx + 1;
+      if (targetIdx < 0 || targetIdx >= ordered.length) return;
+      [ordered[idx], ordered[targetIdx]] = [ordered[targetIdx], ordered[idx]];
+      await callCommand("reorder_accounts", {
+        providerId: provider.id,
+        orderedUuids: ordered,
+      });
+    });
+  });
+
   document.querySelectorAll<HTMLElement>("[data-switch-uuid]").forEach((row) => {
+    row.addEventListener("dragstart", (ev) => {
+      if (state.platform === "android" || modal.kind !== "none" || state.conflicts.length > 0 || busy) {
+        ev.preventDefault();
+        return;
+      }
+      const uuid = row.dataset.switchUuid;
+      if (!uuid) {
+        ev.preventDefault();
+        return;
+      }
+      draggingAccountUuid = uuid;
+      if (ev.dataTransfer) {
+        ev.dataTransfer.effectAllowed = "move";
+        ev.dataTransfer.setData("text/plain", uuid);
+      }
+      requestAnimationFrame(() => row.classList.add("dragging"));
+    });
+
+    row.addEventListener("dragover", (ev) => {
+      if (!draggingAccountUuid) return;
+      const targetUuid = row.dataset.switchUuid;
+      if (!targetUuid || targetUuid === draggingAccountUuid) return;
+      ev.preventDefault();
+      if (ev.dataTransfer) {
+        ev.dataTransfer.dropEffect = "move";
+      }
+      const rect = row.getBoundingClientRect();
+      const insertBefore = ev.clientY < rect.top + rect.height / 2;
+      row.classList.toggle("drag-over-top", insertBefore);
+      row.classList.toggle("drag-over-bottom", !insertBefore);
+    });
+
+    row.addEventListener("dragleave", (ev) => {
+      if (row.contains(ev.relatedTarget as Node | null)) return;
+      row.classList.remove("drag-over-top", "drag-over-bottom");
+    });
+
+    row.addEventListener("drop", async (ev) => {
+      if (!draggingAccountUuid) return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      const srcUuid = draggingAccountUuid;
+      const targetUuid = row.dataset.switchUuid;
+      const insertBefore = row.classList.contains("drag-over-top");
+      row.classList.remove("drag-over-top", "drag-over-bottom");
+      if (!targetUuid || targetUuid === srcUuid) return;
+      const ordered = state.accounts
+        .filter((a) => a.providerId === provider.id)
+        .map((a) => a.uuid);
+      const fromIdx = ordered.indexOf(srcUuid);
+      if (fromIdx === -1) return;
+      ordered.splice(fromIdx, 1);
+      const toIdx = ordered.indexOf(targetUuid);
+      if (toIdx === -1) return;
+      ordered.splice(insertBefore ? toIdx : toIdx + 1, 0, srcUuid);
+      draggingAccountUuid = null;
+      await callCommand("reorder_accounts", {
+        providerId: provider.id,
+        orderedUuids: ordered,
+      });
+    });
+
+    row.addEventListener("dragend", () => {
+      draggingAccountUuid = null;
+      document
+        .querySelectorAll<HTMLElement>(".account-row.dragging, .account-row.drag-over-top, .account-row.drag-over-bottom")
+        .forEach((el) => {
+          el.classList.remove("dragging", "drag-over-top", "drag-over-bottom");
+        });
+    });
+
     row.addEventListener("click", async () => {
       if (modal.kind !== "none" || state.conflicts.length > 0) return;
       const uuid = row.dataset.switchUuid;
@@ -1213,6 +1387,13 @@ async function bootstrap(): Promise<void> {
     }
     render();
     restoreScrollPosition();
+  });
+
+  await listen<DownloadNoticeEvent>("download-event", (event) => {
+    downloadToast = event.payload;
+    clearDownloadToastTimer();
+    rerenderPreservingScroll();
+    scheduleDownloadToastDismiss();
   });
 
   await listen<UpdateProgressEvent>("update-progress", (event) => {

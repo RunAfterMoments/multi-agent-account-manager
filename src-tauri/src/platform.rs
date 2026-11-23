@@ -809,6 +809,72 @@ pub async fn delete_desktop_profile(
   }
 }
 
+#[cfg(windows)]
+pub fn lock_windows_manager_webview_zoom(webview: &tauri::Webview) {
+  let _ = webview.with_webview(|pwv| unsafe {
+    use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Settings5;
+    use windows::core::Interface;
+
+    let controller = pwv.controller();
+    let _ = controller.SetZoomFactor(1.0);
+    if let Ok(core) = controller.CoreWebView2() {
+      if let Ok(settings) = core.Settings() {
+        let _ = settings.SetIsZoomControlEnabled(false);
+        if let Ok(settings5) = settings.cast::<ICoreWebView2Settings5>() {
+          let _ = settings5.SetIsPinchZoomEnabled(false);
+        }
+      }
+    }
+  });
+}
+
+#[cfg(desktop)]
+pub fn reveal_path_in_file_manager(path: &Path) -> Result<(), String> {
+  #[cfg(target_os = "macos")]
+  {
+    if path.exists() {
+      std::process::Command::new("open")
+        .arg("-R")
+        .arg(path)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("打开访达失败: {e}"))
+    } else if let Some(parent) = path.parent().filter(|p| p.exists()) {
+      open::that_detached(parent).map_err(|e| format!("打开文件夹失败: {e}"))
+    } else {
+      Err("文件已被移动或删除".to_string())
+    }
+  }
+  #[cfg(windows)]
+  {
+    use std::os::windows::process::CommandExt;
+
+    if path.exists() {
+      let raw = path.to_string_lossy();
+      let clean = raw.strip_prefix(r"\\?\").unwrap_or(&raw);
+      std::process::Command::new("explorer.exe")
+        .raw_arg(format!("/select,\"{clean}\""))
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("打开资源管理器失败: {e}"))
+    } else if let Some(parent) = path.parent().filter(|p| p.exists()) {
+      open::that_detached(parent).map_err(|e| format!("打开文件夹失败: {e}"))
+    } else {
+      Err("文件已被移动或删除".to_string())
+    }
+  }
+  #[cfg(all(not(target_os = "macos"), not(windows)))]
+  {
+    if let Some(target) = path.parent().filter(|p| p.exists()) {
+      open::that_detached(target).map_err(|e| format!("打开文件夹失败: {e}"))
+    } else if path.exists() {
+      open::that_detached(path).map_err(|e| format!("打开文件失败: {e}"))
+    } else {
+      Err("文件已被移动或删除".to_string())
+    }
+  }
+}
+
 #[cfg(target_os = "android")]
 pub use tauri_plugin_account_session as android;
 

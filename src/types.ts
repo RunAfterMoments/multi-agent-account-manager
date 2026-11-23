@@ -88,3 +88,10 @@ export interface InstallUpdateOutcome {
   status: string;
   message: string;
 }
+
+export interface DownloadNoticeEvent {
+  id: number;
+  filename: string;
+  status: "started" | "completed" | "failed";
+  error?: string | null;
+}

@@ -1,27 +1,41 @@
 package com.ldjx.accountmanager
 
 import android.annotation.SuppressLint
+import android.app.DownloadManager
+import android.content.ActivityNotFoundException
+import android.content.ContentValues
 import android.content.Intent
 import android.content.MutableContextWrapper
 import android.graphics.Bitmap
 import android.graphics.Color
+import android.graphics.drawable.GradientDrawable
+import android.media.MediaScannerConnection
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.os.Message
+import android.provider.MediaStore
 import android.text.TextUtils
+import android.util.Base64
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
+import android.webkit.DownloadListener
+import android.webkit.JavascriptInterface
+import android.webkit.MimeTypeMap
+import android.webkit.PermissionRequest
 import android.webkit.RenderProcessGoneDetail
+import android.webkit.URLUtil
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
+import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.Button
@@ -33,6 +47,7 @@ import androidx.activity.OnBackPressedCallback
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.FileProvider
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
@@ -40,6 +55,17 @@ import androidx.lifecycle.Lifecycle
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
 import org.json.JSONObject
+import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
+import java.io.InputStream
+import java.io.OutputStream
+import java.net.HttpURLConnection
+import java.net.URL
+import java.net.URLDecoder
+import java.util.UUID
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicLong
 
 class AccountWebActivity : AppCompatActivity() {
 
@@ -49,6 +75,10 @@ class AccountWebActivity : AppCompatActivity() {
     private lateinit var popupOverlayRoot: LinearLayout
     private lateinit var popupDomainLabel: TextView
     private lateinit var popupWebContainer: FrameLayout
+    private lateinit var downloadBannerRoot: LinearLayout
+    private lateinit var downloadBannerText: TextView
+    private lateinit var downloadOpenBtn: Button
+    private lateinit var downloadDirBtn: Button
 
     private var currentSpec: AndroidAccountSessionSpec? = null
     private var mainWebView: WebView? = null
@@ -61,6 +91,42 @@ class AccountWebActivity : AppCompatActivity() {
     private var pendingFilePathCallback: ValueCallback<Array<Uri>>? = null
     private val uiHandler = Handler(Looper.getMainLooper())
     private var identityProbeRunnable: Runnable? = null
+    private var probeAwaitingConfirm: Boolean = false
+    private val downloadExecutor = Executors.newSingleThreadExecutor()
+    private val activeSessionGeneration = AtomicLong(1L)
+    private val blobLock = Any()
+    private val pendingBlobTokens = HashMap<String, BlobInitMeta>()
+    private val activeBlobSessions = HashMap<String, BlobTransferSession>()
+    private val blobBridge = AndroidBlobDownloadBridge()
+    private var downloadBannerHideRunnable: Runnable? = null
+    private var lastDownloadedUri: Uri? = null
+    private var lastDownloadedMime: String = "*/*"
+    private var lastDownloadedFallbackDir: File? = null
+
+    private data class BlobInitMeta(
+        val generation: Long,
+        val defaultName: String,
+        val fallbackMime: String,
+    )
+
+    private data class BlobTransferSession(
+        val token: String,
+        val generation: Long,
+        val defaultName: String,
+        val tempFile: File,
+        val stream: FileOutputStream,
+        var mimeType: String,
+        var hintName: String,
+        var totalBytes: Long = 0L,
+    )
+
+    private data class SavedDownloadResult(
+        val filename: String,
+        val mimeType: String,
+        val openUri: Uri?,
+        val publicDownloads: Boolean,
+        val fallbackDir: File?,
+    )
 
     private val fileChooserLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
@@ -401,21 +467,139 @@ class AccountWebActivity : AppCompatActivity() {
                   }
                   const OrigWS = window.WebSocket;
                   if (typeof OrigWS === 'function') {
-                    const WrappedWS = function(...args) {
-                      const ws = new OrigWS(...args);
-                      ws.addEventListener('message', (ev) => {
-                        if (typeof ev.data === 'string') inspectText(ev.data);
-                      });
-                      return ws;
-                    };
-                    WrappedWS.prototype = OrigWS.prototype;
-                    Object.assign(WrappedWS, OrigWS);
-                    window.WebSocket = WrappedWS;
+                    window.WebSocket = new Proxy(OrigWS, {
+                      construct(target, args, newTarget) {
+                        const ws = Reflect.construct(target, args, newTarget);
+                        ws.addEventListener('message', (ev) => {
+                          if (typeof ev.data === 'string') inspectText(ev.data);
+                        });
+                        return ws;
+                      }
+                    });
                   }
+                }
+                if (!window.__maamDownloadNameHooked) {
+                  window.__maamDownloadNameHooked = true;
+                  document.addEventListener('click', (ev) => {
+                    try {
+                      const a = ev.target && ev.target.closest ? ev.target.closest('a[href]') : null;
+                      if (!a) return;
+                      const dl = a.getAttribute('download');
+                      const href = a.href || a.getAttribute('href') || '';
+                      if (dl !== null || href.startsWith('blob:') || href.startsWith('data:')) {
+                        window.__maamLastDownload = { url: href, name: (dl || '').trim(), ts: Date.now() };
+                      }
+                    } catch (_) {}
+                  }, true);
                 }
               } catch (_) {}
             })();
         """
+
+        private const val ANDROID_DOWNLOAD_BRIDGE_NAME = "__maamAndroidDownload"
+        private const val MAX_BLOB_DOWNLOAD_BYTES = 256L * 1024L * 1024L
+
+        private val DOWNLOAD_HINT_EXTENSIONS = setOf(
+            "pdf", "zip", "rar", "7z", "tar", "gz", "tgz",
+            "png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "ico",
+            "mp4", "mov", "webm", "mkv", "avi", "mp3", "wav", "m4a", "ogg", "flac",
+            "csv", "tsv", "json", "txt", "md", "xml", "yaml", "yml",
+            "doc", "docx", "xls", "xlsx", "ppt", "pptx", "apk",
+        )
+
+        private fun sanitizeAndroidUserAgent(raw: String): String {
+            return raw
+                .replace("; wv)", ")")
+                .replace(Regex("""Version/\d+(?:\.\d+)*\s+"""), "")
+        }
+
+        private fun parseContentDispositionFilename(header: String?): String? {
+            if (header.isNullOrBlank()) return null
+            val extMatch = Regex("""filename\*\s*=\s*(?:UTF-8|utf-8)''([^;\r\n]+)""").find(header)
+            if (extMatch != null) {
+                val decoded = runCatching {
+                    URLDecoder.decode(extMatch.groupValues[1].trim().trim('"', '\''), "UTF-8")
+                }.getOrNull()?.trim()
+                if (!decoded.isNullOrEmpty()) return decoded
+            }
+            val plainMatch = Regex("""filename\s*=\s*(?:"([^"\r\n]+)"|([^;\r\n]+))""", RegexOption.IGNORE_CASE).find(header)
+            val raw = plainMatch?.groupValues?.get(1)?.ifEmpty { plainMatch.groupValues[2] }?.trim()
+            return raw?.trim('"', '\'')?.takeIf { it.isNotEmpty() }
+        }
+
+        private fun sanitizeDownloadFilename(rawName: String?, mimeType: String?): String {
+            val cleaned = (rawName ?: "")
+                .substringAfterLast('/')
+                .substringAfterLast('\\')
+                .replace(Regex("""[\r\n\t\u0000-\u001F]"""), "")
+                .replace(Regex("""[:*?"<>|]"""), "_")
+                .trim()
+                .trimStart('.')
+            val base = if (cleaned.isEmpty()) "download_${System.currentTimeMillis()}" else cleaned
+            val cleanMime = mimeType?.substringBefore(';')?.trim()?.lowercase().orEmpty()
+            val hasExt = base.contains('.') && base.substringAfterLast('.').length in 1..8
+            if (!hasExt && cleanMime.isNotEmpty() && cleanMime != "application/octet-stream") {
+                val ext = MimeTypeMap.getSingleton().getExtensionFromMimeType(cleanMime)
+                if (!ext.isNullOrEmpty()) {
+                    return "$base.$ext"
+                }
+            }
+            return base
+        }
+
+        private fun resolveMimeType(filename: String, declaredMime: String?): String {
+            val trimmed = declaredMime?.substringBefore(';')?.trim()?.lowercase().orEmpty()
+            if (trimmed.isNotEmpty() && trimmed != "application/octet-stream") {
+                return trimmed
+            }
+            val ext = filename.substringAfterLast('.', "").lowercase()
+            if (ext.isNotEmpty()) {
+                MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext)?.let { return it }
+            }
+            return trimmed.ifEmpty { "application/octet-stream" }
+        }
+
+        private fun shouldInterceptUrlAsDownload(uri: Uri?, isRedirect: Boolean): Boolean {
+            if (uri == null) return false
+            val scheme = uri.scheme?.lowercase().orEmpty()
+            if (scheme == "data") return true
+            if (scheme != "https" && scheme != "http") return false
+            val queryNames = runCatching { uri.queryParameterNames }.getOrDefault(emptySet())
+            if (queryNames.any {
+                    it.equals("response-content-disposition", ignoreCase = true) ||
+                        it.equals("rscd", ignoreCase = true) ||
+                        it.equals("download", ignoreCase = true)
+                }
+            ) {
+                return true
+            }
+            val disp = runCatching { uri.getQueryParameter("response-content-disposition") }.getOrNull().orEmpty()
+            if (disp.contains("attachment", ignoreCase = true)) {
+                return true
+            }
+            if (isRedirect) {
+                val lastSeg = uri.lastPathSegment.orEmpty().lowercase()
+                val ext = lastSeg.substringAfterLast('.', "")
+                if (ext in DOWNLOAD_HINT_EXTENSIONS) {
+                    return true
+                }
+            }
+            return false
+        }
+
+        private fun isSameSiteOrAllowedHost(initialHost: String?, targetHost: String?, allowedHosts: List<String>): Boolean {
+            if (initialHost.isNullOrBlank() || targetHost.isNullOrBlank()) return false
+            val a = initialHost.lowercase()
+            val b = targetHost.lowercase()
+            if (a == b) return true
+            for (allowed in allowedHosts) {
+                val clean = allowed.lowercase()
+                val aMatch = a == clean || a.endsWith(".$clean")
+                val bMatch = b == clean || b.endsWith(".$clean")
+                if (aMatch && bMatch) return true
+            }
+            return false
+        }
 
         private const val IDENTITY_PROBE_SCRIPT = QUOTA_HOOK_INIT_SCRIPT + """
             (() => {
@@ -456,7 +640,7 @@ class AccountWebActivity : AppCompatActivity() {
                   return JSON.stringify({ auth: false, loggedOut: true, typed, email: '' });
                 };
                 const makeLoading = () => JSON.stringify({ auth: false, loggedOut: false, typed, email: '' });
-                if (document.readyState !== 'complete') {
+                if (document.readyState === 'loading') {
                   return makeLoading();
                 }
                 const loginInputs = document.querySelectorAll('input[type="email"], input[type="password"], input[autocomplete="one-time-code"], input[placeholder*="邮箱"], input[placeholder*="手机"], input[placeholder*="email" i], input[placeholder*="phone" i]');
@@ -491,6 +675,9 @@ class AccountWebActivity : AppCompatActivity() {
                 const bodyText = (document.body && document.body.innerText) || '';
                 if (!hasChatComposer && /登录或创建账户|Log in or sign up|Sign in to|登录以继续|通过 Google 继续|Continue with Google|通过 Apple 继续|Continue with Apple/i.test(bodyText)) {
                   return makeLoggedOut();
+                }
+                if (document.readyState !== 'complete') {
+                  return makeLoading();
                 }
                 const bad = /^(support|privacy|help|legal|press|noreply|no-reply|info|security|contact|abuse|feedback|sales|terms)@/i;
                 const re = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
@@ -780,7 +967,9 @@ class AccountWebActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         val spec = currentSpec
+        cancelDownloadBannerTimer()
         releaseSessionViews()
+        downloadExecutor.shutdownNow()
         AccountSessionCoordinator.detachActivity(this)
         if (!closingFromManager && isFinishing && spec != null) {
             AccountSessionCoordinator.emitActivityClosed(spec.switchSeq, spec.viewInstanceId)
@@ -941,8 +1130,79 @@ class AccountWebActivity : AppCompatActivity() {
         popupOverlayRoot.addView(popupHeader)
         popupOverlayRoot.addView(popupWebContainer)
 
+        downloadBannerRoot = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            visibility = View.GONE
+            setPadding(dp(12), dp(8), dp(8), dp(8))
+            elevation = dp(6).toFloat()
+            background = GradientDrawable().apply {
+                setColor(Color.WHITE)
+                cornerRadius = dp(12).toFloat()
+                setStroke(dp(1), Color.parseColor("#CBD5E1"))
+            }
+            layoutParams = FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.BOTTOM,
+            ).apply {
+                setMargins(dp(10), 0, dp(10), dp(10))
+            }
+        }
+
+        downloadBannerText = TextView(this).apply {
+            text = ""
+            setTextColor(Color.parseColor("#111827"))
+            textSize = 12.5f
+            maxLines = 2
+            ellipsize = TextUtils.TruncateAt.END
+            layoutParams = LinearLayout.LayoutParams(
+                0,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                1f,
+            )
+        }
+
+        downloadOpenBtn = Button(this).apply {
+            text = "打开"
+            textSize = 12f
+            isAllCaps = false
+            visibility = View.GONE
+            minWidth = 0
+            minimumWidth = 0
+            setPadding(dp(8), dp(4), dp(8), dp(4))
+            setOnClickListener { openLastDownloadedFile() }
+        }
+
+        downloadDirBtn = Button(this).apply {
+            text = "下载目录"
+            textSize = 12f
+            isAllCaps = false
+            visibility = View.GONE
+            minWidth = 0
+            minimumWidth = 0
+            setPadding(dp(8), dp(4), dp(8), dp(4))
+            setOnClickListener { openDownloadsFolder() }
+        }
+
+        val closeBannerBtn = Button(this).apply {
+            text = "✕"
+            textSize = 12f
+            isAllCaps = false
+            minWidth = 0
+            minimumWidth = 0
+            setPadding(dp(6), dp(4), dp(6), dp(4))
+            setOnClickListener { hideDownloadBanner() }
+        }
+
+        downloadBannerRoot.addView(downloadBannerText)
+        downloadBannerRoot.addView(downloadOpenBtn)
+        downloadBannerRoot.addView(downloadDirBtn)
+        downloadBannerRoot.addView(closeBannerBtn)
+
         root.addView(column)
         root.addView(popupOverlayRoot)
+        root.addView(downloadBannerRoot)
         ViewCompat.setOnApplyWindowInsetsListener(root) { _, insets ->
             val sysBars = insets.getInsets(
                 WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout()
@@ -965,6 +1225,9 @@ class AccountWebActivity : AppCompatActivity() {
             )
             contentFrame.setPadding(sysBars.left, 0, sysBars.right, bottomInset)
             popupWebContainer.setPadding(sysBars.left, 0, sysBars.right, bottomInset)
+            val lp = downloadBannerRoot.layoutParams as FrameLayout.LayoutParams
+            lp.setMargins(sysBars.left + dp(10), 0, sysBars.right + dp(10), bottomInset + dp(10))
+            downloadBannerRoot.layoutParams = lp
             WindowInsetsCompat.CONSUMED
         }
         setContentView(root)
@@ -976,6 +1239,7 @@ class AccountWebActivity : AppCompatActivity() {
         releaseSessionViews(keepPage = true)
 
         currentSpec = spec
+        activeSessionGeneration.incrementAndGet()
         mainInputEnabled = false
         headerTitleView.text = "正在核验会话…"
         loadingView.visibility = View.VISIBLE
@@ -1025,31 +1289,13 @@ class AccountWebActivity : AppCompatActivity() {
         wv.isFocusableInTouchMode = false
         wv.setOnTouchListener { _, _ -> !mainInputEnabled }
 
-        if (cached == null) {
-            wv.settings.apply {
-                javaScriptEnabled = true
-                domStorageEnabled = true
-                databaseEnabled = true
-                setSupportMultipleWindows(true)
-                javaScriptCanOpenWindowsAutomatically = false
-                allowFileAccess = false
-                allowContentAccess = false
-            }
-            if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
-                runCatching {
-                    WebViewCompat.addDocumentStartJavaScript(
-                        wv,
-                        QUOTA_HOOK_INIT_SCRIPT,
-                        setOf(
-                            "https://muse.ai",
-                            "https://*.muse.ai",
-                            "https://app.hark.com",
-                            "https://*.hark.com",
-                        ),
-                    )
-                }
-            }
-        }
+        configureAccountWebView(
+            wv = wv,
+            spec = spec,
+            supportMultipleWindows = true,
+            applyInitialSettings = cached == null,
+            isPopup = false,
+        )
 
         var mainLoadFailed = false
         wv.webViewClient = object : WebViewClient() {
@@ -1081,16 +1327,8 @@ class AccountWebActivity : AppCompatActivity() {
                     return false
                 }
                 if (!ownsMainView(view, spec)) return true
-                val uri = request.url
-                if (AccountSessionCoordinator.isGoogleOAuthHost(uri)) {
-                    AccountSessionCoordinator.emitExternalAuthUnavailable(
-                        spec.switchSeq,
-                        spec.viewInstanceId,
-                        "Google OAuth 按政策需使用系统浏览器，当前回跳暂无法绑定至发起账号的独立 Profile，请使用邮箱或手机号登录",
-                    )
-                    return true
-                }
-                return !AccountSessionCoordinator.hostMatchesAllowed(uri, spec.allowedHosts)
+                val isRedirect = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) request.isRedirect else false
+                return decideMainFrameOverride(view, spec, request.url, isRedirect, isPopup = false)
             }
 
             override fun onPageCommitVisible(view: WebView, url: String) {
@@ -1117,6 +1355,18 @@ class AccountWebActivity : AppCompatActivity() {
                 AccountSessionCoordinator.emitPageCommitVisible(spec, url)
             }
 
+            override fun onPageFinished(view: WebView, url: String?) {
+                if (!ownsMainView(view, spec)) return
+                val runnable = identityProbeRunnable
+                if (runnable != null && mainInputEnabled &&
+                    lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED) &&
+                    !probeAwaitingConfirm
+                ) {
+                    uiHandler.removeCallbacks(runnable)
+                    uiHandler.post(runnable)
+                }
+            }
+
             override fun onRenderProcessGone(view: WebView, detail: RenderProcessGoneDetail): Boolean {
                 if (view === mainWebView && currentSpec === spec) {
                     AccountSessionCoordinator.emitSessionFailed(spec.switchSeq, spec.viewInstanceId, "账号页面已被系统回收，请重新打开")
@@ -1138,6 +1388,10 @@ class AccountWebActivity : AppCompatActivity() {
                 }
                 if (!ownsMainView(view, spec)) return false
                 return createBoundAuthPopup(spec, resultMsg)
+            }
+
+            override fun onPermissionRequest(request: PermissionRequest) {
+                handleWebPermissionRequest(request)
             }
 
             override fun onShowFileChooser(
@@ -1221,15 +1475,13 @@ class AccountWebActivity : AppCompatActivity() {
         popup.isFocusableInTouchMode = false
         popup.setOnTouchListener { _, _ -> !popupInputEnabled }
 
-        popup.settings.apply {
-            javaScriptEnabled = true
-            domStorageEnabled = true
-            databaseEnabled = true
-            setSupportMultipleWindows(false)
-            javaScriptCanOpenWindowsAutomatically = false
-            allowFileAccess = false
-            allowContentAccess = false
-        }
+        configureAccountWebView(
+            wv = popup,
+            spec = spec,
+            supportMultipleWindows = false,
+            applyInitialSettings = true,
+            isPopup = true,
+        )
 
         popup.webViewClient = object : WebViewClient() {
             override fun shouldOverrideUrlLoading(
@@ -1242,24 +1494,8 @@ class AccountWebActivity : AppCompatActivity() {
                 if (view !== popupWebView || !AccountSessionCoordinator.isCurrent(spec.switchSeq, spec.viewInstanceId)) {
                     return true
                 }
-                val uri = request.url
-                if (uri.toString() == "about:blank") {
-                    return false
-                }
-                if (AccountSessionCoordinator.isGoogleOAuthHost(uri)) {
-                    destroyPopupWebView()
-                    AccountSessionCoordinator.emitExternalAuthUnavailable(
-                        spec.switchSeq,
-                        spec.viewInstanceId,
-                        "Google OAuth 按政策需使用系统浏览器，当前回跳暂无法绑定至发起账号的独立 Profile，请使用邮箱或手机号登录",
-                    )
-                    return true
-                }
-                if (!AccountSessionCoordinator.hostMatchesAllowed(uri, spec.allowedHosts)) {
-                    destroyPopupWebView()
-                    return true
-                }
-                return false
+                val isRedirect = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) request.isRedirect else false
+                return decideMainFrameOverride(view, spec, request.url, isRedirect, isPopup = true)
             }
 
             override fun onPageCommitVisible(view: WebView, url: String) {
@@ -1299,6 +1535,10 @@ class AccountWebActivity : AppCompatActivity() {
         popup.webChromeClient = object : WebChromeClient() {
             override fun onCloseWindow(window: WebView?) {
                 if (window === popupWebView) destroyPopupWebView()
+            }
+
+            override fun onPermissionRequest(request: PermissionRequest) {
+                handleWebPermissionRequest(request)
             }
         }
 
@@ -1341,6 +1581,7 @@ class AccountWebActivity : AppCompatActivity() {
     private fun stopIdentityProbeLoop() {
         identityProbeRunnable?.let { uiHandler.removeCallbacks(it) }
         identityProbeRunnable = null
+        probeAwaitingConfirm = false
     }
 
     private data class ProbeData(
@@ -1384,6 +1625,7 @@ class AccountWebActivity : AppCompatActivity() {
                         }
                         if (parsed.auth) {
                             consecutiveLoggedOut = 0
+                            probeAwaitingConfirm = false
                             loggedOutReported = false
                             val resolved = parsed.email.ifEmpty { capturedIdentityHint.orEmpty() }
                             AccountSessionCoordinator.emitIdentityDetected(
@@ -1397,14 +1639,19 @@ class AccountWebActivity : AppCompatActivity() {
                         } else if (parsed.loggedOut) {
                             consecutiveLoggedOut += 1
                             if (consecutiveLoggedOut == 1) {
+                                probeAwaitingConfirm = true
                                 uiHandler.removeCallbacks(this)
-                                uiHandler.postDelayed(this, 1000L)
+                                uiHandler.postDelayed(this, 350L)
                             } else if (consecutiveLoggedOut >= 2 && !loggedOutReported) {
+                                probeAwaitingConfirm = false
                                 loggedOutReported = true
                                 AccountSessionCoordinator.emitSessionLoggedOut(spec)
+                            } else {
+                                probeAwaitingConfirm = false
                             }
                         } else {
                             consecutiveLoggedOut = 0
+                            probeAwaitingConfirm = false
                         }
                     }
                 }
@@ -1412,7 +1659,7 @@ class AccountWebActivity : AppCompatActivity() {
             }
         }
         identityProbeRunnable = task
-        uiHandler.postDelayed(task, 1400L)
+        uiHandler.postDelayed(task, 250L)
     }
 
     private fun parseProbeOutput(raw: String?): ProbeData? {
@@ -1466,6 +1713,8 @@ class AccountWebActivity : AppCompatActivity() {
         popupOverlayRoot.visibility = View.GONE
         popupDomainLabel.text = ""
         popupWebContainer.removeAllViews()
+        popup?.setDownloadListener(null)
+        popup?.removeJavascriptInterface(ANDROID_DOWNLOAD_BRIDGE_NAME)
         popup?.destroy()
     }
 
@@ -1474,6 +1723,8 @@ class AccountWebActivity : AppCompatActivity() {
         val view = mainWebView
         val retain = keepPage && mainInputEnabled && popupWebView == null && committedAuthority != null &&
             view?.url?.let(Uri::parse)?.encodedAuthority == committedAuthority
+        activeSessionGeneration.incrementAndGet()
+        cancelAllBlobTransfers()
         mainWebView = null
         currentSpec = null
         committedAuthority = null
@@ -1484,6 +1735,8 @@ class AccountWebActivity : AppCompatActivity() {
         destroyPopupWebView()
         mainWebContainer.removeAllViews()
         if (view == null) return
+        view.setDownloadListener(null)
+        view.removeJavascriptInterface(ANDROID_DOWNLOAD_BRIDGE_NAME)
         if (retain && spec != null) {
             view.visibility = View.INVISIBLE
             view.clearFocus()
@@ -1492,6 +1745,727 @@ class AccountWebActivity : AppCompatActivity() {
             RecentAccountPages.park(view, spec)
         } else {
             view.destroy()
+        }
+    }
+
+    @SuppressLint("SetJavaScriptEnabled")
+    private fun configureAccountWebView(
+        wv: WebView,
+        spec: AndroidAccountSessionSpec,
+        supportMultipleWindows: Boolean,
+        applyInitialSettings: Boolean,
+        isPopup: Boolean,
+    ) {
+        runCatching {
+            val cm = WebViewCompat.getProfile(wv).cookieManager
+            cm.setAcceptCookie(true)
+            cm.setAcceptThirdPartyCookies(wv, true)
+        }
+        if (applyInitialSettings) {
+            wv.settings.apply {
+                javaScriptEnabled = true
+                domStorageEnabled = true
+                databaseEnabled = true
+                setSupportMultipleWindows(supportMultipleWindows)
+                javaScriptCanOpenWindowsAutomatically = false
+                allowFileAccess = false
+                allowContentAccess = false
+                mediaPlaybackRequiresUserGesture = false
+                mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
+                val cleanUa = sanitizeAndroidUserAgent(userAgentString)
+                if (cleanUa != userAgentString) {
+                    userAgentString = cleanUa
+                }
+            }
+            if (!isPopup && WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
+                runCatching {
+                    WebViewCompat.addDocumentStartJavaScript(
+                        wv,
+                        QUOTA_HOOK_INIT_SCRIPT,
+                        setOf(
+                            "https://muse.ai",
+                            "https://*.muse.ai",
+                            "https://app.hark.com",
+                            "https://*.hark.com",
+                        ),
+                    )
+                }
+            }
+        }
+        wv.addJavascriptInterface(blobBridge, ANDROID_DOWNLOAD_BRIDGE_NAME)
+        wv.setDownloadListener(DownloadListener { url, userAgent, contentDisposition, mimeType, _ ->
+            handleDownloadRequest(wv, spec, url, userAgent, contentDisposition, mimeType, isPopup)
+        })
+    }
+
+    private fun handleWebPermissionRequest(request: PermissionRequest) {
+        val protectedOnly = request.resources
+            ?.filter { it == PermissionRequest.RESOURCE_PROTECTED_MEDIA_ID }
+            ?.toTypedArray()
+        if (!protectedOnly.isNullOrEmpty()) {
+            request.grant(protectedOnly)
+        } else {
+            request.deny()
+        }
+    }
+
+    private fun decideMainFrameOverride(
+        view: WebView,
+        spec: AndroidAccountSessionSpec,
+        uri: Uri,
+        isRedirect: Boolean,
+        isPopup: Boolean,
+    ): Boolean {
+        val raw = uri.toString()
+        if (isPopup && raw == "about:blank") {
+            return false
+        }
+        if (raw == "about:srcdoc") {
+            return false
+        }
+        if (raw.startsWith("blob:https://", ignoreCase = true)) {
+            val innerUri = runCatching { Uri.parse(raw.substring(5)) }.getOrNull()
+            val allowed = AccountSessionCoordinator.hostMatchesAllowed(innerUri, spec.allowedHosts)
+            if (!allowed && isPopup) destroyPopupWebView()
+            return !allowed
+        }
+        if (AccountSessionCoordinator.isGoogleOAuthHost(uri)) {
+            if (isPopup) destroyPopupWebView()
+            AccountSessionCoordinator.emitExternalAuthUnavailable(
+                spec.switchSeq,
+                spec.viewInstanceId,
+                "Google OAuth 按政策需使用系统浏览器，当前回跳暂无法绑定至发起账号的独立 Profile，请使用邮箱或手机号登录",
+            )
+            return true
+        }
+        if (shouldInterceptUrlAsDownload(uri, isRedirect)) {
+            handleDownloadRequest(
+                view = view,
+                spec = spec,
+                url = raw,
+                userAgent = view.settings.userAgentString,
+                contentDisposition = null,
+                mimeType = null,
+                isPopup = isPopup,
+            )
+            return true
+        }
+        val allowed = AccountSessionCoordinator.hostMatchesAllowed(uri, spec.allowedHosts)
+        if (!allowed && isPopup) {
+            destroyPopupWebView()
+        }
+        return !allowed
+    }
+
+    private fun handleDownloadRequest(
+        view: WebView,
+        spec: AndroidAccountSessionSpec,
+        url: String?,
+        userAgent: String?,
+        contentDisposition: String?,
+        mimeType: String?,
+        isPopup: Boolean,
+    ) {
+        if (url.isNullOrBlank()) return
+        if (currentSpec !== spec || !AccountSessionCoordinator.isCurrent(spec.switchSeq, spec.viewInstanceId)) {
+            return
+        }
+        val gen = activeSessionGeneration.get()
+        if (isPopup && popupOverlayRoot.visibility != View.VISIBLE && !url.startsWith("blob:", ignoreCase = true)) {
+            destroyPopupWebView()
+        }
+        when {
+            url.startsWith("blob:", ignoreCase = true) -> {
+                val defaultName = sanitizeDownloadFilename(
+                    parseContentDispositionFilename(contentDisposition),
+                    mimeType,
+                )
+                startBlobDownload(view, gen, url, defaultName, mimeType, isPopup)
+            }
+            url.startsWith("data:", ignoreCase = true) -> {
+                startDataDownload(gen, url, contentDisposition, mimeType)
+            }
+            url.startsWith("https://", ignoreCase = true) || url.startsWith("http://", ignoreCase = true) -> {
+                val guessed = parseContentDispositionFilename(contentDisposition)
+                    ?: runCatching { URLUtil.guessFileName(url, contentDisposition, mimeType) }.getOrNull()
+                val initialName = sanitizeDownloadFilename(guessed, mimeType)
+                val profileCookies = runCatching {
+                    WebViewCompat.getProfile(view).cookieManager
+                }.getOrNull()
+                val refererUrl = view.url
+                val effectiveUa = userAgent?.takeIf { it.isNotBlank() } ?: view.settings.userAgentString
+                startHttpDownload(
+                    sessionGen = gen,
+                    spec = spec,
+                    rawUrl = url,
+                    initialName = initialName,
+                    declaredMime = mimeType,
+                    userAgent = effectiveUa,
+                    refererUrl = refererUrl,
+                    profileCookieManager = profileCookies,
+                )
+            }
+            else -> {
+                showDownloadStatus("暂不支持此下载链接协议", canOpen = false, showDir = false, isError = true, autoHide = true)
+            }
+        }
+    }
+
+    private fun startHttpDownload(
+        sessionGen: Long,
+        spec: AndroidAccountSessionSpec,
+        rawUrl: String,
+        initialName: String,
+        declaredMime: String?,
+        userAgent: String,
+        refererUrl: String?,
+        profileCookieManager: android.webkit.CookieManager?,
+    ) {
+        showDownloadStatus("正在下载：$initialName…", canOpen = false, showDir = false, isError = false, autoHide = false)
+        downloadExecutor.execute {
+            var conn: HttpURLConnection? = null
+            try {
+                val initialParsed = URL(rawUrl)
+                var currentUrl = initialParsed
+                var activeConn: HttpURLConnection? = null
+                for (hop in 0 until 10) {
+                    val scheme = currentUrl.protocol.lowercase()
+                    if (scheme != "https" && scheme != "http") {
+                        throw IllegalArgumentException("不支持的下载地址协议")
+                    }
+                    val c = (currentUrl.openConnection() as HttpURLConnection).apply {
+                        connectTimeout = 20_000
+                        readTimeout = 60_000
+                        instanceFollowRedirects = false
+                        if (userAgent.isNotEmpty()) setRequestProperty("User-Agent", userAgent)
+                        if (isSameSiteOrAllowedHost(initialParsed.host, currentUrl.host, spec.allowedHosts)) {
+                            profileCookieManager?.getCookie(currentUrl.toString())
+                                ?.takeIf { it.isNotEmpty() }
+                                ?.let { setRequestProperty("Cookie", it) }
+                            if (!refererUrl.isNullOrBlank() &&
+                                isSameSiteOrAllowedHost(initialParsed.host, Uri.parse(refererUrl).host, spec.allowedHosts)
+                            ) {
+                                setRequestProperty("Referer", refererUrl)
+                            }
+                        }
+                    }
+                    val code = c.responseCode
+                    if (code == HttpURLConnection.HTTP_MOVED_PERM ||
+                        code == HttpURLConnection.HTTP_MOVED_TEMP ||
+                        code == HttpURLConnection.HTTP_SEE_OTHER ||
+                        code == 307 ||
+                        code == 308
+                    ) {
+                        val loc = c.getHeaderField("Location")
+                        c.disconnect()
+                        if (loc.isNullOrBlank()) throw IllegalStateException("下载重定向缺少目标地址")
+                        currentUrl = URL(currentUrl, loc)
+                        continue
+                    }
+                    activeConn = c
+                    break
+                }
+                conn = activeConn ?: throw IllegalStateException("下载重定向次数过多")
+                val status = conn.responseCode
+                if (status !in 200..299) {
+                    throw IllegalStateException("服务器返回错误状态（HTTP $status）")
+                }
+                val contentDisp = conn.getHeaderField("Content-Disposition")
+                val serverMime = conn.contentType ?: declaredMime
+                val rawName = parseContentDispositionFilename(contentDisp)
+                    ?: runCatching { URLUtil.guessFileName(currentUrl.toString(), contentDisp, serverMime) }.getOrNull()
+                    ?: initialName
+                val finalName = sanitizeDownloadFilename(rawName, serverMime)
+                val finalMime = resolveMimeType(finalName, serverMime)
+                val saved = conn.inputStream.use { input ->
+                    saveStreamToPublicDownloads(finalName, finalMime) { out ->
+                        copyStreamWithCheck(input, out, sessionGen)
+                    }
+                }
+                onDownloadCompleted(sessionGen, saved)
+            } catch (t: Throwable) {
+                onDownloadFailed(sessionGen, t.message ?: "网络下载失败")
+            } finally {
+                conn?.disconnect()
+            }
+        }
+    }
+
+    private fun startDataDownload(
+        sessionGen: Long,
+        dataUrl: String,
+        contentDisposition: String?,
+        declaredMime: String?,
+    ) {
+        val commaIdx = dataUrl.indexOf(',')
+        if (commaIdx <= 5) {
+            showDownloadStatus("无效的数据下载链接", canOpen = false, showDir = false, isError = true, autoHide = true)
+            return
+        }
+        val meta = dataUrl.substring(5, commaIdx)
+        val payload = dataUrl.substring(commaIdx + 1)
+        val isBase64 = meta.split(';').any { it.trim().equals("base64", ignoreCase = true) }
+        val dataMime = meta.substringBefore(';').trim().ifEmpty { declaredMime ?: "application/octet-stream" }
+        val fileName = sanitizeDownloadFilename(parseContentDispositionFilename(contentDisposition), dataMime)
+        showDownloadStatus("正在保存：$fileName…", canOpen = false, showDir = false, isError = false, autoHide = false)
+        downloadExecutor.execute {
+            try {
+                val bytes = if (isBase64) {
+                    Base64.decode(payload, Base64.DEFAULT)
+                } else {
+                    URLDecoder.decode(payload, "UTF-8").toByteArray(Charsets.UTF_8)
+                }
+                val finalMime = resolveMimeType(fileName, dataMime)
+                val saved = saveStreamToPublicDownloads(fileName, finalMime) { out ->
+                    out.write(bytes)
+                }
+                onDownloadCompleted(sessionGen, saved)
+            } catch (t: Throwable) {
+                onDownloadFailed(sessionGen, t.message ?: "保存数据失败")
+            }
+        }
+    }
+
+    private fun startBlobDownload(
+        view: WebView,
+        sessionGen: Long,
+        blobUrl: String,
+        defaultName: String,
+        mimeType: String?,
+        isPopup: Boolean,
+    ) {
+        val token = UUID.randomUUID().toString()
+        synchronized(blobLock) {
+            pendingBlobTokens[token] = BlobInitMeta(
+                generation = sessionGen,
+                defaultName = defaultName,
+                fallbackMime = mimeType?.trim().orEmpty(),
+            )
+        }
+        showDownloadStatus("正在下载：$defaultName…", canOpen = false, showDir = false, isError = false, autoHide = false)
+        val quotedToken = JSONObject.quote(token)
+        val quotedUrl = JSONObject.quote(blobUrl)
+        val js = """
+            (() => {
+              const token = $quotedToken;
+              const blobUrl = $quotedUrl;
+              const bridge = window.$ANDROID_DOWNLOAD_BRIDGE_NAME;
+              if (!bridge) return;
+              (async () => {
+                try {
+                  const last = window.__maamLastDownload;
+                  const hintName = (last && Date.now() - last.ts < 15000 && (!last.url || last.url === blobUrl))
+                    ? (last.name || '')
+                    : '';
+                  const res = await fetch(blobUrl);
+                  if (!res.ok) throw new Error('HTTP ' + res.status);
+                  const blob = await res.blob();
+                  const mime = blob.type || '';
+                  bridge.beginBlobDownload(token, hintName, mime);
+                  const chunkSize = 384 * 1024;
+                  let offset = 0;
+                  while (offset < blob.size) {
+                    const slice = blob.slice(offset, offset + chunkSize);
+                    const buf = await slice.arrayBuffer();
+                    const bytes = new Uint8Array(buf);
+                    let binary = '';
+                    const step = 0x8000;
+                    for (let i = 0; i < bytes.length; i += step) {
+                      binary += String.fromCharCode.apply(null, bytes.subarray(i, i + step));
+                    }
+                    bridge.appendBlobChunk(token, btoa(binary));
+                    offset += chunkSize;
+                  }
+                  bridge.finishBlobDownload(token, ${if (isPopup) "true" else "false"});
+                } catch (e) {
+                  try {
+                    bridge.failBlobDownload(token, (e && e.message) ? String(e.message) : '读取 Blob 文件失败', ${if (isPopup) "true" else "false"});
+                  } catch (_) {}
+                }
+              })();
+            })();
+        """.trimIndent()
+        view.evaluateJavascript(js, null)
+    }
+
+    private inner class AndroidBlobDownloadBridge {
+        @JavascriptInterface
+        fun beginBlobDownload(token: String, hintName: String, mimeType: String) {
+            val meta = synchronized(blobLock) {
+                val m = pendingBlobTokens.remove(token) ?: return
+                if (m.generation != activeSessionGeneration.get()) return
+                m
+            }
+            val effectiveMime = mimeType.trim().ifEmpty { meta.fallbackMime }
+            val resolvedName = sanitizeDownloadFilename(
+                hintName.trim().ifEmpty { meta.defaultName },
+                effectiveMime,
+            )
+            val tmpDir = File(applicationContext.cacheDir, "dl_tmp").apply { mkdirs() }
+            val tempFile = File(tmpDir, "blob_${UUID.randomUUID()}.part")
+            try {
+                val fos = FileOutputStream(tempFile)
+                val session = BlobTransferSession(
+                    token = token,
+                    generation = meta.generation,
+                    defaultName = resolvedName,
+                    tempFile = tempFile,
+                    stream = fos,
+                    mimeType = effectiveMime,
+                    hintName = hintName.trim(),
+                )
+                synchronized(blobLock) {
+                    if (meta.generation != activeSessionGeneration.get()) {
+                        runCatching { fos.close() }
+                        tempFile.delete()
+                        return
+                    }
+                    activeBlobSessions[token] = session
+                }
+                uiHandler.post {
+                    if (activeSessionGeneration.get() == meta.generation) {
+                        showDownloadStatus("正在下载：$resolvedName…", canOpen = false, showDir = false, isError = false, autoHide = false)
+                    }
+                }
+            } catch (t: Throwable) {
+                tempFile.delete()
+                onDownloadFailed(meta.generation, t.message ?: "无法创建临时下载文件")
+            }
+        }
+
+        @JavascriptInterface
+        fun appendBlobChunk(token: String, base64Chunk: String) {
+            val session = synchronized(blobLock) { activeBlobSessions[token] } ?: return
+            if (session.generation != activeSessionGeneration.get()) {
+                abortBlobSession(token)
+                return
+            }
+            try {
+                val bytes = Base64.decode(base64Chunk, Base64.DEFAULT)
+                synchronized(blobLock) {
+                    val active = activeBlobSessions[token] ?: return
+                    if (active.generation != activeSessionGeneration.get()) {
+                        activeBlobSessions.remove(token)
+                        runCatching { active.stream.close() }
+                        active.tempFile.delete()
+                        return
+                    }
+                    if (active.totalBytes + bytes.size > MAX_BLOB_DOWNLOAD_BYTES) {
+                        activeBlobSessions.remove(token)
+                        runCatching { active.stream.close() }
+                        active.tempFile.delete()
+                        onDownloadFailed(active.generation, "文件超过 256MB 大小限制")
+                        return
+                    }
+                    active.stream.write(bytes)
+                    active.totalBytes += bytes.size
+                }
+            } catch (t: Throwable) {
+                abortBlobSession(token)
+                onDownloadFailed(session.generation, t.message ?: "写入下载分片失败")
+            }
+        }
+
+        @JavascriptInterface
+        fun finishBlobDownload(token: String, closeHiddenPopup: Boolean) {
+            val session = synchronized(blobLock) { activeBlobSessions.remove(token) } ?: return
+            runCatching {
+                session.stream.flush()
+                session.stream.close()
+            }
+            if (closeHiddenPopup) {
+                uiHandler.post {
+                    if (popupOverlayRoot.visibility != View.VISIBLE) {
+                        destroyPopupWebView()
+                    }
+                }
+            }
+            if (session.generation != activeSessionGeneration.get()) {
+                session.tempFile.delete()
+                return
+            }
+            val finalName = sanitizeDownloadFilename(
+                session.hintName.ifEmpty { session.defaultName },
+                session.mimeType,
+            )
+            val finalMime = resolveMimeType(finalName, session.mimeType)
+            downloadExecutor.execute {
+                try {
+                    val saved = FileInputStream(session.tempFile).use { input ->
+                        saveStreamToPublicDownloads(finalName, finalMime) { out ->
+                            copyStreamWithCheck(input, out, session.generation)
+                        }
+                    }
+                    onDownloadCompleted(session.generation, saved)
+                } catch (t: Throwable) {
+                    onDownloadFailed(session.generation, t.message ?: "导出文件失败")
+                } finally {
+                    session.tempFile.delete()
+                }
+            }
+        }
+
+        @JavascriptInterface
+        fun failBlobDownload(token: String, reason: String, closeHiddenPopup: Boolean) {
+            val gen = abortBlobSession(token) ?: synchronized(blobLock) {
+                pendingBlobTokens.remove(token)?.generation
+            }
+            if (closeHiddenPopup) {
+                uiHandler.post {
+                    if (popupOverlayRoot.visibility != View.VISIBLE) {
+                        destroyPopupWebView()
+                    }
+                }
+            }
+            if (gen != null) {
+                onDownloadFailed(gen, reason.ifBlank { "下载失败" })
+            }
+        }
+    }
+
+    private fun abortBlobSession(token: String): Long? {
+        val session = synchronized(blobLock) { activeBlobSessions.remove(token) } ?: return null
+        runCatching { session.stream.close() }
+        session.tempFile.delete()
+        return session.generation
+    }
+
+    private fun cancelAllBlobTransfers() {
+        val sessions = synchronized(blobLock) {
+            pendingBlobTokens.clear()
+            activeBlobSessions.values.toList().also { activeBlobSessions.clear() }
+        }
+        for (s in sessions) {
+            runCatching { s.stream.close() }
+            s.tempFile.delete()
+        }
+    }
+
+    private fun copyStreamWithCheck(input: InputStream, output: OutputStream, sessionGen: Long) {
+        val buf = ByteArray(16 * 1024)
+        while (true) {
+            if (Thread.currentThread().isInterrupted || sessionGen != activeSessionGeneration.get()) {
+                throw InterruptedException("会话已切换")
+            }
+            val n = input.read(buf)
+            if (n <= 0) break
+            output.write(buf, 0, n)
+        }
+        output.flush()
+    }
+
+    private fun saveStreamToPublicDownloads(
+        filename: String,
+        mimeType: String,
+        writer: (OutputStream) -> Unit,
+    ): SavedDownloadResult {
+        val ctx = applicationContext
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val resolver = ctx.contentResolver
+            val values = ContentValues().apply {
+                put(MediaStore.Downloads.DISPLAY_NAME, filename)
+                put(MediaStore.Downloads.MIME_TYPE, mimeType)
+                put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+                put(MediaStore.Downloads.IS_PENDING, 1)
+            }
+            val itemUri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                ?: throw IllegalStateException("无法创建系统下载目录文件")
+            try {
+                resolver.openOutputStream(itemUri, "w")?.use { out ->
+                    writer(out)
+                } ?: throw IllegalStateException("无法写入系统下载文件")
+                val doneValues = ContentValues().apply {
+                    put(MediaStore.Downloads.IS_PENDING, 0)
+                }
+                runCatching { resolver.update(itemUri, doneValues, null, null) }
+                val actualName = runCatching {
+                    resolver.query(itemUri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null)
+                        ?.use { cursor ->
+                            if (cursor.moveToFirst()) cursor.getString(0) else null
+                        }
+                }.getOrNull()?.takeIf { it.isNotBlank() } ?: filename
+                return SavedDownloadResult(
+                    filename = actualName,
+                    mimeType = mimeType,
+                    openUri = itemUri,
+                    publicDownloads = true,
+                    fallbackDir = null,
+                )
+            } catch (t: Throwable) {
+                runCatching { resolver.delete(itemUri, null, null) }
+                throw t
+            }
+        }
+
+        val publicDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+        val tryPublic = runCatching {
+            if (!publicDir.exists()) publicDir.mkdirs()
+            val outFile = createUniqueFile(publicDir, filename)
+            try {
+                FileOutputStream(outFile).use { out -> writer(out) }
+            } catch (t: Throwable) {
+                outFile.delete()
+                throw t
+            }
+            MediaScannerConnection.scanFile(ctx, arrayOf(outFile.absolutePath), arrayOf(mimeType), null)
+            val uri = runCatching {
+                FileProvider.getUriForFile(ctx, "${ctx.packageName}.fileprovider", outFile)
+            }.getOrNull()
+            SavedDownloadResult(
+                filename = outFile.name,
+                mimeType = mimeType,
+                openUri = uri,
+                publicDownloads = true,
+                fallbackDir = publicDir,
+            )
+        }.getOrNull()
+        if (tryPublic != null) return tryPublic
+
+        val fallbackDir = ctx.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
+            ?: File(ctx.filesDir, "Download")
+        if (!fallbackDir.exists()) fallbackDir.mkdirs()
+        val fallbackFile = createUniqueFile(fallbackDir, filename)
+        try {
+            FileOutputStream(fallbackFile).use { out -> writer(out) }
+        } catch (t: Throwable) {
+            fallbackFile.delete()
+            throw t
+        }
+        return SavedDownloadResult(
+            filename = fallbackFile.name,
+            mimeType = mimeType,
+            openUri = null,
+            publicDownloads = false,
+            fallbackDir = fallbackDir,
+        )
+    }
+
+    private fun createUniqueFile(dir: File, filename: String): File {
+        var candidate = File(dir, filename)
+        if (!candidate.exists()) return candidate
+        val dot = filename.lastIndexOf('.')
+        val stem = if (dot > 0) filename.substring(0, dot) else filename
+        val ext = if (dot > 0) filename.substring(dot) else ""
+        var counter = 1
+        while (candidate.exists() && counter < 1000) {
+            candidate = File(dir, "$stem ($counter)$ext")
+            counter += 1
+        }
+        return candidate
+    }
+
+    private fun onDownloadCompleted(sessionGen: Long, saved: SavedDownloadResult) {
+        uiHandler.post {
+            if (isFinishing || isDestroyed || sessionGen != activeSessionGeneration.get()) return@post
+            lastDownloadedUri = saved.openUri
+            lastDownloadedMime = saved.mimeType
+            lastDownloadedFallbackDir = saved.fallbackDir
+            val prefix = if (saved.publicDownloads) "已保存到「下载」" else "已保存（应用下载目录）"
+            showDownloadStatus(
+                text = "$prefix：${saved.filename}",
+                canOpen = saved.openUri != null,
+                showDir = saved.publicDownloads,
+                isError = false,
+                autoHide = true,
+            )
+        }
+    }
+
+    private fun onDownloadFailed(sessionGen: Long, reason: String) {
+        uiHandler.post {
+            if (isFinishing || isDestroyed || sessionGen != activeSessionGeneration.get()) return@post
+            lastDownloadedUri = null
+            showDownloadStatus(
+                text = "下载失败：$reason",
+                canOpen = false,
+                showDir = false,
+                isError = true,
+                autoHide = true,
+            )
+        }
+    }
+
+    private fun showDownloadStatus(
+        text: String,
+        canOpen: Boolean,
+        showDir: Boolean,
+        isError: Boolean,
+        autoHide: Boolean,
+    ) {
+        cancelDownloadBannerTimer()
+        downloadBannerText.text = text
+        downloadBannerText.setTextColor(
+            Color.parseColor(if (isError) "#B91C1C" else "#111827")
+        )
+        downloadOpenBtn.visibility = if (canOpen) View.VISIBLE else View.GONE
+        downloadDirBtn.visibility = if (showDir) View.VISIBLE else View.GONE
+        downloadBannerRoot.visibility = View.VISIBLE
+        if (autoHide) {
+            val task = Runnable { hideDownloadBanner() }
+            downloadBannerHideRunnable = task
+            uiHandler.postDelayed(task, 10_000L)
+        }
+    }
+
+    private fun cancelDownloadBannerTimer() {
+        downloadBannerHideRunnable?.let { uiHandler.removeCallbacks(it) }
+        downloadBannerHideRunnable = null
+    }
+
+    private fun hideDownloadBanner() {
+        cancelDownloadBannerTimer()
+        downloadBannerRoot.visibility = View.GONE
+    }
+
+    private fun openLastDownloadedFile() {
+        val uri = lastDownloadedUri ?: return
+        val intent = Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(uri, lastDownloadedMime)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        try {
+            startActivity(intent)
+        } catch (_: ActivityNotFoundException) {
+            val generic = Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(uri, "*/*")
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            if (runCatching { startActivity(generic) }.isFailure) {
+                showDownloadStatus(
+                    text = "暂无可直接打开此格式的应用，请点「下载目录」查看",
+                    canOpen = false,
+                    showDir = true,
+                    isError = false,
+                    autoHide = true,
+                )
+            }
+        } catch (_: Throwable) {
+            openDownloadsFolder()
+        }
+    }
+
+    private fun openDownloadsFolder() {
+        val openedDownloads = runCatching {
+            startActivity(Intent(DownloadManager.ACTION_VIEW_DOWNLOADS))
+        }.isSuccess
+        if (openedDownloads) return
+
+        val openedDoc = runCatching {
+            val docIntent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                addCategory(Intent.CATEGORY_OPENABLE)
+                type = "*/*"
+            }
+            startActivity(docIntent)
+        }.isSuccess
+        if (!openedDoc) {
+            val hint = lastDownloadedFallbackDir?.absolutePath ?: "系统「文件管理 -> 下载」"
+            showDownloadStatus(
+                text = "请前往 $hint 查看已下载文件",
+                canOpen = lastDownloadedUri != null,
+                showDir = false,
+                isError = false,
+                autoHide = true,
+            )
         }
     }
 }
