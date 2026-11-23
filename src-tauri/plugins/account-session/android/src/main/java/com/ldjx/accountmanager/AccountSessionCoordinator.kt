@@ -134,6 +134,9 @@ object AccountSessionCoordinator {
             return false
         }
         val host = uri.host?.lowercase() ?: return false
+        if (allowedHosts.any { it == "*" }) {
+            return true
+        }
         return allowedHosts.any { allowed ->
             val clean = allowed.lowercase()
             host == clean || host.endsWith(".$clean")

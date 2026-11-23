@@ -1,7 +1,7 @@
-use crate::providers::ProviderId;
+use crate::providers::{normalize_custom_provider_input, CustomProviderRecord, ProviderId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
@@ -9,6 +9,39 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 pub const STORE_VERSION: u32 = 2;
+
+fn default_true() -> bool {
+  true
+}
+
+pub fn default_global_shortcut() -> String {
+  #[cfg(target_os = "macos")]
+  {
+    "CommandOrControl+Shift+M".to_string()
+  }
+  #[cfg(not(target_os = "macos"))]
+  {
+    "CommandOrControl+Shift+M".to_string()
+  }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppSettings {
+  #[serde(default = "default_true")]
+  pub minimize_to_tray: bool,
+  #[serde(default = "default_global_shortcut")]
+  pub global_shortcut: String,
+}
+
+impl Default for AppSettings {
+  fn default() -> Self {
+    Self {
+      minimize_to_tray: true,
+      global_shortcut: default_global_shortcut(),
+    }
+  }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -68,6 +101,10 @@ pub struct AccountRecord {
   pub quota_detail: Option<QuotaDetail>,
   #[serde(default)]
   pub auth_state: AuthState,
+  #[serde(default)]
+  pub cookie_expires_at_ms: Option<u64>,
+  #[serde(default)]
+  pub cookie_session_only: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,6 +121,10 @@ pub struct AccountsStoreFile {
   pub accounts: Vec<AccountRecord>,
   pub last_committed: Option<AccountKey>,
   pub pending_cleanup: Vec<AccountKey>,
+  #[serde(default)]
+  pub custom_providers: Vec<CustomProviderRecord>,
+  #[serde(default)]
+  pub settings: AppSettings,
 }
 
 impl Default for AccountsStoreFile {
@@ -93,6 +134,8 @@ impl Default for AccountsStoreFile {
       accounts: Vec::new(),
       last_committed: None,
       pending_cleanup: Vec::new(),
+      custom_providers: Vec::new(),
+      settings: AppSettings::default(),
     }
   }
 }
@@ -119,7 +162,7 @@ pub fn detect_conflicts(accounts: &[AccountRecord]) -> Vec<ConflictItem> {
   for acc in accounts {
     let entry = by_uuid.entry(acc.uuid.clone()).or_default();
     if !entry.contains(&acc.provider_id) {
-      entry.push(acc.provider_id);
+      entry.push(acc.provider_id.clone());
     }
   }
   let mut count_by_uuid: BTreeMap<String, usize> = BTreeMap::new();
@@ -139,7 +182,7 @@ pub fn detect_conflicts(accounts: &[AccountRecord]) -> Vec<ConflictItem> {
 fn parse_key_or_legacy_muse(val: &Value) -> Option<AccountKey> {
   if let Some(raw_uuid) = val.as_str() {
     return normalize_uuid(raw_uuid).map(|uuid| AccountKey {
-      provider_id: ProviderId::Muse,
+      provider_id: ProviderId::muse(),
       uuid,
     });
   }
@@ -152,7 +195,7 @@ fn parse_key_or_legacy_muse(val: &Value) -> Option<AccountKey> {
   let uuid = normalize_uuid(raw_uuid)?;
   let provider_id = match obj.get("providerId").or_else(|| obj.get("provider_id")) {
     Some(v) => ProviderId::parse(v.as_str()?)?,
-    None => ProviderId::Muse,
+    None => ProviderId::muse(),
   };
   Some(AccountKey { provider_id, uuid })
 }
@@ -168,7 +211,58 @@ fn migrate_from_value(root: Value) -> Result<(AccountsStoreFile, bool), String> 
     .map(|v| v as u32)
     .unwrap_or(1);
 
-  let is_legacy = file_version < STORE_VERSION;
+  let mut dirty = file_version < STORE_VERSION;
+  let is_legacy = dirty;
+
+  let mut custom_providers = Vec::new();
+  let mut custom_ids = HashSet::new();
+  if let Some(arr) = obj
+    .get("customProviders")
+    .or_else(|| obj.get("custom_providers"))
+    .and_then(|v| v.as_array())
+  {
+    for item in arr {
+      let Some(item_obj) = item.as_object() else {
+        dirty = true;
+        continue;
+      };
+      let Some(id_str) = item_obj.get("id").and_then(|v| v.as_str()) else {
+        dirty = true;
+        continue;
+      };
+      let Some(pid) = ProviderId::parse(id_str) else {
+        dirty = true;
+        continue;
+      };
+      if pid.is_builtin() || custom_ids.contains(&pid) {
+        dirty = true;
+        continue;
+      }
+      let raw_name = item_obj.get("name").and_then(|v| v.as_str()).unwrap_or("");
+      let raw_url = item_obj
+        .get("entryUrl")
+        .or_else(|| item_obj.get("entry_url"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+      let Ok((name, entry_url)) = normalize_custom_provider_input(raw_name, raw_url) else {
+        dirty = true;
+        continue;
+      };
+      let created_at_ms = item_obj
+        .get("createdAtMs")
+        .or_else(|| item_obj.get("created_at_ms"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or_else(now_ms);
+      custom_ids.insert(pid.clone());
+      custom_providers.push(CustomProviderRecord {
+        id: pid,
+        name,
+        entry_url,
+        created_at_ms,
+      });
+    }
+  }
+
   let mut accounts = Vec::new();
 
   if let Some(arr) = obj.get("accounts").and_then(|v| v.as_array()) {
@@ -187,9 +281,13 @@ fn migrate_from_value(root: Value) -> Result<(AccountsStoreFile, bool), String> 
           let s = v.as_str().ok_or_else(|| "providerId 非法".to_string())?;
           ProviderId::parse(s).ok_or_else(|| format!("未知服务标识: {s}"))?
         }
-        None if is_legacy => ProviderId::Muse,
+        None if is_legacy => ProviderId::muse(),
         None => return Err("新版配置账号缺少 providerId".to_string()),
       };
+      if !provider_id.is_builtin() && !custom_ids.contains(&provider_id) {
+        dirty = true;
+        continue;
+      }
       let alias = item_obj
         .get("alias")
         .or_else(|| item_obj.get("name"))
@@ -245,10 +343,24 @@ fn migrate_from_value(root: Value) -> Result<(AccountsStoreFile, bool), String> 
         quota_text = None;
         quota_percent = None;
       }
+      let mut cookie_expires_at_ms = item_obj
+        .get("cookieExpiresAtMs")
+        .or_else(|| item_obj.get("cookie_expires_at_ms"))
+        .and_then(|v| v.as_u64());
+      let mut cookie_session_only = item_obj
+        .get("cookieSessionOnly")
+        .or_else(|| item_obj.get("cookie_session_only"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+      if cookie_expires_at_ms.is_some() {
+        cookie_session_only = false;
+      }
       if auth_state == AuthState::LoggedOut {
         quota_detail = None;
         quota_text = None;
         quota_percent = None;
+        cookie_expires_at_ms = None;
+        cookie_session_only = false;
       }
 
       accounts.push(AccountRecord {
@@ -263,6 +375,8 @@ fn migrate_from_value(root: Value) -> Result<(AccountsStoreFile, bool), String> 
         quota_percent,
         quota_detail,
         auth_state,
+        cookie_expires_at_ms,
+        cookie_session_only,
       });
     }
   }
@@ -273,7 +387,8 @@ fn migrate_from_value(root: Value) -> Result<(AccountsStoreFile, bool), String> 
     .or_else(|| obj.get("lastOpened"))
     .or_else(|| obj.get("last_opened"))
     .filter(|v| !v.is_null())
-    .and_then(parse_key_or_legacy_muse);
+    .and_then(parse_key_or_legacy_muse)
+    .filter(|k| k.provider_id.is_builtin() || custom_ids.contains(&k.provider_id));
 
   let mut pending_cleanup = Vec::new();
   if let Some(arr) = obj
@@ -290,14 +405,34 @@ fn migrate_from_value(root: Value) -> Result<(AccountsStoreFile, bool), String> 
     }
   }
 
+  let mut settings = AppSettings::default();
+  if let Some(settings_obj) = obj.get("settings").and_then(|v| v.as_object()) {
+    if let Some(minimize) = settings_obj
+      .get("minimizeToTray")
+      .or_else(|| settings_obj.get("minimize_to_tray"))
+      .and_then(|v| v.as_bool())
+    {
+      settings.minimize_to_tray = minimize;
+    }
+    if let Some(shortcut) = settings_obj
+      .get("globalShortcut")
+      .or_else(|| settings_obj.get("global_shortcut"))
+      .and_then(|v| v.as_str())
+    {
+      settings.global_shortcut = shortcut.trim().to_string();
+    }
+  }
+
   Ok((
     AccountsStoreFile {
       version: STORE_VERSION,
       accounts,
       last_committed,
       pending_cleanup,
+      custom_providers,
+      settings,
     },
-    is_legacy,
+    dirty,
   ))
 }
 
@@ -441,5 +576,92 @@ mod tests {
     assert_eq!(store.accounts[1].proxy_url.as_deref(), Some("http://127.0.0.1:8888"));
     assert_eq!(store.accounts[2].proxy_url, None);
     assert_eq!(store.accounts[3].proxy_url, None);
+    assert!(store.settings.minimize_to_tray);
+    assert!(!store.settings.global_shortcut.is_empty());
+  }
+
+  #[test]
+  fn migrate_custom_providers_settings_and_drops_orphans() {
+    let raw = json!({
+      "version": 2,
+      "customProviders": [
+        {
+          "id": "custom-abcd1234",
+          "name": "ChatGPT",
+          "entryUrl": "https://chatgpt.com/"
+        },
+        {
+          "id": "muse",
+          "name": "ShouldSkipBuiltinId",
+          "entryUrl": "https://chatgpt.com/"
+        }
+      ],
+      "settings": {
+        "minimizeToTray": false,
+        "globalShortcut": "Alt+Space"
+      },
+      "accounts": [
+        {
+          "providerId": "custom-abcd1234",
+          "uuid": "00000000-0000-4000-8000-000000000010",
+          "alias": "gpt1"
+        },
+        {
+          "providerId": "custom-deleted99",
+          "uuid": "00000000-0000-4000-8000-000000000011",
+          "alias": "orphan"
+        }
+      ]
+    });
+
+    let (store, dirty) = migrate_from_value(raw).expect("custom provider store should migrate");
+    assert!(dirty);
+    assert_eq!(store.custom_providers.len(), 1);
+    assert_eq!(store.custom_providers[0].id.as_str(), "custom-abcd1234");
+    assert_eq!(store.accounts.len(), 1);
+    assert_eq!(store.accounts[0].alias, "gpt1");
+    assert!(!store.settings.minimize_to_tray);
+    assert_eq!(store.settings.global_shortcut, "Alt+Space");
+  }
+
+  #[test]
+  fn migrate_cookie_expiry_supports_camel_snake_and_clears_logged_out() {
+    let raw = json!({
+      "version": 2,
+      "accounts": [
+        {
+          "providerId": "muse",
+          "uuid": "00000000-0000-4000-8000-000000000021",
+          "alias": "auth_camel",
+          "authState": "authenticated",
+          "cookieExpiresAtMs": 1800000000000u64,
+          "cookieSessionOnly": false
+        },
+        {
+          "providerId": "muse",
+          "uuid": "00000000-0000-4000-8000-000000000022",
+          "alias": "session_snake",
+          "auth_state": "authenticated",
+          "cookie_session_only": true
+        },
+        {
+          "providerId": "muse",
+          "uuid": "00000000-0000-4000-8000-000000000023",
+          "alias": "logged_out_cleared",
+          "authState": "logged_out",
+          "cookieExpiresAtMs": 1800000000000u64,
+          "cookieSessionOnly": true
+        }
+      ]
+    });
+
+    let (store, _) = migrate_from_value(raw).expect("migrate cookie expiry should succeed");
+    assert_eq!(store.accounts.len(), 3);
+    assert_eq!(store.accounts[0].cookie_expires_at_ms, Some(1_800_000_000_000));
+    assert!(!store.accounts[0].cookie_session_only);
+    assert_eq!(store.accounts[1].cookie_expires_at_ms, None);
+    assert!(store.accounts[1].cookie_session_only);
+    assert_eq!(store.accounts[2].cookie_expires_at_ms, None);
+    assert!(!store.accounts[2].cookie_session_only);
   }
 }

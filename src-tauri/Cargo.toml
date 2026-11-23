@@ -1,6 +1,6 @@
 [package]
 name = "multi-agent-account-manager"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2021"
 rust-version = "1.85"
 
@@ -21,7 +21,8 @@ url = "2"
 uuid = { version = "1", features = ["v4"] }
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
-tauri = { version = "=2.12.6", features = ["unstable"] }
+tauri = { version = "=2.12.6", features = ["unstable", "tray-icon", "image-png"] }
+tauri-plugin-global-shortcut = "2.3.2"
 open = "5"
 reqwest = { version = "0.13", default-features = false, features = ["native-tls", "http2", "system-proxy"] }
 sha2 = "0.10"

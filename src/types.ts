@@ -1,5 +1,6 @@
-export type ProviderId = "muse" | "hark";
+export type ProviderId = string;
 export type AuthState = "unknown" | "authenticated" | "logged_out";
+export type ThemeMode = "system" | "light" | "dark";
 
 export interface AccountKey {
   providerId: ProviderId;
@@ -16,6 +17,21 @@ export interface ProviderInfo {
   homepageUrl: string;
   callbackOrigins: string[];
   verifiedMethods: string[];
+  isCustom: boolean;
+}
+
+export interface AppSettings {
+  minimizeToTray: boolean;
+  globalShortcut: string;
+}
+
+export interface ProxyTestResult {
+  ok: boolean;
+  latencyMs: number;
+  statusCode: number | null;
+  targetHost: string;
+  usedProxy: boolean;
+  message: string;
 }
 
 export interface QuotaDetail {
@@ -41,6 +57,8 @@ export interface AccountRecord {
   quotaPercent: number | null;
   quotaDetail: QuotaDetail | null;
   authState: AuthState;
+  cookieExpiresAtMs: number | null;
+  cookieSessionOnly: boolean;
 }
 
 export interface ConflictItem {
@@ -61,6 +79,9 @@ export interface ManagerSnapshot {
   conflicts: ConflictItem[];
   notice: string | null;
   modalActive: boolean;
+  settings: AppSettings;
+  globalShortcutActive: boolean;
+  globalShortcutError: string | null;
 }
 
 export interface UpdateCheckResult {

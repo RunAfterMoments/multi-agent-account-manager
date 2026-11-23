@@ -482,6 +482,34 @@ mod macos_nav_delegate {
 }
 
 #[cfg(target_os = "macos")]
+pub fn raise_macos_webview_to_front(webview: &tauri::Webview) {
+  let _ = webview.with_webview(|platform_wv| unsafe {
+    let ns_view: &objc2_app_kit::NSView = &*platform_wv.inner().cast();
+    if let Some(superview) = ns_view.superview() {
+      superview.addSubview(ns_view);
+    }
+  });
+}
+
+#[cfg(target_os = "macos")]
+pub async fn is_macos_webview_loading(webview: &tauri::Webview) -> bool {
+  let (tx, rx) = tokio::sync::oneshot::channel();
+  if webview
+    .with_webview(move |platform_wv| unsafe {
+      let wk: &objc2_web_kit::WKWebView = &*platform_wv.inner().cast();
+      let _ = tx.send(wk.isLoading());
+    })
+    .is_err()
+  {
+    return false;
+  }
+  match tokio::time::timeout(std::time::Duration::from_millis(300), rx).await {
+    Ok(Ok(loading)) => loading,
+    _ => false,
+  }
+}
+
+#[cfg(target_os = "macos")]
 pub async fn on_macos_navigation_failed(
   webview: &tauri::Webview,
   on_failed: impl Fn() + Send + 'static,
@@ -647,12 +675,216 @@ fn normalize_win_path(path: &Path) -> String {
     .to_ascii_lowercase()
 }
 
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CookieMeta {
+  pub name: String,
+  pub http_only: bool,
+  pub session_only: bool,
+  pub expires_at_ms: Option<u64>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CookieExpirySummary {
+  pub expires_at_ms: Option<u64>,
+  pub session_only: bool,
+}
+
+#[allow(dead_code)]
+pub fn unix_secs_f64_to_ms(secs: f64) -> Option<u64> {
+  if !secs.is_finite() || secs <= 0.0 {
+    return None;
+  }
+  let ms = secs * 1000.0;
+  if ms >= (u64::MAX as f64) {
+    Some(u64::MAX)
+  } else {
+    Some(ms as u64)
+  }
+}
+
+#[allow(dead_code)]
+pub fn unix_secs_i64_to_ms(secs: i64) -> Option<u64> {
+  if secs <= 0 {
+    return None;
+  }
+  Some((secs as u64).saturating_mul(1000))
+}
+
+#[allow(dead_code)]
+fn is_noise_cookie_name(name: &str) -> bool {
+  let lower = name.trim().to_ascii_lowercase();
+  if lower.is_empty() {
+    return true;
+  }
+  const EXACT: &[&str] = &[
+    "_ga",
+    "_gid",
+    "_gat",
+    "_fbp",
+    "_fbc",
+    "_ttclid",
+    "_uetsid",
+    "_uetvid",
+    "_clck",
+    "_clsk",
+    "__cf_bm",
+    "cf_clearance",
+    "__cfduid",
+    "_cfuvid",
+    "__cflb",
+    "ak_bmsc",
+    "bm_sz",
+    "bm_sv",
+    "_abck",
+    "aws-waf-token",
+    "hubspotutk",
+    "_rdt_uuid",
+    "_pin_unauth",
+    "muc_ads",
+    "locale",
+    "lang",
+    "theme",
+    "color_scheme",
+    "tz",
+    "timezone",
+    "dpr",
+    "wd",
+    "viewport",
+    "datr",
+    "sb",
+    "fr",
+    "oai-did",
+    "device_id",
+    "did",
+    "client_id",
+    "guest_id",
+    "anon_id",
+  ];
+  if EXACT.contains(&lower.as_str()) {
+    return true;
+  }
+  const PREFIXES: &[&str] = &[
+    "_ga_",
+    "_gid_",
+    "_gat_",
+    "_gcl_",
+    "_hj",
+    "_pk_",
+    "_ym_",
+    "_dd_s",
+    "ajs_",
+    "amplitude_",
+    "mp_",
+    "ph_",
+    "intercom-",
+    "__hs",
+    "__cf",
+    "cf_",
+    "incap_ses_",
+    "visid_incap_",
+  ];
+  if PREFIXES.iter().any(|prefix| lower.starts_with(prefix)) {
+    return true;
+  }
+  const SUBSTRINGS: &[&str] = &[
+    "csrf",
+    "xsrf",
+    "analytics",
+    "telemetry",
+    "sentry",
+    "datadog",
+    "intercom",
+  ];
+  SUBSTRINGS.iter().any(|part| lower.contains(part))
+}
+
+#[allow(dead_code)]
+fn is_auth_cookie_name(name: &str) -> bool {
+  let lower = name.trim().to_ascii_lowercase();
+  const KEYWORDS: &[&str] = &[
+    "session",
+    "sess",
+    "token",
+    "auth",
+    "jwt",
+    "refresh",
+    "oauth",
+    "oidc",
+    "sso",
+    "login",
+    "credential",
+    "bearer",
+  ];
+  if KEYWORDS.iter().any(|kw| lower.contains(kw)) {
+    return true;
+  }
+  matches!(lower.as_str(), "sid" | "c_user" | "xs")
+    || lower.ends_with(".sid")
+    || lower.ends_with("_sid")
+    || lower.ends_with("-sid")
+    || lower.starts_with("__secure-")
+    || lower.starts_with("__host-")
+}
+
+#[allow(dead_code)]
+pub fn summarize_cookie_expiry(cookies: &[CookieMeta], now_ms: u64) -> CookieExpirySummary {
+  let valid: Vec<(bool, bool, Option<u64>)> = cookies
+    .iter()
+    .filter_map(|cookie| {
+      let expires_at_ms = if cookie.session_only {
+        None
+      } else {
+        cookie.expires_at_ms
+      };
+      if expires_at_ms.is_some_and(|exp| exp <= now_ms) {
+        return None;
+      }
+      if is_noise_cookie_name(&cookie.name) {
+        return None;
+      }
+      Some((cookie.http_only, is_auth_cookie_name(&cookie.name), expires_at_ms))
+    })
+    .collect();
+
+  if valid.is_empty() {
+    return CookieExpirySummary::default();
+  }
+
+  let pick_tier = |predicate: &dyn Fn(bool, bool) -> bool| -> Option<CookieExpirySummary> {
+    let mut matched = false;
+    let mut max_exp: Option<u64> = None;
+    for &(http_only, auth, expires_at_ms) in &valid {
+      if predicate(http_only, auth) {
+        matched = true;
+        if let Some(exp) = expires_at_ms {
+          max_exp = Some(max_exp.map_or(exp, |prev| prev.max(exp)));
+        }
+      }
+    }
+    if !matched {
+      return None;
+    }
+    Some(CookieExpirySummary {
+      expires_at_ms: max_exp,
+      session_only: max_exp.is_none(),
+    })
+  };
+
+  pick_tier(&|http_only, auth| http_only && auth)
+    .or_else(|| pick_tier(&|_, auth| auth))
+    .or_else(|| pick_tier(&|http_only, _| http_only))
+    .or_else(|| pick_tier(&|_, _| true))
+    .unwrap_or_default()
+}
+
 #[cfg(target_os = "macos")]
-pub async fn read_macos_cookie_header(
+pub async fn read_macos_cookies_for_url(
   app: &tauri::AppHandle,
   uuid: Uuid,
   url: url::Url,
-) -> Result<String, String> {
+) -> Result<(String, CookieExpirySummary), String> {
   use objc2::{AnyThread, MainThreadMarker};
   use objc2_foundation::{NSArray, NSHTTPCookie, NSString, NSUUID};
   use objc2_web_kit::WKWebsiteDataStore;
@@ -676,7 +908,9 @@ pub async fn read_macos_cookie_header(
       let store = unsafe { WKWebsiteDataStore::dataStoreForIdentifier(&identifier, main_thread) };
       let sender = RefCell::new(Some(sender));
       let callback = block2::RcBlock::new(move |cookies: NonNull<NSArray<NSHTTPCookie>>| {
+        let now_ms = crate::storage::now_ms();
         let mut pairs = Vec::new();
+        let mut metas = Vec::new();
         for cookie in unsafe { cookies.as_ref() }.to_vec() {
           let domain = cookie.domain().to_string().to_ascii_lowercase();
           let domain_matches = match domain.strip_prefix('.') {
@@ -689,21 +923,46 @@ pub async fn read_macos_cookie_header(
             || path.strip_prefix(&cookie_path).is_some_and(|suffix| {
               cookie_path.ends_with('/') || suffix.starts_with('/')
             });
-          let expired = cookie.expiresDate().is_some_and(|date| date.timeIntervalSinceNow() <= 0.0);
+          let expires_at_ms = cookie
+            .expiresDate()
+            .and_then(|date| unix_secs_f64_to_ms(date.timeIntervalSince1970()));
+          let expired = expires_at_ms.is_some_and(|exp| exp <= now_ms)
+            || cookie.expiresDate().is_some_and(|date| date.timeIntervalSinceNow() <= 0.0);
           if domain_matches && path_matches && !expired {
-            pairs.push((cookie_path.len(), format!("{}={}", cookie.name(), cookie.value())));
+            let name = cookie.name().to_string();
+            let value = cookie.value().to_string();
+            metas.push(CookieMeta {
+              name: name.clone(),
+              http_only: cookie.isHTTPOnly(),
+              session_only: cookie.isSessionOnly(),
+              expires_at_ms,
+            });
+            pairs.push((cookie_path.len(), format!("{name}={value}")));
           }
         }
         pairs.sort_by_key(|(path_len, _)| std::cmp::Reverse(*path_len));
         let header = pairs.into_iter().map(|(_, pair)| pair).collect::<Vec<_>>().join("; ");
+        let summary = summarize_cookie_expiry(&metas, now_ms);
         if let Some(sender) = sender.borrow_mut().take() {
-          let _ = sender.send(Ok(header));
+          let _ = sender.send(Ok((header, summary)));
         }
       });
       unsafe { store.httpCookieStore().getAllCookies(&callback) };
     })
     .map_err(|_| "读取账号 Cookie 失败".to_string())?;
   receiver.await.map_err(|_| "读取账号 Cookie 中断".to_string())?
+}
+
+#[cfg(target_os = "macos")]
+#[allow(dead_code)]
+pub async fn read_macos_cookie_header(
+  app: &tauri::AppHandle,
+  uuid: Uuid,
+  url: url::Url,
+) -> Result<String, String> {
+  read_macos_cookies_for_url(app, uuid, url)
+    .await
+    .map(|(header, _)| header)
 }
 
 #[cfg(any(target_os = "macos", windows))]
@@ -875,6 +1134,98 @@ pub fn reveal_path_in_file_manager(path: &Path) -> Result<(), String> {
   }
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyTestResult {
+  pub ok: bool,
+  pub latency_ms: u64,
+  pub status_code: Option<u16>,
+  pub target_host: String,
+  pub used_proxy: bool,
+  pub message: String,
+}
+
+#[cfg(desktop)]
+pub async fn test_account_proxy(target_url: &str, raw_proxy: &str) -> Result<ProxyTestResult, String> {
+  let proxy_opt = parse_account_proxy(raw_proxy)?;
+  let parsed_target = url::Url::parse(target_url.trim())
+    .map_err(|_| "目标服务入口地址无效".to_string())?;
+  let target_host = parsed_target
+    .host_str()
+    .filter(|h| !h.is_empty())
+    .ok_or_else(|| "目标服务缺少主机名".to_string())?
+    .to_string();
+  let used_proxy = proxy_opt.is_some();
+
+  let mut builder = reqwest::Client::builder()
+    .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15")
+    .connect_timeout(std::time::Duration::from_secs(6))
+    .timeout(std::time::Duration::from_secs(10))
+    .redirect(reqwest::redirect::Policy::none());
+
+  if let Some(ref proxy_url) = proxy_opt {
+    let proxy = reqwest::Proxy::all(proxy_url.as_str())
+      .map_err(|e| format!("构造代理客户端失败: {e}"))?;
+    builder = builder.proxy(proxy);
+  }
+
+  let client = builder
+    .build()
+    .map_err(|e| format!("初始化测速客户端失败: {e}"))?;
+
+  let start = std::time::Instant::now();
+  let mut res = client.head(parsed_target.clone()).send().await;
+  if let Ok(ref resp) = res {
+    if resp.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED {
+      res = client.get(parsed_target).send().await;
+    }
+  }
+  let latency_ms = start.elapsed().as_millis() as u64;
+
+  match res {
+    Ok(resp) => {
+      let code = resp.status().as_u16();
+      let prefix = if used_proxy { "代理连通" } else { "系统网络连通" };
+      Ok(ProxyTestResult {
+        ok: true,
+        latency_ms,
+        status_code: Some(code),
+        target_host,
+        used_proxy,
+        message: format!("{prefix} · {latency_ms} ms (HTTP {code})"),
+      })
+    }
+    Err(err) => {
+      let reason = if err.is_timeout() {
+        "连接超时".to_string()
+      } else if err.is_connect() {
+        if used_proxy {
+          "无法连接到代理或代理握手失败".to_string()
+        } else {
+          "无法连接到目标服务器".to_string()
+        }
+      } else {
+        format!("请求失败: {err}")
+      };
+      let prefix = if used_proxy { "代理不可用" } else { "连接失败" };
+      Ok(ProxyTestResult {
+        ok: false,
+        latency_ms,
+        status_code: None,
+        target_host,
+        used_proxy,
+        message: format!("{prefix}（{reason}，耗时 {latency_ms} ms）"),
+      })
+    }
+  }
+}
+
+#[cfg(not(desktop))]
+#[allow(dead_code)]
+pub async fn test_account_proxy(_target_url: &str, _raw_proxy: &str) -> Result<ProxyTestResult, String> {
+  Err("当前平台不支持代理测试".to_string())
+}
+
 #[cfg(target_os = "android")]
 pub use tauri_plugin_account_session as android;
 
@@ -962,5 +1313,115 @@ mod tests {
       wry::Error::WebView2Error(webview2_com::Error::from(ERROR_ACCESS_DENIED.to_hresult())),
     )));
     assert!(!windows_webview_options_in_use(&other_err));
+  }
+
+  #[test]
+  fn summarize_cookie_expiry_prioritizes_auth_cookies_and_ignores_noise() {
+    let now = 1_700_000_000_000;
+
+    // 1. Filters expired and noise cookies; picks max among httpOnly+auth tier.
+    let cookies = vec![
+      CookieMeta {
+        name: "_ga".to_string(),
+        http_only: false,
+        session_only: false,
+        expires_at_ms: Some(now + 100_000_000),
+      },
+      CookieMeta {
+        name: "cf_clearance".to_string(),
+        http_only: true,
+        session_only: false,
+        expires_at_ms: Some(now + 90_000_000),
+      },
+      CookieMeta {
+        name: "expired_session".to_string(),
+        http_only: true,
+        session_only: false,
+        expires_at_ms: Some(now - 1_000),
+      },
+      CookieMeta {
+        name: "access_token".to_string(),
+        http_only: true,
+        session_only: false,
+        expires_at_ms: Some(now + 3_600_000),
+      },
+      CookieMeta {
+        name: "refresh_token".to_string(),
+        http_only: true,
+        session_only: false,
+        expires_at_ms: Some(now + 30 * 86_400_000),
+      },
+      CookieMeta {
+        name: "ui_state".to_string(),
+        http_only: false,
+        session_only: false,
+        expires_at_ms: Some(now + 365 * 86_400_000),
+      },
+    ];
+    assert_eq!(
+      summarize_cookie_expiry(&cookies, now),
+      CookieExpirySummary {
+        expires_at_ms: Some(now + 30 * 86_400_000),
+        session_only: false,
+      }
+    );
+
+    // 2. Falls back to auth without httpOnly before non-auth httpOnly.
+    let auth_non_httponly = vec![
+      CookieMeta {
+        name: "opaque_pref".to_string(),
+        http_only: true,
+        session_only: false,
+        expires_at_ms: Some(now + 10 * 86_400_000),
+      },
+      CookieMeta {
+        name: "c_user".to_string(),
+        http_only: false,
+        session_only: false,
+        expires_at_ms: Some(now + 90 * 86_400_000),
+      },
+    ];
+    assert_eq!(
+      summarize_cookie_expiry(&auth_non_httponly, now),
+      CookieExpirySummary {
+        expires_at_ms: Some(now + 90 * 86_400_000),
+        session_only: false,
+      }
+    );
+
+    // 3. Session-only auth cookies report session_only = true.
+    let session_only = vec![
+      CookieMeta {
+        name: "__Host-next-auth.csrf-token".to_string(),
+        http_only: true,
+        session_only: false,
+        expires_at_ms: Some(now + 86_400_000),
+      },
+      CookieMeta {
+        name: "JSESSIONID".to_string(),
+        http_only: true,
+        session_only: true,
+        expires_at_ms: None,
+      },
+    ];
+    assert_eq!(
+      summarize_cookie_expiry(&session_only, now),
+      CookieExpirySummary {
+        expires_at_ms: None,
+        session_only: true,
+      }
+    );
+
+    // 4. Noise-only returns empty summary.
+    let noise_only = vec![CookieMeta {
+      name: "__cf_bm".to_string(),
+      http_only: true,
+      session_only: false,
+      expires_at_ms: Some(now + 1_800_000),
+    }];
+    assert_eq!(
+      summarize_cookie_expiry(&noise_only, now),
+      CookieExpirySummary::default()
+    );
   }
 }

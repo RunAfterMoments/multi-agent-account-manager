@@ -1,11 +1,12 @@
-use crate::platform::{self, current_platform_name};
+use crate::platform::{self, current_platform_name, ProxyTestResult};
 use crate::providers::{
-  all_provider_infos, classify_top_level_url, get_provider, is_verified_callback_origin,
-  NavigationDecision, ProviderId, ProviderInfo,
+  all_provider_infos, classify_top_level_url, is_verified_callback_origin,
+  normalize_custom_provider_input, resolve_provider, CustomProviderRecord, NavigationDecision,
+  ProviderId, ProviderInfo, ProviderSpec,
 };
 use crate::storage::{
   detect_conflicts, load_or_migrate_store, normalize_uuid, now_ms, save_store_atomic, AccountKey,
-  AccountRecord, AccountsStoreFile, AuthState, ConflictItem, QuotaDetail,
+  AccountRecord, AccountsStoreFile, AppSettings, AuthState, ConflictItem, QuotaDetail,
 };
 use serde::Serialize;
 #[cfg(desktop)]
@@ -532,62 +533,144 @@ const LOGIN_CAPTURE_INIT_JS: &str = r#"(() => {
 const DOM_PAINT_READY_JS: &str = r#"(() => {
   try {
     if (location.href === 'about:blank') return false;
-    if (document.readyState === 'loading') return false;
+    if (document.readyState !== 'complete') return false;
     const body = document.body;
     if (!body) return false;
+    const sheets = document.querySelectorAll('link[rel~="stylesheet"]');
+    for (const l of sheets) {
+      if (l.disabled) continue;
+      if ((l.media || '').toLowerCase() === 'print') continue;
+      if (l.sheet === null) return false;
+    }
     const host = (location.hostname || '').toLowerCase();
     const isHark = host === 'app.hark.com' || host.endsWith('.hark.com');
-    const isVisibleEl = (el) => {
+    const isMuse =
+      host === 'muse.ai' ||
+      host.endsWith('.muse.ai') ||
+      host === 'meta.com' ||
+      host.endsWith('.meta.com');
+    const vw = window.innerWidth || document.documentElement.clientWidth || 0;
+    const vh = window.innerHeight || document.documentElement.clientHeight || 0;
+    const isTrulyVisible = (el) => {
       if (!el) return false;
       const r = el.getBoundingClientRect();
       if (r.width < 16 || r.height < 16) return false;
-      try {
-        const st = getComputedStyle(el);
-        if (st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0') return false;
-      } catch (_) {}
-      return true;
-    };
-    if (isHark) {
-      if (document.readyState !== 'complete') return false;
-      const sheets = document.querySelectorAll('link[rel~="stylesheet"]');
-      for (const l of sheets) {
-        if (l.sheet === null) return false;
-      }
-      const root = document.getElementById('root');
-      const rootText = root ? (root.innerText || '').trim() : '';
-      if (rootText.length < 4 && (body.innerText || '').trim() === 'Unauthorized') {
+      if (vw > 0 && vh > 0 && (r.bottom <= 0 || r.right <= 0 || r.top >= vh || r.left >= vw)) {
         return false;
       }
-      if (root) {
-        let rootReady = rootText.length >= 2;
-        if (!rootReady) {
-          const uiEls = root.querySelectorAll('input, button, textarea, [contenteditable="true"], svg, img');
-          for (let i = 0; i < uiEls.length && i < 30; i++) {
-            if (isVisibleEl(uiEls[i])) {
-              rootReady = true;
-              break;
-            }
-          }
-        }
-        if (!rootReady) return false;
-      }
-      if (window.__harkSky && !window.__harkSky.painted) {
-        const gl = document.getElementById('gl');
-        if (gl) {
-          try {
-            if (getComputedStyle(gl).visibility === 'hidden') return false;
-          } catch (_) {}
-        }
+      let cur = el;
+      for (let d = 0; cur && cur.nodeType === 1 && d < 8; d++) {
+        try {
+          const st = getComputedStyle(cur);
+          if (st.display === 'none' || st.visibility === 'hidden') return false;
+          const op = parseFloat(st.opacity);
+          if (!Number.isNaN(op) && op < 0.05) return false;
+        } catch (_) {}
+        cur = cur.parentElement;
       }
       return true;
+    };
+    const isLoadingPlaceholderEl = (el) => {
+      if (!el) return false;
+      const role = (el.getAttribute && el.getAttribute('role')) || '';
+      const busy = (el.getAttribute && el.getAttribute('aria-busy')) || '';
+      const aria = (el.getAttribute && el.getAttribute('aria-label')) || '';
+      const cls =
+        typeof el.className === 'string'
+          ? el.className
+          : (el.getAttribute && el.getAttribute('class')) || '';
+      if (role === 'progressbar' || busy === 'true') return true;
+      return /spinner|skeleton|shimmer|loader|loading/i.test(`${cls} ${aria}`);
+    };
+    const isLoadingOnlyText = (t) => {
+      const s = (t || '').trim();
+      if (!s) return true;
+      return /^(loading|加载中|正在加载|请稍候|please wait|\.{1,3}|meta|muse|hark)$/i.test(s);
+    };
+
+    let domReady = false;
+    if (isHark) {
+      const root = document.getElementById('root');
+      const rootText = root ? (root.innerText || '').trim() : '';
+      if (!(rootText.length < 4 && (body.innerText || '').trim() === 'Unauthorized')) {
+        let ready = true;
+        if (root) {
+          let rootReady = rootText.length >= 2;
+          if (!rootReady) {
+            const uiEls = root.querySelectorAll('input, button, textarea, [contenteditable="true"], svg, img');
+            for (let i = 0; i < uiEls.length && i < 30; i++) {
+              if (isTrulyVisible(uiEls[i])) {
+                rootReady = true;
+                break;
+              }
+            }
+          }
+          if (!rootReady) ready = false;
+        }
+        if (ready && window.__harkSky && !window.__harkSky.painted) {
+          const gl = document.getElementById('gl');
+          if (gl) {
+            try {
+              if (getComputedStyle(gl).visibility === 'hidden') ready = false;
+            } catch (_) {}
+          }
+        }
+        domReady = ready;
+      }
+    } else {
+      const bodyText = (body.innerText || '').trim();
+      const interactiveSel = 'input:not([type="hidden"]), textarea, [contenteditable="true"], button, [role="button"], a[href]';
+      const hasVisibleInteractive = (sel) => {
+        const els = body.querySelectorAll(sel);
+        for (let i = 0; i < els.length && i < 60; i++) {
+          const el = els[i];
+          if (isLoadingPlaceholderEl(el)) continue;
+          if (el.tagName === 'IFRAME') {
+            const r = el.getBoundingClientRect();
+            if (r.width < 100 || r.height < 100) continue;
+          }
+          if (isTrulyVisible(el)) return true;
+        }
+        return false;
+      };
+      if (isMuse) {
+        const hasControl = hasVisibleInteractive(interactiveSel);
+        const hasInput = hasVisibleInteractive('input:not([type="hidden"]), textarea, [contenteditable="true"]');
+        const hasText = bodyText.length >= 12 && !isLoadingOnlyText(bodyText);
+        domReady = hasControl && (hasText || hasInput);
+      } else {
+        const hasContentText = bodyText.length >= 20 && !isLoadingOnlyText(bodyText);
+        const hasLayoutOrContent = hasVisibleInteractive('main, article, section, form, nav, header, input:not([type="hidden"]), textarea, [contenteditable="true"], button, [role="button"], a[href], img, canvas, video, iframe');
+        const hasDirectControl = hasVisibleInteractive('input:not([type="hidden"]), textarea, [contenteditable="true"], button, [role="button"], iframe');
+        domReady = (hasContentText && hasLayoutOrContent) || hasDirectControl;
+      }
     }
-    const textLen = (body.innerText || '').trim().length;
-    if (textLen >= 4) return true;
-    const els = body.querySelectorAll('input, button, svg, img, canvas, textarea, [role="button"]');
-    for (let i = 0; i < els.length && i < 40; i++) {
-      if (isVisibleEl(els[i])) return true;
+
+    if (!domReady) {
+      window.__maamReadySince = 0;
+      window.__maamReadyFrames = 0;
+      return false;
     }
-    return false;
+
+    if (!window.__maamReadySince) {
+      window.__maamReadySince = Date.now();
+      window.__maamReadyFrames = 0;
+      if (typeof requestAnimationFrame === 'function') {
+        const step = () => {
+          window.__maamReadyFrames = (window.__maamReadyFrames || 0) + 1;
+          if ((window.__maamReadyFrames || 0) < 3) {
+            requestAnimationFrame(step);
+          }
+        };
+        requestAnimationFrame(step);
+      }
+      return false;
+    }
+
+    if (document.visibilityState === 'hidden') {
+      return (Date.now() - window.__maamReadySince) >= 350;
+    }
+    return (window.__maamReadyFrames || 0) >= 2 || (Date.now() - window.__maamReadySince) >= 600;
   } catch (_) {
     return false;
   }
@@ -613,8 +696,31 @@ const IDENTITY_PROBE_JS: &str = r#"(() => {
     } catch (_) {}
     const host = (location.hostname || '').toLowerCase();
     const path = (location.pathname || '').toLowerCase();
-    const isPrimary = host === 'muse.ai' || host.endsWith('.muse.ai') || host === 'app.hark.com' || host.endsWith('.hark.com');
-    const isExternalLoginHost = host === 'meta.com' || host.endsWith('.meta.com') || host === 'facebook.com' || host.endsWith('.facebook.com') || host === 'appleid.apple.com';
+    const pCfg = window.__maamProvider || {};
+    const isCustom = Boolean(pCfg.custom);
+    const customHost = (pCfg.host || '').toLowerCase();
+    const matchesDomain = (h, d) => Boolean(d) && (h === d || h.endsWith('.' + d));
+    const baseDomain = (h) => {
+      const parts = (h || '').split('.').filter(Boolean);
+      return parts.length >= 2 ? parts.slice(-2).join('.') : h;
+    };
+    const customBase = isCustom ? baseDomain(customHost) : '';
+    const isPrimary = isCustom
+      ? (matchesDomain(host, customHost) || matchesDomain(host, customBase))
+      : (host === 'muse.ai' || host.endsWith('.muse.ai') || host === 'app.hark.com' || host.endsWith('.hark.com'));
+    const isExternalLoginHost =
+      host === 'meta.com' || host.endsWith('.meta.com') ||
+      host === 'facebook.com' || host.endsWith('.facebook.com') ||
+      host === 'appleid.apple.com' ||
+      (isCustom && (
+        matchesDomain(host, 'auth.openai.com') ||
+        matchesDomain(host, 'auth0.openai.com') ||
+        matchesDomain(host, 'accounts.anthropic.com') ||
+        matchesDomain(host, 'accounts.x.ai') ||
+        matchesDomain(host, 'login.microsoftonline.com') ||
+        matchesDomain(host, 'login.live.com') ||
+        matchesDomain(host, 'accounts.google.com')
+      ));
     const makeLoggedOut = () => {
       window.__maamQuota = null;
       window.__maamQuotaDetail = null;
@@ -749,6 +855,9 @@ const IDENTITY_PROBE_JS: &str = r#"(() => {
     };
 
     const extractQuota = () => {
+      if (isCustom) {
+        return { text: '', pct: null, detail: null };
+      }
       if (isPrimary) {
         if (typeof window.__maamRefreshBackendQuota === 'function') {
           window.__maamRefreshBackendQuota(false);
@@ -905,6 +1014,9 @@ pub struct ManagerSnapshot {
   pub conflicts: Vec<ConflictItem>,
   pub notice: Option<String>,
   pub modal_active: bool,
+  pub settings: AppSettings,
+  pub global_shortcut_active: bool,
+  pub global_shortcut_error: Option<String>,
 }
 
 #[cfg(desktop)]
@@ -932,7 +1044,9 @@ struct WarmDesktopEntry {
   webview_label: String,
   popup_label: Option<String>,
   paint_ready: bool,
+  staged_painted: bool,
   navigation_reached: bool,
+  load_gen: Arc<AtomicU64>,
   last_url: Option<Url>,
   captured_identity_hint: Option<String>,
   watcher_running: bool,
@@ -961,9 +1075,13 @@ struct InnerState {
   warm_pool: HashMap<AccountKey, WarmDesktopEntry>,
   #[cfg(desktop)]
   prewarm_failed: HashSet<AccountKey>,
+  #[cfg(desktop)]
+  cookie_checked_at: HashMap<AccountKey, u64>,
   pending_external_auth: Option<PendingExternalAuth>,
   notice: Option<String>,
   modal_active: bool,
+  global_shortcut_active: bool,
+  global_shortcut_error: Option<String>,
 }
 
 pub struct SessionManager {
@@ -971,6 +1089,7 @@ pub struct SessionManager {
   active_view_id: Arc<AtomicU64>,
   view_counter: AtomicU64,
   last_sync_timestamp: AtomicU64,
+  minimize_to_tray: AtomicBool,
   #[cfg(desktop)]
   download_counter: AtomicU64,
   #[cfg(desktop)]
@@ -982,19 +1101,24 @@ impl SessionManager {
   pub fn new(app_data_dir: PathBuf) -> Self {
     let store_path = app_data_dir.join("accounts.json");
     let loaded = load_or_migrate_store(&store_path);
+    let initial_minimize = loaded.store.settings.minimize_to_tray;
     let initial_provider = loaded
       .store
       .last_committed
       .as_ref()
-      .map(|k| k.provider_id)
-      .filter(|pid| get_provider(*pid).info.enabled)
-      .unwrap_or(ProviderId::Muse);
+      .map(|k| k.provider_id.clone())
+      .filter(|pid| {
+        resolve_provider(&loaded.store.custom_providers, pid)
+          .is_some_and(|spec| spec.info.enabled)
+      })
+      .unwrap_or_else(ProviderId::muse);
 
     Self {
       current_seq: Arc::new(AtomicU64::new(1)),
       active_view_id: Arc::new(AtomicU64::new(0)),
       view_counter: AtomicU64::new(1),
       last_sync_timestamp: AtomicU64::new(0),
+      minimize_to_tray: AtomicBool::new(initial_minimize),
       #[cfg(desktop)]
       download_counter: AtomicU64::new(1),
       #[cfg(desktop)]
@@ -1011,11 +1135,60 @@ impl SessionManager {
         warm_pool: HashMap::new(),
         #[cfg(desktop)]
         prewarm_failed: HashSet::new(),
+        #[cfg(desktop)]
+        cookie_checked_at: HashMap::new(),
         pending_external_auth: None,
         notice: loaded.startup_notice,
         modal_active: false,
+        global_shortcut_active: false,
+        global_shortcut_error: None,
       }),
     }
+  }
+
+  #[cfg_attr(not(desktop), allow(dead_code))]
+  pub fn minimize_to_tray_enabled(&self) -> bool {
+    self.minimize_to_tray.load(Ordering::SeqCst)
+  }
+
+  #[cfg(desktop)]
+  pub fn toggle_main_window(app: &AppHandle) {
+    let Some(win) = app.get_window("main") else {
+      return;
+    };
+    let visible = win.is_visible().unwrap_or(false);
+    let focused = win.is_focused().unwrap_or(false);
+    if visible && focused {
+      let _ = win.hide();
+    } else {
+      let _ = win.unminimize();
+      let _ = win.show();
+      let _ = win.set_focus();
+    }
+  }
+
+  #[cfg(desktop)]
+  async fn apply_global_shortcut_on(app: &AppHandle, shortcut: &str) -> Result<bool, String> {
+    let trimmed = shortcut.trim().to_string();
+    let app_handle = app.clone();
+    tokio::task::spawn_blocking(move || {
+      use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
+
+      let gs = app_handle.global_shortcut();
+      let _ = gs.unregister_all();
+      if trimmed.is_empty() {
+        return Ok(false);
+      }
+      gs.on_shortcut(trimmed.as_str(), move |app_cb, _hotkey, event| {
+        if event.state == ShortcutState::Pressed {
+          Self::toggle_main_window(app_cb);
+        }
+      })
+      .map_err(|e| format!("快捷键格式无效或已被其他应用占用: {e}"))?;
+      Ok(true)
+    })
+    .await
+    .map_err(|e| format!("应用全局快捷键中断: {e}"))?
   }
 
   fn snapshot_from_locked(locked: &InnerState) -> ManagerSnapshot {
@@ -1038,9 +1211,9 @@ impl SessionManager {
 
     ManagerSnapshot {
       platform: current_platform_name(),
-      providers: all_provider_infos(),
+      providers: all_provider_infos(&locked.store.custom_providers),
       accounts: locked.store.accounts.clone(),
-      selected_provider_id: locked.selected_provider_id,
+      selected_provider_id: locked.selected_provider_id.clone(),
       active_account,
       switching_account,
       warm_accounts,
@@ -1049,6 +1222,9 @@ impl SessionManager {
       conflicts: locked.conflicts.clone(),
       notice: locked.notice.clone(),
       modal_active: locked.modal_active,
+      settings: locked.store.settings.clone(),
+      global_shortcut_active: locked.global_shortcut_active,
+      global_shortcut_error: locked.global_shortcut_error.clone(),
     }
   }
 
@@ -1062,6 +1238,26 @@ impl SessionManager {
   }
 
   pub async fn run_startup_tasks(self: &Arc<Self>, app: &AppHandle) {
+    #[cfg(desktop)]
+    {
+      let initial_shortcut = {
+        let locked = self.inner.lock().await;
+        locked.store.settings.global_shortcut.clone()
+      };
+      let shortcut_res = Self::apply_global_shortcut_on(app, &initial_shortcut).await;
+      let mut locked = self.inner.lock().await;
+      match shortcut_res {
+        Ok(active) => {
+          locked.global_shortcut_active = active;
+          locked.global_shortcut_error = None;
+        }
+        Err(err) => {
+          locked.global_shortcut_active = false;
+          locked.global_shortcut_error = Some(err);
+        }
+      }
+    }
+
     #[cfg(target_os = "android")]
     {
       let mgr = Arc::clone(self);
@@ -1107,7 +1303,8 @@ impl SessionManager {
           .accounts
           .iter()
           .any(|a| a.provider_id == key.provider_id && a.uuid == key.uuid);
-        let enabled = get_provider(key.provider_id).info.enabled;
+        let enabled = resolve_provider(&locked.store.custom_providers, &key.provider_id)
+          .is_some_and(|spec| spec.info.enabled);
         if in_cleanup || !exists {
           locked.store.last_committed = None;
           let _ = save_store_atomic(&locked.store_path, &locked.store);
@@ -1116,7 +1313,7 @@ impl SessionManager {
         } else if !enabled {
           None
         } else {
-          locked.selected_provider_id = key.provider_id;
+          locked.selected_provider_id = key.provider_id.clone();
           Some(key)
         }
       } else {
@@ -1315,6 +1512,9 @@ impl SessionManager {
     );
     let _ = (win_w, win_h);
 
+    let left_phys = ((LEFT_PANE_WIDTH * scale).round().max(0.0) as u32).min(phys_size.width);
+    let right_phys = phys_size.width.saturating_sub(left_phys);
+
     let active_committed_label = locked.active_slot.as_ref().and_then(|slot| {
       if slot.committed {
         locked
@@ -1326,8 +1526,26 @@ impl SessionManager {
       }
     });
 
+    let active_loading_label = locked.active_slot.as_ref().and_then(|slot| {
+      if !slot.committed {
+        locked
+          .warm_pool
+          .get(&slot.account_key)
+          .map(|e| e.webview_label.clone())
+      } else {
+        None
+      }
+    });
+
+    let stage_loading_behind = cfg!(target_os = "macos")
+      && active_committed_label.is_none()
+      && active_loading_label.is_some()
+      && right_phys > 1;
+
     for entry in locked.warm_pool.values() {
-      if Some(&entry.webview_label) != active_committed_label.as_ref() {
+      let keep_visible = Some(&entry.webview_label) == active_committed_label.as_ref()
+        || (stage_loading_behind && Some(&entry.webview_label) == active_loading_label.as_ref());
+      if !keep_visible {
         if let Some(wv) = app.get_webview(&entry.webview_label) {
           let _ = wv.hide();
         }
@@ -1335,9 +1553,6 @@ impl SessionManager {
     }
 
     if let Some(active_label) = active_committed_label {
-      let left_phys = ((LEFT_PANE_WIDTH * scale).round().max(0.0) as u32).min(phys_size.width);
-      let right_phys = phys_size.width.saturating_sub(left_phys);
-
       if let Some(mgr_wv) = app.get_webview("manager") {
         let _ = mgr_wv.set_bounds(tauri::Rect {
           position: tauri::PhysicalPosition::new(0, 0).into(),
@@ -1367,6 +1582,19 @@ impl SessionManager {
         position: tauri::PhysicalPosition::new(0, 0).into(),
         size: tauri::PhysicalSize::new(phys_size.width, phys_size.height).into(),
       });
+
+      #[cfg(target_os = "macos")]
+      if let Some(loading_label) = active_loading_label.filter(|_| right_phys > 1) {
+        platform::raise_macos_webview_to_front(&mgr_wv);
+        if let Some(loading_wv) = app.get_webview(&loading_label) {
+          let _ = loading_wv.set_bounds(tauri::Rect {
+            position: tauri::PhysicalPosition::new(left_phys as i32, 0).into(),
+            size: tauri::PhysicalSize::new(right_phys, phys_size.height).into(),
+          });
+          let _ = loading_wv.show();
+          platform::raise_macos_webview_to_front(&mgr_wv);
+        }
+      }
     }
   }
 
@@ -1387,9 +1615,11 @@ impl SessionManager {
     #[cfg(desktop)]
     let warm_restore = {
       let mut locked = self.inner.lock().await;
-      locked.selected_provider_id = provider_id;
+      let spec = resolve_provider(&locked.store.custom_providers, &provider_id)
+        .ok_or_else(|| "未找到对应的服务配置".to_string())?;
+      locked.selected_provider_id = provider_id.clone();
       self.hide_foreground_slot(app, next_seq, &mut locked).await;
-      if get_provider(provider_id).info.enabled && locked.conflicts.is_empty() {
+      if spec.info.enabled && locked.conflicts.is_empty() {
         locked
           .last_active_per_provider
           .get(&provider_id)
@@ -1419,12 +1649,245 @@ impl SessionManager {
     #[cfg(not(desktop))]
     {
       let mut locked = self.inner.lock().await;
+      let _ = resolve_provider(&locked.store.custom_providers, &provider_id)
+        .ok_or_else(|| "未找到对应的服务配置".to_string())?;
       locked.selected_provider_id = provider_id;
       self.hide_foreground_slot(app, next_seq, &mut locked).await;
       return Ok(Self::snapshot_from_locked(&locked));
     }
 
     #[cfg(desktop)]
+    Ok(self.get_snapshot().await)
+  }
+
+  pub async fn add_custom_provider(
+    &self,
+    app: &AppHandle,
+    raw_name: &str,
+    raw_url: &str,
+  ) -> Result<ManagerSnapshot, String> {
+    let (name, entry_url) = normalize_custom_provider_input(raw_name, raw_url)?;
+    let next_seq = self.current_seq.fetch_add(1, Ordering::SeqCst) + 1;
+    let mut locked = self.inner.lock().await;
+    if !locked.conflicts.is_empty() {
+      return Err("请先处理 UUID 归属冲突后再新增服务".to_string());
+    }
+    let id = loop {
+      let suffix = &Uuid::new_v4().simple().to_string()[..8];
+      let candidate = ProviderId::from_validated_custom(format!("custom-{suffix}"));
+      if !locked.store.custom_providers.iter().any(|p| p.id == candidate) {
+        break candidate;
+      }
+    };
+    locked.store.custom_providers.push(CustomProviderRecord {
+      id: id.clone(),
+      name,
+      entry_url,
+      created_at_ms: now_ms(),
+    });
+    if let Err(err) = save_store_atomic(&locked.store_path, &locked.store) {
+      locked.store.custom_providers.pop();
+      return Err(err);
+    }
+    locked.selected_provider_id = id;
+    locked.notice = None;
+    self.hide_foreground_slot(app, next_seq, &mut locked).await;
+    Ok(Self::snapshot_from_locked(&locked))
+  }
+
+  pub async fn update_custom_provider(
+    self: &Arc<Self>,
+    app: &AppHandle,
+    raw_provider: &str,
+    raw_name: &str,
+    raw_url: &str,
+  ) -> Result<ManagerSnapshot, String> {
+    let provider_id = ProviderId::parse(raw_provider).ok_or_else(|| "无效的服务标识".to_string())?;
+    if provider_id.is_builtin() {
+      return Err("内置服务不支持修改入口配置".to_string());
+    }
+    let (name, entry_url) = normalize_custom_provider_input(raw_name, raw_url)?;
+
+    let reopen_key = {
+      let mut locked = self.inner.lock().await;
+      let idx = locked
+        .store
+        .custom_providers
+        .iter()
+        .position(|p| p.id == provider_id)
+        .ok_or_else(|| "未找到对应的自定义服务".to_string())?;
+      let previous = locked.store.custom_providers[idx].clone();
+      let url_changed = previous.entry_url != entry_url;
+      let name_changed = previous.name != name;
+      if !url_changed && !name_changed {
+        return Ok(Self::snapshot_from_locked(&locked));
+      }
+      locked.store.custom_providers[idx].name = name.clone();
+      locked.store.custom_providers[idx].entry_url = entry_url;
+      if let Err(err) = save_store_atomic(&locked.store_path, &locked.store) {
+        locked.store.custom_providers[idx] = previous;
+        return Err(err);
+      }
+
+      let active_key_for_provider = locked
+        .active_slot
+        .as_ref()
+        .filter(|s| s.account_key.provider_id == provider_id)
+        .map(|s| s.account_key.clone());
+
+      #[cfg(desktop)]
+      {
+        if url_changed {
+          let keys_to_close: Vec<AccountKey> = locked
+            .warm_pool
+            .keys()
+            .filter(|k| k.provider_id == provider_id)
+            .cloned()
+            .collect();
+          for k in keys_to_close {
+            locked.prewarm_failed.remove(&k);
+            if let Some(entry) = locked.warm_pool.remove(&k) {
+              Self::close_warm_entry(app, entry);
+            }
+          }
+          if active_key_for_provider.is_some() {
+            let next_seq = self.current_seq.fetch_add(1, Ordering::SeqCst) + 1;
+            self.hide_foreground_slot(app, next_seq, &mut locked).await;
+            active_key_for_provider
+          } else {
+            Self::apply_desktop_layout_locked(app, &locked);
+            None
+          }
+        } else {
+          if name_changed {
+            if let Some(ref ak) = active_key_for_provider {
+              if let Some(acc) = locked
+                .store
+                .accounts
+                .iter()
+                .find(|a| a.provider_id == ak.provider_id && a.uuid == ak.uuid)
+              {
+                if let Some(main_win) = app.get_window("main") {
+                  let _ = main_win.set_title(&format!("{name} · {}", acc.alias));
+                }
+              }
+            }
+          }
+          None
+        }
+      }
+      #[cfg(not(desktop))]
+      {
+        let _ = (app, url_changed, active_key_for_provider);
+        None::<AccountKey>
+      }
+    };
+
+    if let Some(key) = reopen_key {
+      return self.switch_account_internal(app, key, false).await;
+    }
+
+    Ok(self.get_snapshot().await)
+  }
+
+  pub async fn remove_custom_provider(
+    &self,
+    app: &AppHandle,
+    raw_provider: &str,
+  ) -> Result<ManagerSnapshot, String> {
+    let provider_id = ProviderId::parse(raw_provider).ok_or_else(|| "无效的服务标识".to_string())?;
+    if provider_id.is_builtin() {
+      return Err("内置服务不能删除".to_string());
+    }
+
+    let (removed_keys, closed_desktop_view) = {
+      let mut locked = self.inner.lock().await;
+      if !locked.conflicts.is_empty() {
+        return Err("存在 UUID 归属冲突，请先处理冲突后再删除服务".to_string());
+      }
+      let idx = locked
+        .store
+        .custom_providers
+        .iter()
+        .position(|p| p.id == provider_id)
+        .ok_or_else(|| "未找到对应的自定义服务".to_string())?;
+
+      let keys_for_provider: Vec<AccountKey> = locked
+        .store
+        .accounts
+        .iter()
+        .filter(|a| a.provider_id == provider_id)
+        .map(|a| AccountKey {
+          provider_id: a.provider_id.clone(),
+          uuid: a.uuid.clone(),
+        })
+        .collect();
+
+      let active_matches = locked
+        .active_slot
+        .as_ref()
+        .is_some_and(|s| s.account_key.provider_id == provider_id);
+      if active_matches {
+        let next_seq = self.current_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        self.hide_foreground_slot(app, next_seq, &mut locked).await;
+      }
+
+      locked.store.custom_providers.remove(idx);
+      locked.store.accounts.retain(|a| a.provider_id != provider_id);
+      locked.last_active_per_provider.remove(&provider_id);
+      if locked
+        .store
+        .last_committed
+        .as_ref()
+        .is_some_and(|k| k.provider_id == provider_id)
+      {
+        locked.store.last_committed = None;
+      }
+      for key in &keys_for_provider {
+        if !locked.store.pending_cleanup.contains(key) {
+          locked.store.pending_cleanup.push(key.clone());
+        }
+      }
+      if locked.selected_provider_id == provider_id {
+        locked.selected_provider_id = ProviderId::muse();
+      }
+      locked.conflicts = detect_conflicts(&locked.store.accounts);
+      save_store_atomic(&locked.store_path, &locked.store)?;
+
+      #[cfg(desktop)]
+      let closed = {
+        let mut any_closed = false;
+        for key in &keys_for_provider {
+          locked.prewarm_failed.remove(key);
+          locked.cookie_checked_at.remove(key);
+          if let Some(entry) = locked.warm_pool.remove(key) {
+            Self::close_warm_entry(app, entry);
+            any_closed = true;
+          }
+        }
+        if any_closed {
+          Self::apply_desktop_layout_locked(app, &locked);
+        }
+        any_closed
+      };
+      #[cfg(not(desktop))]
+      let closed = false;
+
+      (keys_for_provider, closed)
+    };
+
+    if closed_desktop_view {
+      tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+    }
+
+    for key in removed_keys {
+      if self.delete_profile_for_key(app, &key.uuid).await.is_ok() {
+        let mut locked = self.inner.lock().await;
+        locked.store.pending_cleanup.retain(|k| k != &key);
+        let _ = save_store_atomic(&locked.store_path, &locked.store);
+      }
+    }
+
     Ok(self.get_snapshot().await)
   }
 
@@ -1436,12 +1899,6 @@ impl SessionManager {
     raw_proxy_url: Option<&str>,
   ) -> Result<ManagerSnapshot, String> {
     let provider_id = ProviderId::parse(raw_provider).ok_or_else(|| "无效的服务标识".to_string())?;
-    if !get_provider(provider_id).info.enabled {
-      return Err(format!(
-        "{} 当前待接入，暂不支持添加内嵌账号",
-        get_provider(provider_id).info.name
-      ));
-    }
     let trimmed = raw_alias.trim();
     let (alias, auto_alias) = if trimmed.is_empty() {
       ("待登录账号".to_string(), true)
@@ -1453,6 +1910,11 @@ impl SessionManager {
 
     let created_key = {
       let mut locked = self.inner.lock().await;
+      let spec = resolve_provider(&locked.store.custom_providers, &provider_id)
+        .ok_or_else(|| "未找到对应的服务配置".to_string())?;
+      if !spec.info.enabled {
+        return Err(format!("{} 当前待接入，暂不支持添加内嵌账号", spec.info.name));
+      }
       if !locked.conflicts.is_empty() {
         return Err("请先处理 UUID 归属冲突后再新增账号".to_string());
       }
@@ -1467,7 +1929,7 @@ impl SessionManager {
       };
 
       locked.store.accounts.push(AccountRecord {
-        provider_id,
+        provider_id: provider_id.clone(),
         uuid: uuid.clone(),
         alias,
         created_at_ms: now_ms(),
@@ -1478,16 +1940,34 @@ impl SessionManager {
         quota_percent: None,
         quota_detail: None,
         auth_state: AuthState::LoggedOut,
+        cookie_expires_at_ms: None,
+        cookie_session_only: false,
       });
       if let Err(err) = save_store_atomic(&locked.store_path, &locked.store) {
         locked.store.accounts.pop();
         return Err(err);
       }
-      locked.selected_provider_id = provider_id;
+      locked.selected_provider_id = provider_id.clone();
       AccountKey { provider_id, uuid }
     };
 
     self.switch_account_internal(app, created_key, false).await
+  }
+
+  pub async fn test_account_proxy(
+    &self,
+    raw_provider: &str,
+    raw_proxy_url: &str,
+  ) -> Result<ProxyTestResult, String> {
+    let provider_id = ProviderId::parse(raw_provider).ok_or_else(|| "无效的服务标识".to_string())?;
+    let entry_url = {
+      let locked = self.inner.lock().await;
+      resolve_provider(&locked.store.custom_providers, &provider_id)
+        .ok_or_else(|| "未找到对应的服务配置".to_string())?
+        .info
+        .entry_url
+    };
+    platform::test_account_proxy(&entry_url, raw_proxy_url).await
   }
 
   pub async fn update_account_settings(
@@ -1507,6 +1987,8 @@ impl SessionManager {
     let proxy_update = raw_proxy_url.map(platform::parse_account_proxy).transpose()?;
 
     let mut locked = self.inner.lock().await;
+    let spec = resolve_provider(&locked.store.custom_providers, &provider_id)
+      .ok_or_else(|| "未找到对应的服务配置".to_string())?;
     let index = locked
       .store
       .accounts
@@ -1536,7 +2018,10 @@ impl SessionManager {
 
     #[cfg(any(target_os = "macos", windows))]
     if proxy_changed {
-      let key = AccountKey { provider_id, uuid: uuid.clone() };
+      let key = AccountKey {
+        provider_id: provider_id.clone(),
+        uuid: uuid.clone(),
+      };
       let was_active = locked.active_slot.as_ref().is_some_and(|slot| slot.account_key == key);
       locked.prewarm_failed.remove(&key);
       if let Some(entry) = locked.warm_pool.remove(&key) {
@@ -1558,11 +2043,7 @@ impl SessionManager {
 
     if let Some(slot) = &locked.active_slot {
       if slot.committed && slot.account_key.provider_id == provider_id && slot.account_key.uuid == uuid {
-        let title = format!(
-          "{} · {}",
-          get_provider(provider_id).info.short_name,
-          locked.store.accounts[index].alias
-        );
+        let title = format!("{} · {}", spec.info.short_name, locked.store.accounts[index].alias);
         #[cfg(desktop)]
         if let Some(main_win) = app.get_window("main") {
           let _ = main_win.set_title(&title);
@@ -1585,7 +2066,10 @@ impl SessionManager {
   ) -> Result<(), String> {
     let provider_id = ProviderId::parse(raw_provider).ok_or_else(|| "无效的服务标识".to_string())?;
     let uuid = normalize_uuid(raw_uuid).ok_or_else(|| "无效的账号 UUID".to_string())?;
-    let key = AccountKey { provider_id, uuid };
+    let key = AccountKey {
+      provider_id: provider_id.clone(),
+      uuid,
+    };
     let locked = self.inner.lock().await;
     if !locked.conflicts.is_empty() {
       return Err("存在 UUID 归属冲突，请先完成归属裁决".to_string());
@@ -1597,42 +2081,87 @@ impl SessionManager {
     {
       return Err("账号归属核对失败，未找到可用的账号".to_string());
     }
-    let spec = get_provider(provider_id);
+    let spec = resolve_provider(&locked.store.custom_providers, &provider_id)
+      .ok_or_else(|| "未找到对应的服务配置".to_string())?;
     if !spec.info.enabled {
       return Err("该服务尚未开放应用内嵌".to_string());
     }
-    let url = Url::parse(spec.info.entry_url).map_err(|_| "服务入口地址无效".to_string())?;
+    let url = Url::parse(&spec.info.entry_url).map_err(|_| "服务入口地址无效".to_string())?;
 
     #[cfg(target_os = "macos")]
     {
+      drop(locked);
       let uuid = Uuid::parse_str(&key.uuid).map_err(|_| "账号资料标识无效".to_string())?;
-      let header = platform::read_macos_cookie_header(app, uuid, url).await?;
+      let (header, summary) = platform::read_macos_cookies_for_url(app, uuid, url).await?;
+      self.apply_cookie_expiry_summary(app, &key, summary).await;
       platform::write_cookie_clipboard(app, header).await
     }
     #[cfg(windows)]
     {
-      let header = self.read_windows_cookie_header(app, &locked, &key, url).await?;
+      let res = self.read_windows_cookies_for_url(app, &locked, &key, url).await;
+      drop(locked);
+      let (header, summary) = res?;
+      self.apply_cookie_expiry_summary(app, &key, summary).await;
       platform::write_cookie_clipboard(app, header).await
     }
     #[cfg(target_os = "android")]
     {
+      drop(locked);
       platform::android::copy_profile_cookie(app, &key.uuid, url.as_str()).await
     }
     #[cfg(not(any(target_os = "macos", windows, target_os = "android")))]
     {
+      drop(locked);
       let _ = (app, url);
       Err("当前平台不支持复制 Cookie".to_string())
     }
   }
 
   #[cfg(windows)]
-  async fn read_windows_cookie_header(
+  async fn read_windows_webview_cookies(
+    webview: tauri::Webview,
+    url: Url,
+  ) -> Result<(String, platform::CookieExpirySummary), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+      let current_ms = now_ms();
+      let cookies = webview
+        .cookies_for_url(url)
+        .map_err(|_| "读取账号 Cookie 失败".to_string())?;
+      let mut pairs = Vec::with_capacity(cookies.len());
+      let mut metas = Vec::with_capacity(cookies.len());
+      for cookie in &cookies {
+        let (session_only, expires_at_ms) = match cookie.expires_datetime() {
+          None => (true, None),
+          Some(dt) => match platform::unix_secs_i64_to_ms(dt.unix_timestamp()) {
+            Some(exp) if exp > current_ms => (false, Some(exp)),
+            _ => continue,
+          },
+        };
+        let name = cookie.name().to_string();
+        metas.push(platform::CookieMeta {
+          name: name.clone(),
+          http_only: cookie.http_only().unwrap_or(false),
+          session_only,
+          expires_at_ms,
+        });
+        pairs.push(format!("{}={}", cookie.name(), cookie.value()));
+      }
+      let header = pairs.join("; ");
+      let summary = platform::summarize_cookie_expiry(&metas, current_ms);
+      Ok((header, summary))
+    })
+    .await
+    .map_err(|_| "读取账号 Cookie 中断".to_string())?
+  }
+
+  #[cfg(windows)]
+  async fn read_windows_cookies_for_url(
     &self,
     app: &AppHandle,
     locked: &InnerState,
     key: &AccountKey,
     url: Url,
-  ) -> Result<String, String> {
+  ) -> Result<(String, platform::CookieExpirySummary), String> {
     let profile_dir = locked.app_data_dir.join("profiles").join(&key.uuid);
     let uuid = Uuid::parse_str(&key.uuid).map_err(|_| "账号资料标识无效".to_string())?;
     let existing = locked.warm_pool.get(key).and_then(|entry| app.get_webview(&entry.webview_label));
@@ -1668,14 +2197,7 @@ impl SessionManager {
 
     let result = async {
       platform::verify_desktop_profile_binding(&webview, uuid, &profile_dir).await?;
-      let read_view = webview.clone();
-      tauri::async_runtime::spawn_blocking(move || {
-        let cookies = read_view.cookies_for_url(url).map_err(|_| "读取账号 Cookie 失败".to_string())?;
-        Ok(cookies.iter().map(|cookie| format!("{}={}", cookie.name(), cookie.value()))
-          .collect::<Vec<_>>().join("; "))
-      })
-      .await
-      .map_err(|_| "读取账号 Cookie 中断".to_string())?
+      Self::read_windows_webview_cookies(webview.clone(), url).await
     }.await;
     if temporary {
       let _ = webview.close();
@@ -1692,7 +2214,7 @@ impl SessionManager {
     let provider_id = ProviderId::parse(raw_provider).ok_or_else(|| "无效的服务标识".to_string())?;
     let uuid = normalize_uuid(raw_uuid).ok_or_else(|| "无效的账号 UUID".to_string())?;
     let key = AccountKey {
-      provider_id,
+      provider_id: provider_id.clone(),
       uuid: uuid.clone(),
     };
 
@@ -1733,6 +2255,7 @@ impl SessionManager {
       #[cfg(desktop)]
       {
         locked.prewarm_failed.remove(&key);
+        locked.cookie_checked_at.remove(&key);
         if let Some(warm_entry) = locked.warm_pool.remove(&key) {
           Self::close_warm_entry(app, warm_entry);
           Self::apply_desktop_layout_locked(app, &locked);
@@ -1821,6 +2344,221 @@ impl SessionManager {
     Ok(Self::snapshot_from_locked(&locked))
   }
 
+  pub async fn reload_account(
+    self: &Arc<Self>,
+    app: &AppHandle,
+    raw_provider: &str,
+    raw_uuid: &str,
+  ) -> Result<ManagerSnapshot, String> {
+    let provider_id = ProviderId::parse(raw_provider).ok_or_else(|| "无效的服务标识".to_string())?;
+    let uuid = normalize_uuid(raw_uuid).ok_or_else(|| "无效的账号 UUID".to_string())?;
+    let key = AccountKey {
+      provider_id: provider_id.clone(),
+      uuid: uuid.clone(),
+    };
+
+    #[cfg(desktop)]
+    {
+      let next_seq = self.current_seq.fetch_add(1, Ordering::SeqCst) + 1;
+      let action = {
+        let mut locked = self.inner.lock().await;
+        let Some(acc) = locked
+          .store
+          .accounts
+          .iter()
+          .find(|a| a.provider_id == provider_id && a.uuid == uuid)
+          .cloned()
+        else {
+          return Err("未找到对应的账号记录".to_string());
+        };
+        let spec = resolve_provider(&locked.store.custom_providers, &provider_id)
+          .ok_or_else(|| "未找到对应的服务配置".to_string())?;
+        if !spec.info.enabled {
+          return Err("该服务尚未开放应用内嵌".to_string());
+        }
+        let was_active = locked
+          .active_slot
+          .as_ref()
+          .is_some_and(|s| s.account_key == key);
+        locked.prewarm_failed.remove(&key);
+        if let Some(entry) = locked.warm_pool.remove(&key) {
+          Self::close_warm_entry(app, entry);
+        }
+        if was_active {
+          self.hide_foreground_slot(app, next_seq, &mut locked).await;
+          let app_data_dir = locked.app_data_dir.clone();
+          let vid = self.view_counter.fetch_add(1, Ordering::SeqCst);
+          Some((acc, app_data_dir, vid))
+        } else {
+          Self::apply_desktop_layout_locked(app, &locked);
+          None
+        }
+      };
+
+      if let Some((account, app_data_dir, vid)) = action {
+        return self
+          .open_desktop_session(app, account, app_data_dir, next_seq, vid, false)
+          .await;
+      }
+      return Ok(self.get_snapshot().await);
+    }
+
+    #[cfg(not(desktop))]
+    {
+      let _ = app;
+      let locked = self.inner.lock().await;
+      if !locked
+        .store
+        .accounts
+        .iter()
+        .any(|a| a.provider_id == key.provider_id && a.uuid == key.uuid)
+      {
+        return Err("未找到对应的账号记录".to_string());
+      }
+      Ok(Self::snapshot_from_locked(&locked))
+    }
+  }
+
+  pub async fn clear_account_data(
+    self: &Arc<Self>,
+    app: &AppHandle,
+    raw_provider: &str,
+    raw_uuid: &str,
+  ) -> Result<ManagerSnapshot, String> {
+    let provider_id = ProviderId::parse(raw_provider).ok_or_else(|| "无效的服务标识".to_string())?;
+    let uuid = normalize_uuid(raw_uuid).ok_or_else(|| "无效的账号 UUID".to_string())?;
+    let key = AccountKey {
+      provider_id: provider_id.clone(),
+      uuid: uuid.clone(),
+    };
+
+    let (was_active, closed_desktop_view) = {
+      let mut locked = self.inner.lock().await;
+      if !locked.conflicts.is_empty() {
+        return Err("存在 UUID 归属冲突，请先完成归属裁决".to_string());
+      }
+      let idx = locked
+        .store
+        .accounts
+        .iter()
+        .position(|a| a.provider_id == key.provider_id && a.uuid == key.uuid)
+        .ok_or_else(|| "未找到对应的账号记录".to_string())?;
+
+      let active_matches = locked
+        .active_slot
+        .as_ref()
+        .is_some_and(|s| s.account_key == key);
+      if active_matches {
+        let next_seq = self.current_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        self.hide_foreground_slot(app, next_seq, &mut locked).await;
+      }
+
+      locked.store.accounts[idx].auth_state = AuthState::LoggedOut;
+      locked.store.accounts[idx].quota_detail = None;
+      locked.store.accounts[idx].quota_text = None;
+      locked.store.accounts[idx].quota_percent = None;
+      locked.store.accounts[idx].avatar_url = None;
+      locked.store.accounts[idx].cookie_expires_at_ms = None;
+      locked.store.accounts[idx].cookie_session_only = false;
+      if !locked.store.pending_cleanup.contains(&key) {
+        locked.store.pending_cleanup.push(key.clone());
+      }
+      save_store_atomic(&locked.store_path, &locked.store)?;
+
+      #[cfg(desktop)]
+      let closed = {
+        locked.prewarm_failed.remove(&key);
+        locked.cookie_checked_at.remove(&key);
+        if let Some(entry) = locked.warm_pool.remove(&key) {
+          Self::close_warm_entry(app, entry);
+          Self::apply_desktop_layout_locked(app, &locked);
+          true
+        } else {
+          false
+        }
+      };
+      #[cfg(not(desktop))]
+      let closed = false;
+
+      (active_matches, closed)
+    };
+
+    if closed_desktop_view {
+      tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    }
+
+    match self.delete_profile_for_key(app, &uuid).await {
+      Ok(()) => {
+        let snap = {
+          let mut locked = self.inner.lock().await;
+          locked.store.pending_cleanup.retain(|k| k != &key);
+          save_store_atomic(&locked.store_path, &locked.store)?;
+          Self::snapshot_from_locked(&locked)
+        };
+        if was_active {
+          return self.switch_account_internal(app, key, false).await;
+        }
+        Ok(snap)
+      }
+      Err(err) => {
+        let snap = self.get_snapshot().await;
+        self.emit_snapshot(app, &snap);
+        Err(err)
+      }
+    }
+  }
+
+  pub async fn update_app_settings(
+    &self,
+    app: &AppHandle,
+    minimize_to_tray: bool,
+    raw_shortcut: &str,
+  ) -> Result<ManagerSnapshot, String> {
+    let shortcut = raw_shortcut.trim().to_string();
+    if shortcut.chars().count() > 80 {
+      return Err("全局快捷键长度过长".to_string());
+    }
+
+    #[cfg(desktop)]
+    let (global_shortcut_active, global_shortcut_error) = {
+      let (old_shortcut, old_active) = {
+        let locked = self.inner.lock().await;
+        (
+          locked.store.settings.global_shortcut.clone(),
+          locked.global_shortcut_active,
+        )
+      };
+      match Self::apply_global_shortcut_on(app, &shortcut).await {
+        Ok(active) => (active, None),
+        Err(err) => {
+          if old_active && !old_shortcut.trim().is_empty() {
+            let _ = Self::apply_global_shortcut_on(app, &old_shortcut).await;
+          }
+          return Err(err);
+        }
+      }
+    };
+
+    #[cfg(not(desktop))]
+    let (global_shortcut_active, global_shortcut_error) = {
+      let _ = app;
+      (false, None)
+    };
+
+    let mut locked = self.inner.lock().await;
+    let previous = locked.store.settings.clone();
+    locked.store.settings.minimize_to_tray = minimize_to_tray;
+    locked.store.settings.global_shortcut = shortcut;
+    if let Err(err) = save_store_atomic(&locked.store_path, &locked.store) {
+      locked.store.settings = previous;
+      return Err(err);
+    }
+    self.minimize_to_tray.store(minimize_to_tray, Ordering::SeqCst);
+    locked.global_shortcut_active = global_shortcut_active;
+    locked.global_shortcut_error = global_shortcut_error;
+    Ok(Self::snapshot_from_locked(&locked))
+  }
+
   pub async fn reveal_downloaded_file(&self, download_id: u64) -> Result<(), String> {
     #[cfg(desktop)]
     {
@@ -1860,16 +2598,22 @@ impl SessionManager {
     raw_provider: &str,
   ) -> Result<ManagerSnapshot, String> {
     let provider_id = ProviderId::parse(raw_provider).ok_or_else(|| "无效的服务标识".to_string())?;
-    let homepage = get_provider(provider_id).info.homepage_url;
+    let homepage = {
+      let locked = self.inner.lock().await;
+      resolve_provider(&locked.store.custom_providers, &provider_id)
+        .ok_or_else(|| "未找到对应的服务配置".to_string())?
+        .info
+        .homepage_url
+    };
 
     #[cfg(desktop)]
     {
       let _ = app;
-      platform::open_external_browser(homepage)?;
+      platform::open_external_browser(&homepage)?;
     }
     #[cfg(target_os = "android")]
     {
-      crate::platform::android::open_external_url(app, homepage).await?;
+      crate::platform::android::open_external_url(app, &homepage).await?;
     }
 
     Ok(self.get_snapshot().await)
@@ -1931,7 +2675,7 @@ impl SessionManager {
     }
     let (provider_id, target_uuid) = {
       let locked = self.inner.lock().await;
-      let pid = locked.selected_provider_id;
+      let pid = locked.selected_provider_id.clone();
       let accounts: Vec<_> = locked
         .store
         .accounts
@@ -1977,6 +2721,9 @@ impl SessionManager {
           .collect::<Vec<_>>()
       };
 
+      #[cfg(target_os = "macos")]
+      let warm_set: HashSet<AccountKey> = warm_targets.iter().map(|(k, _, _)| k.clone()).collect();
+
       for (key, wv_label, vid) in warm_targets {
         if let Some(wv) = app.get_webview(&wv_label) {
           let _ = wv.eval(r#"(() => {
@@ -2000,10 +2747,10 @@ impl SessionManager {
                 } else {
                   None
                 };
-                mgr
+                let (just_authenticated, _) = mgr
                   .apply_detected_metadata(
                     &app_handle,
-                    key,
+                    key.clone(),
                     vid,
                     resolved_identity,
                     if probe.avatar.is_empty() {
@@ -2020,10 +2767,38 @@ impl SessionManager {
                     probe.quota_detail,
                   )
                   .await;
+                mgr
+                  .refresh_account_cookie_expiry(&app_handle, key, force || just_authenticated)
+                  .await;
               } else if probe.logged_out {
                 mgr.apply_logged_out_state(&app_handle, key, vid).await;
               }
             }
+          });
+        }
+      }
+
+      #[cfg(target_os = "macos")]
+      {
+        let cold_auth_keys: Vec<AccountKey> = {
+          let locked = self.inner.lock().await;
+          locked
+            .store
+            .accounts
+            .iter()
+            .filter(|a| a.auth_state == AuthState::Authenticated)
+            .map(|a| AccountKey {
+              provider_id: a.provider_id.clone(),
+              uuid: a.uuid.clone(),
+            })
+            .filter(|k| !warm_set.contains(k))
+            .collect()
+        };
+        for key in cold_auth_keys {
+          let mgr_cold = Arc::clone(self);
+          let app_cold = app.clone();
+          tauri::async_runtime::spawn(async move {
+            mgr_cold.refresh_account_cookie_expiry(&app_cold, key, force).await;
           });
         }
       }
@@ -2062,6 +2837,13 @@ impl SessionManager {
           need_identity_watcher: bool,
           probe_notify: Arc<tokio::sync::Notify>,
         },
+        #[cfg(target_os = "macos")]
+        StageWarmPaint {
+          view_instance_id: u64,
+          expected_load_gen: u64,
+          loaded_url: Url,
+          loading_snap: ManagerSnapshot,
+        },
         AwaitWarmLoading {
           view_instance_id: u64,
         },
@@ -2078,8 +2860,10 @@ impl SessionManager {
         if !locked.conflicts.is_empty() {
           return Err("存在 UUID 归属冲突，已停留在管理页".to_string());
         }
-        if !get_provider(key.provider_id).info.enabled {
-          return Err(format!("{} 尚未开放应用内嵌", get_provider(key.provider_id).info.name));
+        let spec = resolve_provider(&locked.store.custom_providers, &key.provider_id)
+          .ok_or_else(|| "未找到对应的服务配置".to_string())?;
+        if !spec.info.enabled {
+          return Err(format!("{} 尚未开放应用内嵌", spec.info.name));
         }
         if locked.store.pending_cleanup.contains(&key) {
           self.hide_foreground_slot(app, next_seq, &mut locked).await;
@@ -2098,7 +2882,7 @@ impl SessionManager {
             return Ok(Self::snapshot_from_locked(&locked));
           };
 
-          locked.selected_provider_id = key.provider_id;
+          locked.selected_provider_id = key.provider_id.clone();
           locked.notice = None;
           locked.prewarm_failed.remove(&key);
           self.hide_foreground_slot(app, next_seq, &mut locked).await;
@@ -2108,16 +2892,60 @@ impl SessionManager {
               Some((
                 entry.view_instance_id,
                 entry.paint_ready,
+                entry.staged_painted,
                 entry.watcher_running,
                 Arc::clone(&entry.probe_notify),
+                Arc::clone(&entry.load_gen),
+                entry.last_url.clone(),
               ))
             } else {
               None
             }
           });
 
-          if let Some((vid, paint_ready, watcher_running, probe_notify)) = warm_state {
-            if paint_ready {
+          if let Some((
+            vid,
+            paint_ready,
+            staged_painted,
+            watcher_running,
+            probe_notify,
+            load_gen,
+            last_url,
+          )) = warm_state
+          {
+            #[cfg(not(target_os = "macos"))]
+            let _ = (staged_painted, &load_gen, &last_url);
+            #[cfg(target_os = "macos")]
+            let needs_stage_paint = paint_ready && !staged_painted;
+            #[cfg(not(target_os = "macos"))]
+            let needs_stage_paint = false;
+
+            if needs_stage_paint {
+              #[cfg(target_os = "macos")]
+              {
+                if let Some(entry) = locked.warm_pool.get_mut(&key) {
+                  entry.last_used_ms = now_ms();
+                }
+                locked.active_slot = Some(ActiveSessionSlot {
+                  account_key: key.clone(),
+                  view_instance_id: vid,
+                  switch_seq: next_seq,
+                  committed: false,
+                });
+                self.active_view_id.store(vid, Ordering::SeqCst);
+                Self::apply_desktop_layout_locked(app, &locked);
+                let fallback_url = Url::parse(&spec.info.entry_url)
+                  .unwrap_or_else(|_| Url::parse("about:blank").expect("valid blank url"));
+                DesktopSwitchPlan::StageWarmPaint {
+                  view_instance_id: vid,
+                  expected_load_gen: load_gen.load(Ordering::SeqCst),
+                  loaded_url: last_url.unwrap_or(fallback_url),
+                  loading_snap: Self::snapshot_from_locked(&locked),
+                }
+              }
+              #[cfg(not(target_os = "macos"))]
+              unreachable!()
+            } else if paint_ready {
               let prev_last = locked.store.last_committed.clone();
               locked.store.last_committed = Some(key.clone());
               if let Err(err) = save_store_atomic(&locked.store_path, &locked.store) {
@@ -2127,7 +2955,7 @@ impl SessionManager {
               } else {
                 locked
                   .last_active_per_provider
-                  .insert(key.provider_id, key.clone());
+                  .insert(key.provider_id.clone(), key.clone());
                 locked.active_slot = Some(ActiveSessionSlot {
                   account_key: key.clone(),
                   view_instance_id: vid,
@@ -2135,11 +2963,7 @@ impl SessionManager {
                   committed: true,
                 });
                 self.active_view_id.store(vid, Ordering::SeqCst);
-                let title = format!(
-                  "{} · {}",
-                  get_provider(key.provider_id).info.short_name,
-                  acc.alias
-                );
+                let title = format!("{} · {}", spec.info.short_name, acc.alias);
                 if let Some(main_win) = app.get_window("main") {
                   let _ = main_win.set_title(&title);
                 }
@@ -2202,6 +3026,31 @@ impl SessionManager {
           }
           Ok(self.get_snapshot().await)
         }
+        #[cfg(target_os = "macos")]
+        DesktopSwitchPlan::StageWarmPaint {
+          view_instance_id,
+          expected_load_gen,
+          loaded_url,
+          loading_snap,
+        } => {
+          self.emit_snapshot(app, &loading_snap);
+          let mgr_stage = Arc::clone(self);
+          let app_stage = app.clone();
+          let key_stage = key;
+          tauri::async_runtime::spawn(async move {
+            mgr_stage
+              .wait_paint_and_finalize_desktop(
+                &app_stage,
+                key_stage,
+                view_instance_id,
+                loaded_url,
+                expected_load_gen,
+                true,
+              )
+              .await;
+          });
+          Ok(loading_snap)
+        }
         DesktopSwitchPlan::AwaitWarmLoading { view_instance_id } => {
           let _ = view_instance_id;
           Ok(self.get_snapshot().await)
@@ -2233,8 +3082,10 @@ impl SessionManager {
         if !locked.conflicts.is_empty() {
           return Err("存在 UUID 归属冲突，已停留在管理页".to_string());
         }
-        if !get_provider(key.provider_id).info.enabled {
-          return Err(format!("{} 尚未开放应用内嵌", get_provider(key.provider_id).info.name));
+        let spec = resolve_provider(&locked.store.custom_providers, &key.provider_id)
+          .ok_or_else(|| "未找到对应的服务配置".to_string())?;
+        if !spec.info.enabled {
+          return Err(format!("{} 尚未开放应用内嵌", spec.info.name));
         }
         if locked.store.pending_cleanup.contains(&key) {
           self.hide_foreground_slot(app, next_seq, &mut locked).await;
@@ -2375,6 +3226,7 @@ impl SessionManager {
     self: &Arc<Self>,
     app: &AppHandle,
     key: AccountKey,
+    provider_spec: ProviderSpec,
     parsed_uuid: Uuid,
     profile_dir: &std::path::Path,
     proxy_url: Option<&Url>,
@@ -2382,22 +3234,25 @@ impl SessionManager {
     view_instance_id: u64,
     allow_blank: Arc<AtomicBool>,
     alive_flag: Arc<AtomicBool>,
+    load_gen: Arc<AtomicU64>,
   ) -> tauri::webview::WebviewBuilder<tauri::Wry> {
     let alive_nav = Arc::clone(&alive_flag);
     let mgr_for_nav = Arc::clone(self);
     let app_for_nav = app.clone();
     let allow_blank_nav = Arc::clone(&allow_blank);
-    let provider_id = key.provider_id;
+    let spec_for_nav = provider_spec.clone();
     let key_for_nav = key.clone();
 
     let alive_popup = Arc::clone(&alive_flag);
     let active_vid_popup = Arc::clone(&self.active_view_id);
     let mgr_for_popup = Arc::clone(self);
     let app_for_popup = app.clone();
+    let spec_for_popup = provider_spec.clone();
     let key_for_popup = key.clone();
     let popup_counter = Arc::new(AtomicU64::new(1));
 
     let alive_load = Arc::clone(&alive_flag);
+    let load_gen_for_load = Arc::clone(&load_gen);
     let mgr_for_load = Arc::clone(self);
     let app_for_load = app.clone();
     let key_for_load = key;
@@ -2412,19 +3267,31 @@ impl SessionManager {
     let app_for_popup_dl = app.clone();
     let pending_for_popup_dl = Arc::clone(&pending_downloads);
 
+    let provider_host = Url::parse(&provider_spec.info.entry_url)
+      .ok()
+      .and_then(|u| u.host_str().map(|s| s.to_ascii_lowercase()))
+      .unwrap_or_default();
+    let provider_init_js = format!(
+      "window.__maamProvider = {{ id: {}, host: {}, custom: {} }};",
+      serde_json::to_string(provider_spec.info.id.as_str()).unwrap_or_else(|_| "\"\"".to_string()),
+      serde_json::to_string(&provider_host).unwrap_or_else(|_| "\"\"".to_string()),
+      provider_spec.info.is_custom
+    );
+
     let mut builder = tauri::webview::WebviewBuilder::new(
       webview_label,
       tauri::WebviewUrl::External("about:blank".parse().expect("valid blank url")),
     )
     .focused(false)
     .background_throttling(tauri::utils::config::BackgroundThrottlingPolicy::Disabled)
+    .initialization_script(&provider_init_js)
     .initialization_script(LOGIN_CAPTURE_INIT_JS)
     .on_navigation(move |url| {
       if !alive_nav.load(Ordering::SeqCst) {
         return false;
       }
       let can_blank = allow_blank_nav.load(Ordering::SeqCst);
-      match classify_top_level_url(provider_id, url, can_blank) {
+      match classify_top_level_url(&spec_for_nav, url, can_blank) {
         NavigationDecision::AllowBlank => true,
         NavigationDecision::AllowHttps => true,
         NavigationDecision::ExternalGoogleOAuth => {
@@ -2447,7 +3314,7 @@ impl SessionManager {
       {
         return tauri::webview::NewWindowResponse::Deny;
       }
-      let decision = classify_top_level_url(provider_id, &url, true);
+      let decision = classify_top_level_url(&spec_for_popup, &url, true);
       match decision {
         NavigationDecision::ExternalGoogleOAuth => {
           let mgr_ext = Arc::clone(&mgr_for_popup);
@@ -2475,6 +3342,7 @@ impl SessionManager {
       let active_vid_popup_nav = Arc::clone(&active_vid_popup);
       let app_popup_nav = app_for_popup.clone();
       let mgr_popup_nav = Arc::clone(&mgr_for_popup);
+      let spec_popup_nav = spec_for_popup.clone();
       let key_popup_nav = key_for_popup.clone();
 
       let popup_title = url
@@ -2492,6 +3360,7 @@ impl SessionManager {
         tauri::WebviewUrl::External("about:blank".parse().expect("valid blank url")),
       )
       .window_features(features)
+      .initialization_script(&provider_init_js)
       .initialization_script(LOGIN_CAPTURE_INIT_JS)
       .title(&popup_title)
       .on_download(move |_wv, event| {
@@ -2506,7 +3375,7 @@ impl SessionManager {
           }
           return false;
         }
-        match classify_top_level_url(provider_id, nav_url, true) {
+        match classify_top_level_url(&spec_popup_nav, nav_url, true) {
           NavigationDecision::AllowBlank => true,
           NavigationDecision::AllowHttps => {
             if let Some(host) = nav_url.host_str() {
@@ -2555,24 +3424,39 @@ impl SessionManager {
       mgr_for_dl.handle_desktop_download_event(&app_for_dl, &pending_for_dl, event)
     })
     .on_page_load(move |_wv, payload| {
-      if !handle_page_load || payload.event() != tauri::webview::PageLoadEvent::Finished {
-        return;
-      }
       if payload.url().as_str() == "about:blank" {
         return;
       }
       if !alive_load.load(Ordering::SeqCst) {
         return;
       }
-      let loaded_url = payload.url().clone();
-      let mgr_commit = Arc::clone(&mgr_for_load);
-      let app_commit = app_for_load.clone();
-      let key_commit = key_for_load.clone();
-      tauri::async_runtime::spawn(async move {
-        mgr_commit
-          .wait_paint_and_finalize_desktop(&app_commit, key_commit, view_instance_id, loaded_url)
-          .await;
-      });
+      match payload.event() {
+        tauri::webview::PageLoadEvent::Started => {
+          load_gen_for_load.fetch_add(1, Ordering::SeqCst);
+        }
+        tauri::webview::PageLoadEvent::Finished => {
+          if !handle_page_load {
+            return;
+          }
+          let expected_gen = load_gen_for_load.fetch_add(1, Ordering::SeqCst) + 1;
+          let loaded_url = payload.url().clone();
+          let mgr_commit = Arc::clone(&mgr_for_load);
+          let app_commit = app_for_load.clone();
+          let key_commit = key_for_load.clone();
+          tauri::async_runtime::spawn(async move {
+            mgr_commit
+              .wait_paint_and_finalize_desktop(
+                &app_commit,
+                key_commit,
+                view_instance_id,
+                loaded_url,
+                expected_gen,
+                false,
+              )
+              .await;
+          });
+        }
+      }
     });
 
     #[cfg(target_os = "macos")]
@@ -2589,7 +3473,7 @@ impl SessionManager {
       builder = builder.data_directory(profile_dir.to_path_buf());
     }
 
-    if provider_id == ProviderId::Hark {
+    if provider_spec.info.id.is_hark() {
       builder = builder.background_color(tauri::webview::Color(23, 29, 47, 255));
     }
 
@@ -2649,6 +3533,7 @@ impl SessionManager {
     webview_label: &str,
     view_instance_id: u64,
     alive_flag: &Arc<AtomicBool>,
+    load_gen: &Arc<AtomicU64>,
   ) -> Result<(), String> {
     let main_win = app.get_window("main").ok_or_else(|| "主窗口不存在".to_string())?;
     let (init_pos, init_size) = Self::initial_hidden_child_rect(&main_win);
@@ -2656,22 +3541,28 @@ impl SessionManager {
     let retry_until = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
 
     loop {
-      let proxy_url = {
+      let (proxy_url, provider_spec) = {
         let locked = self.inner.lock().await;
         if !Self::is_view_instance_valid(&locked, key, view_instance_id) {
           return Ok(());
         }
+        let spec = resolve_provider(&locked.store.custom_providers, &key.provider_id)
+          .ok_or_else(|| "未找到对应的服务配置".to_string())?;
         let account = locked
           .store
           .accounts
           .iter()
           .find(|account| account.provider_id == key.provider_id && account.uuid == key.uuid)
           .ok_or_else(|| "账号不存在，已阻止加载".to_string())?;
-        platform::parse_account_proxy(account.proxy_url.as_deref().unwrap_or_default())?
+        (
+          platform::parse_account_proxy(account.proxy_url.as_deref().unwrap_or_default())?,
+          spec,
+        )
       };
       let builder = self.build_desktop_account_webview(
         app,
         key.clone(),
+        provider_spec,
         parsed_uuid,
         profile_dir,
         proxy_url.as_ref(),
@@ -2679,6 +3570,7 @@ impl SessionManager {
         view_instance_id,
         Arc::new(AtomicBool::new(true)),
         Arc::clone(alive_flag),
+        Arc::clone(load_gen),
       );
       #[cfg(windows)]
       let builder =
@@ -2688,7 +3580,9 @@ impl SessionManager {
       match result {
         Ok(webview) => {
           let _ = webview.hide();
-          return self.navigate_desktop_account(app, &webview, key, view_instance_id).await;
+          return self
+            .navigate_desktop_account(app, &webview, key, view_instance_id, load_gen)
+            .await;
         }
         #[cfg(windows)]
         Err(err) if platform::windows_webview_options_in_use(&err) => {
@@ -2709,14 +3603,18 @@ impl SessionManager {
     webview: &tauri::Webview,
     key: &AccountKey,
     view_instance_id: u64,
+    load_gen: &Arc<AtomicU64>,
   ) -> Result<(), String> {
-    let (proxy_url, uuid, profile_dir) = {
+    let _ = load_gen;
+    let (proxy_url, uuid, profile_dir, entry_url_str) = {
       let locked = self.inner.lock().await;
       if !Self::is_view_instance_valid(&locked, key, view_instance_id) {
         drop(locked);
         let _ = webview.close();
         return Ok(());
       }
+      let spec = resolve_provider(&locked.store.custom_providers, &key.provider_id)
+        .ok_or_else(|| "未找到对应的服务配置".to_string())?;
       let account = locked
         .store
         .accounts
@@ -2726,7 +3624,7 @@ impl SessionManager {
       let proxy_url = platform::parse_account_proxy(account.proxy_url.as_deref().unwrap_or_default())?;
       let uuid = Uuid::parse_str(&key.uuid).map_err(|err| format!("非法 UUID: {err}"))?;
       let profile_dir = locked.app_data_dir.join("profiles").join(&key.uuid);
-      (proxy_url, uuid, profile_dir)
+      (proxy_url, uuid, profile_dir, spec.info.entry_url)
     };
     let uses_proxy = proxy_url.is_some();
 
@@ -2760,13 +3658,27 @@ impl SessionManager {
       let mgr = Arc::clone(self);
       let app = app.clone();
       let key = key.clone();
+      let load_gen_win = Arc::clone(load_gen);
       platform::on_windows_navigation_completed(webview, move |result| {
         let mgr = Arc::clone(&mgr);
         let app = app.clone();
         let key = key.clone();
+        let load_gen_cb = Arc::clone(&load_gen_win);
         tauri::async_runtime::spawn(async move {
           match result {
-            Ok(url) => mgr.wait_paint_and_finalize_desktop(&app, key, view_instance_id, url).await,
+            Ok(url) => {
+              let expected_gen = load_gen_cb.fetch_add(1, Ordering::SeqCst) + 1;
+              mgr
+                .wait_paint_and_finalize_desktop(
+                  &app,
+                  key,
+                  view_instance_id,
+                  url,
+                  expected_gen,
+                  false,
+                )
+                .await;
+            }
             Err(()) => {
               mgr.fail_initial_proxy_load(
                 &app,
@@ -2782,9 +3694,7 @@ impl SessionManager {
       .await?;
     }
 
-    let entry_url = get_provider(key.provider_id)
-      .info
-      .entry_url
+    let entry_url = entry_url_str
       .parse()
       .map_err(|err| format!("服务入口地址错误: {err}"))?;
     {
@@ -2864,12 +3774,13 @@ impl SessionManager {
 
     let webview_label = format!("account-{view_instance_id}");
     let alive_flag = Arc::new(AtomicBool::new(true));
+    let load_gen = Arc::new(AtomicU64::new(0));
     let key = AccountKey {
       provider_id: account.provider_id,
       uuid: account.uuid.clone(),
     };
 
-    {
+    let loading_snap = {
       let mut locked = self.inner.lock().await;
       if self.current_seq.load(Ordering::SeqCst) != expected_seq {
         return Ok(Self::snapshot_from_locked(&locked));
@@ -2892,7 +3803,9 @@ impl SessionManager {
           webview_label: webview_label.clone(),
           popup_label: None,
           paint_ready: false,
+          staged_painted: false,
           navigation_reached: false,
+          load_gen: Arc::clone(&load_gen),
           last_url: None,
           captured_identity_hint: None,
           watcher_running: false,
@@ -2902,17 +3815,40 @@ impl SessionManager {
         },
       );
       Self::evict_warm_pool_if_needed(app, &mut locked, Some(&key), MAX_WARM_DESKTOP_VIEWS);
-    }
+      Self::apply_desktop_layout_locked(app, &locked);
+      Self::snapshot_from_locked(&locked)
+    };
+    self.emit_snapshot(app, &loading_snap);
 
     let result = self
       .attach_desktop_account_webview(
-        app, &key, parsed_uuid, &profile_dir, &webview_label, view_instance_id, &alive_flag,
+        app,
+        &key,
+        parsed_uuid,
+        &profile_dir,
+        &webview_label,
+        view_instance_id,
+        &alive_flag,
+        &load_gen,
       )
       .await;
     if let Err(err) = result {
       let mut locked = self.inner.lock().await;
       self.discard_desktop_view_locked(app, &mut locked, &key, view_instance_id, err);
       return Ok(Self::snapshot_from_locked(&locked));
+    }
+
+    {
+      let locked = self.inner.lock().await;
+      if locked
+        .active_slot
+        .as_ref()
+        .is_some_and(|slot| {
+          slot.account_key == key && slot.view_instance_id == view_instance_id && !slot.committed
+        })
+      {
+        Self::apply_desktop_layout_locked(app, &locked);
+      }
     }
 
     Ok(self.get_snapshot().await)
@@ -2947,37 +3883,74 @@ impl SessionManager {
     key: AccountKey,
     view_instance_id: u64,
     loaded_url: Url,
+    expected_load_gen: u64,
+    reset_paint_state: bool,
   ) {
-    if classify_top_level_url(key.provider_id, &loaded_url, false) != NavigationDecision::AllowHttps {
-      return;
-    }
-
-    let wv_label_opt = {
+    let wait_params = {
       let mut locked = self.inner.lock().await;
+      let Some(spec) = resolve_provider(&locked.store.custom_providers, &key.provider_id) else {
+        return;
+      };
+      if classify_top_level_url(&spec, &loaded_url, false) != NavigationDecision::AllowHttps {
+        return;
+      }
       locked.warm_pool.get_mut(&key).and_then(|e| {
-        if e.view_instance_id == view_instance_id {
+        if e.view_instance_id == view_instance_id
+          && e.load_gen.load(Ordering::SeqCst) == expected_load_gen
+        {
           e.navigation_reached = true;
-          Some((e.webview_label.clone(), e.paint_ready))
+          Some((
+            e.webview_label.clone(),
+            e.paint_ready,
+            Arc::clone(&e.alive_flag),
+            Arc::clone(&e.load_gen),
+          ))
         } else {
           None
         }
       })
     };
 
-    let Some((wv_label, already_ready)) = wv_label_opt else {
+    let Some((wv_label, already_ready, alive_flag, load_gen)) = wait_params else {
       return;
     };
 
-    if !already_ready {
-      for _ in 0..45 {
+    if !already_ready || reset_paint_state {
+      if reset_paint_state {
+        if let Some(wv) = app.get_webview(&wv_label) {
+          let _ = wv.eval("window.__maamReadySince = 0; window.__maamReadyFrames = 0;");
+        }
+      }
+      for tick in 0..100 {
+        if !alive_flag.load(Ordering::SeqCst)
+          || load_gen.load(Ordering::SeqCst) != expected_load_gen
+        {
+          return;
+        }
         let Some(wv) = app.get_webview(&wv_label) else {
           return;
         };
+        #[cfg(target_os = "macos")]
+        if platform::is_macos_webview_loading(&wv).await {
+          tokio::time::sleep(std::time::Duration::from_millis(if tick < 20 { 80 } else { 150 }))
+            .await;
+          continue;
+        }
         if Self::eval_paint_ready(&wv).await {
-          tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+          tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+          if !alive_flag.load(Ordering::SeqCst)
+            || load_gen.load(Ordering::SeqCst) != expected_load_gen
+          {
+            return;
+          }
+          #[cfg(target_os = "macos")]
+          if platform::is_macos_webview_loading(&wv).await {
+            continue;
+          }
           break;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(if tick < 20 { 80 } else { 150 }))
+          .await;
       }
     }
 
@@ -3040,13 +4013,24 @@ impl SessionManager {
         return;
       };
 
+      let is_foreground_waiting = locked
+        .active_slot
+        .as_ref()
+        .map(|s| s.account_key == key && s.view_instance_id == view_instance_id && !s.committed)
+        .unwrap_or(false);
+
       let mut need_watcher = false;
       let probe_notify;
       if let Some(entry) = locked.warm_pool.get_mut(&key) {
-        if entry.view_instance_id != view_instance_id {
+        if entry.view_instance_id != view_instance_id
+          || entry.load_gen.load(Ordering::SeqCst) != expected_load_gen
+        {
           return;
         }
         entry.paint_ready = true;
+        if is_foreground_waiting {
+          entry.staged_painted = true;
+        }
         entry.last_url = Some(loaded_url);
         if !entry.watcher_running {
           entry.watcher_running = true;
@@ -3056,12 +4040,6 @@ impl SessionManager {
       } else {
         return;
       }
-
-      let is_foreground_waiting = locked
-        .active_slot
-        .as_ref()
-        .map(|s| s.account_key == key && s.view_instance_id == view_instance_id && !s.committed)
-        .unwrap_or(false);
 
       if is_foreground_waiting {
         let prev_last = locked.store.last_committed.clone();
@@ -3082,12 +4060,11 @@ impl SessionManager {
           }
           locked
             .last_active_per_provider
-            .insert(key.provider_id, key.clone());
-          let title = format!(
-            "{} · {}",
-            get_provider(key.provider_id).info.short_name,
-            acc.alias
-          );
+            .insert(key.provider_id.clone(), key.clone());
+          let short_name = resolve_provider(&locked.store.custom_providers, &key.provider_id)
+            .map(|s| s.info.short_name)
+            .unwrap_or_else(|| key.provider_id.as_str().to_string());
+          let title = format!("{short_name} · {}", acc.alias);
           if let Some(main_win) = app.get_window("main") {
             let _ = main_win.set_title(&title);
           }
@@ -3149,6 +4126,7 @@ impl SessionManager {
     let view_instance_id = self.view_counter.fetch_add(1, Ordering::SeqCst);
     let webview_label = format!("account-{view_instance_id}");
     let alive_flag = Arc::new(AtomicBool::new(true));
+    let load_gen = Arc::new(AtomicU64::new(0));
 
     {
       let mut locked = self.inner.lock().await;
@@ -3169,7 +4147,9 @@ impl SessionManager {
           webview_label: webview_label.clone(),
           popup_label: None,
           paint_ready: false,
+          staged_painted: false,
           navigation_reached: false,
+          load_gen: Arc::clone(&load_gen),
           last_url: None,
           captured_identity_hint: None,
           watcher_running: false,
@@ -3182,7 +4162,7 @@ impl SessionManager {
 
     let result = self
       .attach_desktop_account_webview(
-        app, &key, parsed_uuid, &profile_dir, &webview_label, view_instance_id, &alive_flag,
+        app, &key, parsed_uuid, &profile_dir, &webview_label, view_instance_id, &alive_flag, &load_gen,
       )
       .await;
     if let Err(err) = result {
@@ -3210,11 +4190,13 @@ impl SessionManager {
           None
         } else {
           let is_eligible_cold = |a: &&AccountRecord| {
-            if !get_provider(a.provider_id).info.enabled {
+            if !resolve_provider(&locked.store.custom_providers, &a.provider_id)
+              .is_some_and(|s| s.info.enabled)
+            {
               return false;
             }
             let k = AccountKey {
-              provider_id: a.provider_id,
+              provider_id: a.provider_id.clone(),
               uuid: a.uuid.clone(),
             };
             !locked.warm_pool.contains_key(&k)
@@ -3234,7 +4216,7 @@ impl SessionManager {
 
       if let Some(account) = next_cold {
         let failed_key = AccountKey {
-          provider_id: account.provider_id,
+          provider_id: account.provider_id.clone(),
           uuid: account.uuid.clone(),
         };
         if mgr.prewarm_desktop_account(&app_handle, account).await.is_err() {
@@ -3325,32 +4307,34 @@ impl SessionManager {
     }
 
     let key = AccountKey {
-      provider_id: account.provider_id,
+      provider_id: account.provider_id.clone(),
       uuid: account.uuid.clone(),
     };
 
-    {
+    let spec = {
       let mut locked = self.inner.lock().await;
       if self.current_seq.load(Ordering::SeqCst) != expected_seq {
         return Ok(Self::snapshot_from_locked(&locked));
       }
+      let spec = resolve_provider(&locked.store.custom_providers, &account.provider_id)
+        .ok_or_else(|| "未找到对应的服务配置".to_string())?;
       locked.active_slot = Some(ActiveSessionSlot {
         account_key: key,
         view_instance_id,
         switch_seq: expected_seq,
         committed: false,
       });
-    }
+      spec
+    };
 
-    let spec = get_provider(account.provider_id);
     let payload = crate::platform::android::OpenAndroidAccountPayload {
       provider_id: account.provider_id.as_str().to_string(),
-      provider_name: spec.info.short_name.to_string(),
+      provider_name: spec.info.short_name,
       uuid: account.uuid.clone(),
       alias: account.alias.clone(),
       auto_alias: account.auto_alias,
-      entry_url: spec.info.entry_url.to_string(),
-      allowed_hosts: spec.allowed_hosts.iter().map(|s| (*s).to_string()).collect(),
+      entry_url: spec.info.entry_url,
+      allowed_hosts: spec.allowed_hosts,
       switch_seq: expected_seq,
       view_instance_id,
       is_cold_start,
@@ -3579,13 +4563,16 @@ impl SessionManager {
     if self.current_seq.load(Ordering::SeqCst) != expected_seq {
       return;
     }
-    if classify_top_level_url(key.provider_id, &committed_url, false) != NavigationDecision::AllowHttps {
-      return;
-    }
 
     let snap_opt = {
       let mut locked = self.inner.lock().await;
       if self.current_seq.load(Ordering::SeqCst) != expected_seq {
+        return;
+      }
+      let Some(spec) = resolve_provider(&locked.store.custom_providers, &key.provider_id) else {
+        return;
+      };
+      if classify_top_level_url(&spec, &committed_url, false) != NavigationDecision::AllowHttps {
         return;
       }
       if !locked.conflicts.is_empty() || locked.store.pending_cleanup.contains(&key) {
@@ -3627,11 +4614,7 @@ impl SessionManager {
         if let Some(slot) = &mut locked.active_slot {
           slot.committed = true;
         }
-        let title = format!(
-          "{} · {}",
-          get_provider(key.provider_id).info.short_name,
-          acc.alias
-        );
+        let title = format!("{} · {}", spec.info.short_name, acc.alias);
         let _ = crate::platform::android::update_account_title(app, expected_seq, &title).await;
         Some(Self::snapshot_from_locked(&locked))
       }
@@ -3660,8 +4643,12 @@ impl SessionManager {
         return;
       }
       let cur_seq = self.current_seq.load(Ordering::SeqCst);
-      let entry_ok = Url::parse(get_provider(key.provider_id).info.entry_url)
-        .map(|u| is_verified_callback_origin(key.provider_id, &u))
+      let entry_ok = resolve_provider(&locked.store.custom_providers, &key.provider_id)
+        .and_then(|spec| {
+          Url::parse(&spec.info.entry_url)
+            .ok()
+            .map(|u| is_verified_callback_origin(&spec, &u))
+        })
         .unwrap_or(false);
       locked.pending_external_auth = Some(PendingExternalAuth {
         account_key: key.clone(),
@@ -3802,7 +4789,7 @@ impl SessionManager {
 
         if probe.is_auth {
           consecutive_logged_out = 0;
-          mgr
+          let (just_authenticated, needs_cookie_check) = mgr
             .apply_detected_metadata(
               &app,
               key.clone(),
@@ -3822,6 +4809,16 @@ impl SessionManager {
               probe.quota_detail,
             )
             .await;
+          if just_authenticated || needs_cookie_check {
+            let mgr_cookie = Arc::clone(&mgr);
+            let app_cookie = app.clone();
+            let key_cookie = key.clone();
+            tauri::async_runtime::spawn(async move {
+              mgr_cookie
+                .refresh_account_cookie_expiry(&app_cookie, key_cookie, just_authenticated)
+                .await;
+            });
+          }
           next_delay_ms = Some(if tick_count < 6 { 950 } else { 6500 });
         } else if probe.logged_out {
           consecutive_logged_out = consecutive_logged_out.saturating_add(1);
@@ -3945,6 +4942,9 @@ impl SessionManager {
         return;
       }
 
+      #[cfg(desktop)]
+      locked.cookie_checked_at.remove(&key);
+
       let Some(target) = locked
         .store
         .accounts
@@ -3958,6 +4958,8 @@ impl SessionManager {
         && target.quota_detail.is_none()
         && target.quota_text.is_none()
         && target.quota_percent.is_none()
+        && target.cookie_expires_at_ms.is_none()
+        && !target.cookie_session_only
       {
         return;
       }
@@ -3966,6 +4968,8 @@ impl SessionManager {
       target.quota_detail = None;
       target.quota_text = None;
       target.quota_percent = None;
+      target.cookie_expires_at_ms = None;
+      target.cookie_session_only = false;
 
       if save_store_atomic(&locked.store_path, &locked.store).is_err() {
         return;
@@ -3976,6 +4980,132 @@ impl SessionManager {
 
     if let Some(snap) = snap_opt {
       self.emit_snapshot(app, &snap);
+    }
+  }
+
+  #[cfg(desktop)]
+  #[allow(dead_code)]
+  async fn apply_cookie_expiry_summary(
+    &self,
+    app: &AppHandle,
+    key: &AccountKey,
+    summary: platform::CookieExpirySummary,
+  ) {
+    let checked_at = now_ms();
+    let snap_opt = {
+      let mut locked = self.inner.lock().await;
+      let Some(idx) = locked
+        .store
+        .accounts
+        .iter()
+        .position(|a| a.provider_id == key.provider_id && a.uuid == key.uuid)
+      else {
+        return;
+      };
+      if locked.store.accounts[idx].auth_state == AuthState::LoggedOut {
+        return;
+      }
+      if summary.expires_at_ms.is_some() || summary.session_only {
+        locked.cookie_checked_at.insert(key.clone(), checked_at);
+      }
+      let target = &mut locked.store.accounts[idx];
+      if target.cookie_expires_at_ms == summary.expires_at_ms
+        && target.cookie_session_only == summary.session_only
+      {
+        return;
+      }
+      target.cookie_expires_at_ms = summary.expires_at_ms;
+      target.cookie_session_only = summary.session_only;
+      if save_store_atomic(&locked.store_path, &locked.store).is_err() {
+        return;
+      }
+      Some(Self::snapshot_from_locked(&locked))
+    };
+
+    if let Some(snap) = snap_opt {
+      self.emit_snapshot(app, &snap);
+    }
+  }
+
+  #[cfg(desktop)]
+  #[allow(dead_code)]
+  async fn refresh_account_cookie_expiry(
+    self: &Arc<Self>,
+    app: &AppHandle,
+    key: AccountKey,
+    force: bool,
+  ) {
+    const COOKIE_CHECK_COOLDOWN_MS: u64 = 10 * 60 * 1000;
+    let now = now_ms();
+
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+      let _ = (app, key, force, now, COOKIE_CHECK_COOLDOWN_MS);
+      return;
+    }
+
+    #[cfg(any(target_os = "macos", windows))]
+    {
+      let url_opt = {
+        let locked = self.inner.lock().await;
+        let Some(account) = locked
+          .store
+          .accounts
+          .iter()
+          .find(|a| a.provider_id == key.provider_id && a.uuid == key.uuid)
+        else {
+          return;
+        };
+        if account.auth_state == AuthState::LoggedOut {
+          return;
+        }
+        if !force {
+          if let Some(&last_checked) = locked.cookie_checked_at.get(&key) {
+            if now.saturating_sub(last_checked) < COOKIE_CHECK_COOLDOWN_MS {
+              return;
+            }
+          }
+        }
+        let Some(spec) = resolve_provider(&locked.store.custom_providers, &key.provider_id) else {
+          return;
+        };
+        if !spec.info.enabled {
+          return;
+        }
+        let Ok(url) = Url::parse(&spec.info.entry_url) else {
+          return;
+        };
+
+        #[cfg(target_os = "macos")]
+        let platform_target = Uuid::parse_str(&key.uuid).ok().map(|uuid| (url, uuid));
+
+        #[cfg(windows)]
+        let platform_target = locked
+          .warm_pool
+          .get(&key)
+          .and_then(|entry| app.get_webview(&entry.webview_label))
+          .map(|webview| (url, webview));
+
+        platform_target
+      };
+
+      let Some((url, handle)) = url_opt else {
+        return;
+      };
+
+      #[cfg(target_os = "macos")]
+      let summary_res = platform::read_macos_cookies_for_url(app, handle, url)
+        .await
+        .map(|(_, summary)| summary);
+
+      #[cfg(windows)]
+      let summary_res = Self::read_windows_webview_cookies(handle, url)
+        .await
+        .map(|(_, summary)| summary);
+
+      if let Ok(summary) = summary_res {
+        self.apply_cookie_expiry_summary(app, &key, summary).await;
+      }
     }
   }
 
@@ -3990,11 +5120,11 @@ impl SessionManager {
     quota_text_opt: Option<String>,
     quota_pct_opt: Option<u8>,
     quota_detail_opt: Option<QuotaDetail>,
-  ) {
-    let snap_opt = {
+  ) -> (bool, bool) {
+    let (snap_opt, became_authenticated, needs_cookie_check) = {
       let mut locked = self.inner.lock().await;
       if !Self::is_view_instance_valid(&locked, &key, view_instance_id) {
-        return;
+        return (false, false);
       }
 
       let Some(target) = locked
@@ -4003,14 +5133,16 @@ impl SessionManager {
         .iter_mut()
         .find(|a| a.provider_id == key.provider_id && a.uuid == key.uuid)
       else {
-        return;
+        return (false, false);
       };
 
       let mut changed = false;
+      let mut became_authenticated = false;
       let mut alias_updated = None;
 
       if target.auth_state != AuthState::Authenticated {
         target.auth_state = AuthState::Authenticated;
+        became_authenticated = true;
         changed = true;
       }
 
@@ -4057,43 +5189,44 @@ impl SessionManager {
         }
       }
 
-      if !changed {
-        return;
-      }
+      let needs_cookie_check =
+        became_authenticated || (target.cookie_expires_at_ms.is_none() && !target.cookie_session_only);
 
-      if save_store_atomic(&locked.store_path, &locked.store).is_err() {
-        return;
-      }
-
-      if let Some(new_alias) = alias_updated {
-        let is_fg = locked
-          .active_slot
-          .as_ref()
-          .map(|s| s.committed && s.account_key == key)
-          .unwrap_or(false);
-        if is_fg {
-          let title = format!(
-            "{} · {}",
-            get_provider(key.provider_id).info.short_name,
-            new_alias
-          );
-          #[cfg(desktop)]
-          if let Some(main_win) = app.get_window("main") {
-            let _ = main_win.set_title(&title);
-          }
-          #[cfg(target_os = "android")]
-          if let Some(slot) = &locked.active_slot {
-            let _ = crate::platform::android::update_account_title(app, slot.switch_seq, &title).await;
+      let snap_opt = if changed && save_store_atomic(&locked.store_path, &locked.store).is_ok() {
+        if let Some(new_alias) = alias_updated {
+          let is_fg = locked
+            .active_slot
+            .as_ref()
+            .map(|s| s.committed && s.account_key == key)
+            .unwrap_or(false);
+          if is_fg {
+            let short_name = resolve_provider(&locked.store.custom_providers, &key.provider_id)
+              .map(|s| s.info.short_name)
+              .unwrap_or_else(|| key.provider_id.as_str().to_string());
+            let title = format!("{short_name} · {new_alias}");
+            #[cfg(desktop)]
+            if let Some(main_win) = app.get_window("main") {
+              let _ = main_win.set_title(&title);
+            }
+            #[cfg(target_os = "android")]
+            if let Some(slot) = &locked.active_slot {
+              let _ = crate::platform::android::update_account_title(app, slot.switch_seq, &title).await;
+            }
           }
         }
-      }
+        Some(Self::snapshot_from_locked(&locked))
+      } else {
+        None
+      };
 
-      Some(Self::snapshot_from_locked(&locked))
+      (snap_opt, became_authenticated, needs_cookie_check)
     };
 
     if let Some(snap) = snap_opt {
       self.emit_snapshot(app, &snap);
     }
+
+    (became_authenticated, needs_cookie_check)
   }
 }
 
@@ -4128,6 +5261,8 @@ mod tests {
       quota_percent: None,
       quota_detail: None,
       auth_state: AuthState::Unknown,
+      cookie_expires_at_ms: None,
+      cookie_session_only: false,
     }
   }
 
@@ -4146,14 +5281,16 @@ mod tests {
     let initial = AccountsStoreFile {
       version: crate::storage::STORE_VERSION,
       accounts: vec![
-        make_test_account(ProviderId::Muse, m1, "m1"),
-        make_test_account(ProviderId::Hark, h1, "h1"),
-        make_test_account(ProviderId::Muse, m2, "m2"),
-        make_test_account(ProviderId::Muse, m3, "m3"),
-        make_test_account(ProviderId::Hark, h2, "h2"),
+        make_test_account(ProviderId::muse(), m1, "m1"),
+        make_test_account(ProviderId::hark(), h1, "h1"),
+        make_test_account(ProviderId::muse(), m2, "m2"),
+        make_test_account(ProviderId::muse(), m3, "m3"),
+        make_test_account(ProviderId::hark(), h2, "h2"),
       ],
       last_committed: None,
       pending_cleanup: Vec::new(),
+      custom_providers: Vec::new(),
+      settings: AppSettings::default(),
     };
     save_store_atomic(&store_path, &initial).unwrap();
 
@@ -4183,5 +5320,33 @@ mod tests {
       .is_err());
 
     let _ = std::fs::remove_dir_all(&temp_dir);
+  }
+
+  #[test]
+  fn custom_provider_validation_and_navigation() {
+    assert!(normalize_custom_provider_input("", "https://chatgpt.com").is_err());
+    assert!(normalize_custom_provider_input("GPT", "http://chatgpt.com").is_err());
+    let (name, url) = normalize_custom_provider_input("  ChatGPT ", "chatgpt.com").unwrap();
+    assert_eq!(name, "ChatGPT");
+    assert_eq!(url, "https://chatgpt.com/");
+
+    let rec = CustomProviderRecord {
+      id: ProviderId::parse("custom-chatgpt1").unwrap(),
+      name,
+      entry_url: url,
+      created_at_ms: 1,
+    };
+    let spec = crate::providers::custom_provider_spec(&rec);
+    assert!(spec.info.is_custom);
+    let google_oauth = Url::parse("https://accounts.google.com/o/oauth2/v2/auth").unwrap();
+    assert_eq!(
+      classify_top_level_url(&spec, &google_oauth, false),
+      NavigationDecision::AllowHttps
+    );
+    let http_url = Url::parse("http://example.com/").unwrap();
+    assert_eq!(
+      classify_top_level_url(&spec, &http_url, false),
+      NavigationDecision::Deny
+    );
   }
 }

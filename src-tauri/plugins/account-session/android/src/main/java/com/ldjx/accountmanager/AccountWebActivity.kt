@@ -593,6 +593,7 @@ class AccountWebActivity : AppCompatActivity() {
             val b = targetHost.lowercase()
             if (a == b) return true
             for (allowed in allowedHosts) {
+                if (allowed == "*") continue
                 val clean = allowed.lowercase()
                 val aMatch = a == clean || a.endsWith(".$clean")
                 val bMatch = b == clean || b.endsWith(".$clean")
@@ -628,8 +629,30 @@ class AccountWebActivity : AppCompatActivity() {
                 try { typed = typed || sessionStorage.getItem('__maam_typed_identity__') || ''; } catch (_) {}
                 const host = (location.hostname || '').toLowerCase();
                 const path = (location.pathname || '').toLowerCase();
-                const isPrimary = host === 'muse.ai' || host.endsWith('.muse.ai') || host === 'app.hark.com' || host.endsWith('.hark.com');
-                const isExternalLoginHost = host === 'meta.com' || host.endsWith('.meta.com') || host === 'facebook.com' || host.endsWith('.facebook.com') || host === 'appleid.apple.com';
+                const isCustom = Boolean(window.__maamIsCustom);
+                const customHost = (window.__maamCustomHost || '').toLowerCase();
+                const matchesDomain = (h, d) => Boolean(d) && (h === d || h.endsWith('.' + d));
+                const baseDomain = (h) => {
+                  const parts = (h || '').split('.').filter(Boolean);
+                  return parts.length >= 2 ? parts.slice(-2).join('.') : h;
+                };
+                const customBase = isCustom ? baseDomain(customHost) : '';
+                const isPrimary = isCustom
+                  ? (matchesDomain(host, customHost) || matchesDomain(host, customBase))
+                  : (host === 'muse.ai' || host.endsWith('.muse.ai') || host === 'app.hark.com' || host.endsWith('.hark.com'));
+                const isExternalLoginHost =
+                  host === 'meta.com' || host.endsWith('.meta.com') ||
+                  host === 'facebook.com' || host.endsWith('.facebook.com') ||
+                  host === 'appleid.apple.com' ||
+                  (isCustom && (
+                    matchesDomain(host, 'auth.openai.com') ||
+                    matchesDomain(host, 'auth0.openai.com') ||
+                    matchesDomain(host, 'accounts.anthropic.com') ||
+                    matchesDomain(host, 'accounts.x.ai') ||
+                    matchesDomain(host, 'login.microsoftonline.com') ||
+                    matchesDomain(host, 'login.live.com') ||
+                    matchesDomain(host, 'accounts.google.com')
+                  ));
                 const makeLoggedOut = () => {
                   window.__maamQuota = null;
                   window.__maamQuotaDetail = null;
@@ -802,11 +825,11 @@ class AccountWebActivity : AppCompatActivity() {
                 if ((host === 'app.hark.com' || host.endsWith('.hark.com')) && typeof window.__maamRefreshHarkQuota === 'function') {
                   window.__maamRefreshHarkQuota(false);
                 }
-                let qText = '正在同步额度…';
+                let qText = isCustom ? '' : '正在同步额度…';
                 let qPct = -1;
                 let qDetailStr = '';
-                let dObj = window.__maamQuotaDetail || null;
-                if (!dObj) {
+                let dObj = isCustom ? null : (window.__maamQuotaDetail || null);
+                if (!isCustom && !dObj) {
                   try {
                     const cached = localStorage.getItem('__maam_cached_quota_detail_v2__');
                     if (cached) dObj = JSON.parse(cached);
@@ -875,12 +898,12 @@ class AccountWebActivity : AppCompatActivity() {
                     }
                   }
                 }
-                if (dObj && dObj.planLabel) {
+                if (!isCustom && dObj && dObj.planLabel) {
                   window.__maamQuotaDetail = dObj;
                   qText = dObj.planValue || dObj.planLabel;
                   if (typeof dObj.planUsedPercent === 'number') qPct = Math.max(0, 100 - dObj.planUsedPercent);
                   qDetailStr = JSON.stringify(dObj);
-                } else {
+                } else if (!isCustom) {
                   let qObj = window.__maamQuota || null;
                   if (!qObj) {
                     try {
@@ -1041,8 +1064,25 @@ class AccountWebActivity : AppCompatActivity() {
             )
         }
 
+        val refreshBtn = Button(this).apply {
+            text = "刷新"
+            textSize = 13f
+            isAllCaps = false
+            setOnClickListener {
+                val target = popupWebView ?: mainWebView
+                if (target != null) {
+                    if (target.url.isNullOrBlank()) {
+                        currentSpec?.let { target.loadUrl(it.entryUrl) }
+                    } else {
+                        target.reload()
+                    }
+                }
+            }
+        }
+
         topBar.addView(backBtn)
         topBar.addView(headerTitleView)
+        topBar.addView(refreshBtn)
 
         val contentFrame = FrameLayout(this).apply {
             layoutParams = LinearLayout.LayoutParams(
@@ -1595,8 +1635,16 @@ class AccountWebActivity : AppCompatActivity() {
         val quotaDetailJson: String,
     )
 
+    private fun buildProbeScript(spec: AndroidAccountSessionSpec): String {
+        val isCustom = spec.providerId != "muse" && spec.providerId != "hark"
+        if (!isCustom) return IDENTITY_PROBE_SCRIPT
+        val customHost = runCatching { Uri.parse(spec.entryUrl).host?.lowercase().orEmpty() }.getOrDefault("")
+        return "window.__maamIsCustom = true; window.__maamCustomHost = ${JSONObject.quote(customHost)};\n$IDENTITY_PROBE_SCRIPT"
+    }
+
     private fun startIdentityProbeLoop(spec: AndroidAccountSessionSpec) {
         stopIdentityProbeLoop()
+        val probeScript = buildProbeScript(spec)
         var consecutiveLoggedOut = 0
         var loggedOutReported = false
         val task = object : Runnable {
@@ -1606,7 +1654,7 @@ class AccountWebActivity : AppCompatActivity() {
                     return
                 }
                 val popup = popupWebView
-                popup?.evaluateJavascript(IDENTITY_PROBE_SCRIPT) { raw ->
+                popup?.evaluateJavascript(probeScript) { raw ->
                     if (identityProbeRunnable !== this || popup !== popupWebView ||
                         !AccountSessionCoordinator.isCurrent(spec.switchSeq, spec.viewInstanceId)) return@evaluateJavascript
                     parseProbeOutput(raw)?.let { parsed ->
@@ -1615,7 +1663,7 @@ class AccountWebActivity : AppCompatActivity() {
                         }
                     }
                 }
-                mainWebView?.evaluateJavascript(IDENTITY_PROBE_SCRIPT) { raw ->
+                mainWebView?.evaluateJavascript(probeScript) { raw ->
                     if (identityProbeRunnable !== this ||
                         !AccountSessionCoordinator.isCurrent(spec.switchSeq, spec.viewInstanceId)) return@evaluateJavascript
                     val parsed = parseProbeOutput(raw)
@@ -1829,7 +1877,7 @@ class AccountWebActivity : AppCompatActivity() {
             if (!allowed && isPopup) destroyPopupWebView()
             return !allowed
         }
-        if (AccountSessionCoordinator.isGoogleOAuthHost(uri)) {
+        if (AccountSessionCoordinator.isGoogleOAuthHost(uri) && !spec.allowedHosts.any { it == "*" }) {
             if (isPopup) destroyPopupWebView()
             AccountSessionCoordinator.emitExternalAuthUnavailable(
                 spec.switchSeq,
