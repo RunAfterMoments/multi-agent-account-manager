@@ -16,7 +16,16 @@ pub fn current_platform_name() -> &'static str {
   {
     "android"
   }
-  #[cfg(all(not(target_os = "macos"), not(windows), not(target_os = "android")))]
+  #[cfg(target_os = "ios")]
+  {
+    "ios"
+  }
+  #[cfg(all(
+    not(target_os = "macos"),
+    not(windows),
+    not(target_os = "android"),
+    not(target_os = "ios")
+  ))]
   {
     "linux"
   }
@@ -27,7 +36,293 @@ pub fn open_external_browser(url: &str) -> Result<(), String> {
   open::that_detached(url).map_err(|e| format!("打开系统浏览器失败: {e}"))
 }
 
-pub const SUPPORTS_ACCOUNT_PROXY: bool = cfg!(any(target_os = "macos", windows));
+pub const SUPPORTS_ACCOUNT_PROXY: bool = cfg!(any(target_os = "macos", windows, target_os = "ios"));
+
+pub fn parse_account_timezone(raw: &str) -> Result<Option<String>, String> {
+  let trimmed = raw.trim();
+  if trimmed.is_empty() {
+    return Ok(None);
+  }
+  let invalid = || {
+    "时区格式无效，请使用 IANA 时区名称（例如 America/New_York、Asia/Tokyo）".to_string()
+  };
+  if trimmed.len() > 64
+    || !trimmed
+      .bytes()
+      .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'+' | b'-' | b'/'))
+  {
+    return Err(invalid());
+  }
+  if trimmed.eq_ignore_ascii_case("UTC") || trimmed.eq_ignore_ascii_case("GMT") {
+    return Ok(Some(trimmed.to_ascii_uppercase()));
+  }
+  if !trimmed.contains('/')
+    || trimmed.starts_with('/')
+    || trimmed.ends_with('/')
+    || trimmed.contains("//")
+    || trimmed.contains("..")
+  {
+    return Err(invalid());
+  }
+  Ok(Some(trimmed.to_string()))
+}
+
+#[cfg_attr(all(not(desktop), not(mobile)), allow(dead_code))]
+pub fn build_timezone_override_init_js(timezone: &str) -> String {
+  let tz_json = serde_json::to_string(timezone).unwrap_or_else(|_| "\"UTC\"".to_string());
+  format!(
+    r#"(() => {{
+  const TZ = {tz_json};
+  if (!TZ || window.__maamTimezoneOverride === TZ) return;
+  const NativeDate = window.Date;
+  const NativeIntl = window.Intl;
+  if (!NativeDate || !NativeIntl || !NativeIntl.DateTimeFormat) return;
+  const NativeDTF = NativeIntl.DateTimeFormat;
+  try {{
+    new NativeDTF('en-US', {{ timeZone: TZ }});
+  }} catch (_) {{
+    return;
+  }}
+  window.__maamTimezoneOverride = TZ;
+
+  const nativeResolvedOptions = NativeDTF.prototype.resolvedOptions;
+  const nativeFormat = NativeDTF.prototype.format;
+  const nativeFormatToParts = NativeDTF.prototype.formatToParts;
+  const nativeValueOf = NativeDate.prototype.valueOf;
+  const nativeGetUTCFullYear = NativeDate.prototype.getUTCFullYear;
+  const nativeGetUTCMonth = NativeDate.prototype.getUTCMonth;
+  const nativeGetUTCDate = NativeDate.prototype.getUTCDate;
+  const nativeGetUTCDay = NativeDate.prototype.getUTCDay;
+  const nativeGetUTCHours = NativeDate.prototype.getUTCHours;
+  const nativeGetUTCMinutes = NativeDate.prototype.getUTCMinutes;
+  const nativeGetUTCSeconds = NativeDate.prototype.getUTCSeconds;
+  const nativeGetUTCMilliseconds = NativeDate.prototype.getUTCMilliseconds;
+  const nativeSetTime = NativeDate.prototype.setTime;
+  const nativeToLocaleString = NativeDate.prototype.toLocaleString;
+  const nativeToLocaleDateString = NativeDate.prototype.toLocaleDateString;
+  const nativeToLocaleTimeString = NativeDate.prototype.toLocaleTimeString;
+
+  const partsFmt = new NativeDTF('en-US', {{
+    timeZone: TZ,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hourCycle: 'h23'
+  }});
+
+  let longNameFmt = null;
+  try {{
+    longNameFmt = new NativeDTF('en-US', {{ timeZone: TZ, timeZoneName: 'long' }});
+  }} catch (_) {{}}
+
+  const getOffsetMinutes = (ms) => {{
+    if (!Number.isFinite(ms)) return 0;
+    const parts = nativeFormatToParts.call(partsFmt, new NativeDate(ms));
+    let y = 1970, mo = 1, d = 1, h = 0, mi = 0, s = 0;
+    for (let i = 0; i < parts.length; i++) {{
+      const p = parts[i];
+      if (p.type === 'year') y = Number(p.value);
+      else if (p.type === 'month') mo = Number(p.value);
+      else if (p.type === 'day') d = Number(p.value);
+      else if (p.type === 'hour') h = Number(p.value) % 24;
+      else if (p.type === 'minute') mi = Number(p.value);
+      else if (p.type === 'second') s = Number(p.value);
+    }}
+    const wallUtc = NativeDate.UTC(y, mo - 1, d, h, mi, s);
+    const realSec = Math.floor(ms / 1000) * 1000;
+    return Math.round((realSec - wallUtc) / 60000);
+  }};
+
+  const shiftedUtcDate = (dateObj) => {{
+    const ms = nativeValueOf.call(dateObj);
+    if (!Number.isFinite(ms)) return null;
+    const offsetMin = getOffsetMinutes(ms);
+    return new NativeDate(ms - offsetMin * 60000);
+  }};
+
+  const injectTzOpt = (options) => {{
+    if (!options || typeof options !== 'object') return {{ timeZone: TZ }};
+    if (options.timeZone === undefined) return Object.assign({{}}, options, {{ timeZone: TZ }});
+    return options;
+  }};
+
+  const WrappedDTF = function DateTimeFormat(locales, options) {{
+    const nextOpts = injectTzOpt(options);
+    if (new.target) {{
+      return new NativeDTF(locales, nextOpts);
+    }}
+    return NativeDTF(locales, nextOpts);
+  }};
+  WrappedDTF.prototype = NativeDTF.prototype;
+  WrappedDTF.supportedLocalesOf = NativeDTF.supportedLocalesOf.bind(NativeDTF);
+  try {{
+    Object.defineProperty(NativeIntl, 'DateTimeFormat', {{
+      configurable: true,
+      writable: true,
+      value: WrappedDTF
+    }});
+  }} catch (_) {{}}
+
+  const pad2 = (n) => (n < 10 ? '0' + n : String(n));
+  const pad4 = (n) => {{
+    const sign = n < 0 ? '-' : '';
+    const abs = String(Math.abs(n)).padStart(4, '0');
+    return sign + abs;
+  }};
+  const WEEKDAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+  const formatGmtSuffix = (ms) => {{
+    const offsetMin = getOffsetMinutes(ms);
+    const west = offsetMin;
+    const total = Math.abs(west);
+    const hh = pad2(Math.floor(total / 60));
+    const mm = pad2(total % 60);
+    const sign = west <= 0 ? '+' : '-';
+    let tzLabel = TZ;
+    if (longNameFmt) {{
+      try {{
+        const ps = nativeFormatToParts.call(longNameFmt, new NativeDate(ms));
+        const tn = ps.find((x) => x.type === 'timeZoneName');
+        if (tn && tn.value) tzLabel = tn.value;
+      }} catch (_) {{}}
+    }}
+    return 'GMT' + sign + hh + mm + ' (' + tzLabel + ')';
+  }};
+
+  const dp = NativeDate.prototype;
+  dp.getTimezoneOffset = function () {{
+    const ms = nativeValueOf.call(this);
+    if (!Number.isFinite(ms)) return NaN;
+    return getOffsetMinutes(ms);
+  }};
+  dp.getFullYear = function () {{ const s = shiftedUtcDate(this); return s ? nativeGetUTCFullYear.call(s) : NaN; }};
+  dp.getMonth = function () {{ const s = shiftedUtcDate(this); return s ? nativeGetUTCMonth.call(s) : NaN; }};
+  dp.getDate = function () {{ const s = shiftedUtcDate(this); return s ? nativeGetUTCDate.call(s) : NaN; }};
+  dp.getDay = function () {{ const s = shiftedUtcDate(this); return s ? nativeGetUTCDay.call(s) : NaN; }};
+  dp.getHours = function () {{ const s = shiftedUtcDate(this); return s ? nativeGetUTCHours.call(s) : NaN; }};
+  dp.getMinutes = function () {{ const s = shiftedUtcDate(this); return s ? nativeGetUTCMinutes.call(s) : NaN; }};
+  dp.getSeconds = function () {{ const s = shiftedUtcDate(this); return s ? nativeGetUTCSeconds.call(s) : NaN; }};
+  dp.getMilliseconds = function () {{ const s = shiftedUtcDate(this); return s ? nativeGetUTCMilliseconds.call(s) : NaN; }};
+
+  const applyWallUpdate = (targetDate, y, m, d, h, mi, sec, msPart) => {{
+    const guess = NativeDate.UTC(y, m, d, h, mi, sec, msPart);
+    if (!Number.isFinite(guess)) return nativeSetTime.call(targetDate, NaN);
+    const off1 = getOffsetMinutes(guess);
+    const utc1 = guess + off1 * 60000;
+    const off2 = getOffsetMinutes(utc1);
+    return nativeSetTime.call(targetDate, guess + off2 * 60000);
+  }};
+  dp.setFullYear = function (y, m, d) {{
+    const s = shiftedUtcDate(this);
+    if (!s) return NaN;
+    return applyWallUpdate(
+      this,
+      y,
+      m === undefined ? nativeGetUTCMonth.call(s) : m,
+      d === undefined ? nativeGetUTCDate.call(s) : d,
+      nativeGetUTCHours.call(s),
+      nativeGetUTCMinutes.call(s),
+      nativeGetUTCSeconds.call(s),
+      nativeGetUTCMilliseconds.call(s)
+    );
+  }};
+  dp.setMonth = function (m, d) {{
+    const s = shiftedUtcDate(this);
+    if (!s) return NaN;
+    return applyWallUpdate(
+      this,
+      nativeGetUTCFullYear.call(s),
+      m,
+      d === undefined ? nativeGetUTCDate.call(s) : d,
+      nativeGetUTCHours.call(s),
+      nativeGetUTCMinutes.call(s),
+      nativeGetUTCSeconds.call(s),
+      nativeGetUTCMilliseconds.call(s)
+    );
+  }};
+  dp.setDate = function (d) {{
+    const s = shiftedUtcDate(this);
+    if (!s) return NaN;
+    return applyWallUpdate(
+      this,
+      nativeGetUTCFullYear.call(s),
+      nativeGetUTCMonth.call(s),
+      d,
+      nativeGetUTCHours.call(s),
+      nativeGetUTCMinutes.call(s),
+      nativeGetUTCSeconds.call(s),
+      nativeGetUTCMilliseconds.call(s)
+    );
+  }};
+  dp.setHours = function (h, mi, sec, msPart) {{
+    const s = shiftedUtcDate(this);
+    if (!s) return NaN;
+    return applyWallUpdate(
+      this,
+      nativeGetUTCFullYear.call(s),
+      nativeGetUTCMonth.call(s),
+      nativeGetUTCDate.call(s),
+      h,
+      mi === undefined ? nativeGetUTCMinutes.call(s) : mi,
+      sec === undefined ? nativeGetUTCSeconds.call(s) : sec,
+      msPart === undefined ? nativeGetUTCMilliseconds.call(s) : msPart
+    );
+  }};
+  dp.setMinutes = function (mi, sec, msPart) {{
+    const s = shiftedUtcDate(this);
+    if (!s) return NaN;
+    return applyWallUpdate(
+      this,
+      nativeGetUTCFullYear.call(s),
+      nativeGetUTCMonth.call(s),
+      nativeGetUTCDate.call(s),
+      nativeGetUTCHours.call(s),
+      mi,
+      sec === undefined ? nativeGetUTCSeconds.call(s) : sec,
+      msPart === undefined ? nativeGetUTCMilliseconds.call(s) : msPart
+    );
+  }};
+
+  dp.toDateString = function () {{
+    const s = shiftedUtcDate(this);
+    if (!s) return 'Invalid Date';
+    return WEEKDAYS[nativeGetUTCDay.call(s)] + ' ' + MONTHS[nativeGetUTCMonth.call(s)] + ' ' + pad2(nativeGetUTCDate.call(s)) + ' ' + pad4(nativeGetUTCFullYear.call(s));
+  }};
+  dp.toTimeString = function () {{
+    const ms = nativeValueOf.call(this);
+    const s = shiftedUtcDate(this);
+    if (!s || !Number.isFinite(ms)) return 'Invalid Date';
+    return pad2(nativeGetUTCHours.call(s)) + ':' + pad2(nativeGetUTCMinutes.call(s)) + ':' + pad2(nativeGetUTCSeconds.call(s)) + ' ' + formatGmtSuffix(ms);
+  }};
+  dp.toString = function () {{
+    const s = shiftedUtcDate(this);
+    if (!s) return 'Invalid Date';
+    return dp.toDateString.call(this) + ' ' + dp.toTimeString.call(this);
+  }};
+  dp.toLocaleString = function (locales, options) {{
+    return nativeToLocaleString.call(this, locales, injectTzOpt(options));
+  }};
+  dp.toLocaleDateString = function (locales, options) {{
+    return nativeToLocaleDateString.call(this, locales, injectTzOpt(options));
+  }};
+  dp.toLocaleTimeString = function (locales, options) {{
+    return nativeToLocaleTimeString.call(this, locales, injectTzOpt(options));
+  }};
+
+  const _origResolved = nativeResolvedOptions;
+  if (typeof _origResolved === 'function') {{
+    NativeDTF.prototype.resolvedOptions = function () {{
+      return _origResolved.call(this);
+    }};
+  }}
+  void nativeFormat;
+}})();"#
+  )
+}
 
 pub fn parse_account_proxy(raw: &str) -> Result<Option<url::Url>, String> {
   let raw = raw.trim();
@@ -664,6 +959,66 @@ pub fn verify_desktop_profile_binding(
   {
     let _ = (webview, expected_uuid, expected_dir);
     async move { Ok(()) }
+  }
+}
+
+#[cfg(windows)]
+pub async fn configure_windows_timezone(
+  webview: &tauri::Webview,
+  timezone: Option<&str>,
+) -> Result<(), String> {
+  let Some(tz) = timezone.map(str::trim).filter(|s| !s.is_empty()) else {
+    return Ok(());
+  };
+  let params_json = serde_json::json!({ "timezoneId": tz }).to_string();
+  let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+  let tx_slot = std::sync::Arc::new(std::sync::Mutex::new(Some(tx)));
+
+  webview
+    .with_webview(move |platform_wv| unsafe {
+      use webview2_com::CallDevToolsProtocolMethodCompletedHandler;
+      use windows::core::{HSTRING, PCWSTR};
+
+      let core = match platform_wv.controller().CoreWebView2() {
+        Ok(core) => core,
+        Err(e) => {
+          if let Some(sender) = tx_slot.lock().unwrap().take() {
+            let _ = sender.send(Err(format!("获取 CoreWebView2 失败: {e}")));
+          }
+          return;
+        }
+      };
+
+      let method_w = HSTRING::from("Emulation.setTimezoneOverride");
+      let params_w = HSTRING::from(params_json);
+      let tx_cb = std::sync::Arc::clone(&tx_slot);
+      let handler =
+        CallDevToolsProtocolMethodCompletedHandler::create(Box::new(move |err_code, _res_json| {
+          let outcome = if err_code.is_ok() {
+            Ok(())
+          } else {
+            Err(format!("设置 WebView2 时区失败: {err_code:?}"))
+          };
+          if let Some(sender) = tx_cb.lock().unwrap().take() {
+            let _ = sender.send(outcome);
+          }
+          Ok(())
+        }));
+
+      let method_ptr = PCWSTR(method_w.as_ptr());
+      let params_ptr = PCWSTR(params_w.as_ptr());
+      if let Err(e) = core.CallDevToolsProtocolMethod(method_ptr, params_ptr, &handler) {
+        if let Some(sender) = tx_slot.lock().unwrap().take() {
+          let _ = sender.send(Err(format!("调用 WebView2 时区接口失败: {e}")));
+        }
+      }
+    })
+    .map_err(|e| format!("访问 Windows WebView2 失败: {e}"))?;
+
+  match tokio::time::timeout(std::time::Duration::from_secs(3), rx).await {
+    Ok(Ok(res)) => res,
+    Ok(Err(_)) => Err("Windows WebView2 时区设置回调中断".to_string()),
+    Err(_) => Err("Windows WebView2 时区设置超时".to_string()),
   }
 }
 
@@ -1532,7 +1887,7 @@ pub fn imported_cookie_to_tauri(
   Ok(cookie)
 }
 
-#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+#[cfg_attr(not(mobile), allow(dead_code))]
 pub fn imported_cookie_to_set_cookie_header(spec: &ImportedCookieSpec) -> String {
   let mut header = format!("{}={}", spec.name, spec.value);
   if !spec.name.starts_with("__Host-") {
@@ -1795,8 +2150,8 @@ pub async fn test_account_proxy(_target_url: &str, _raw_proxy: &str) -> Result<P
   Err("当前平台不支持代理测试".to_string())
 }
 
-#[cfg(target_os = "android")]
-pub use tauri_plugin_account_session as android;
+#[cfg(mobile)]
+pub use tauri_plugin_account_session as mobile;
 
 #[cfg(test)]
 mod tests {

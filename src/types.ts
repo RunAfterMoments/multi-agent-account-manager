@@ -52,6 +52,7 @@ export interface AccountRecord {
   createdAtMs: number;
   autoAlias: boolean;
   proxyUrl: string | null;
+  timezone: string | null;
   avatarUrl: string | null;
   quotaText: string | null;
   quotaPercent: number | null;

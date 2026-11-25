@@ -24,6 +24,7 @@ const APP_COMMANDS: &[&str] = &[
   "delete_group_chat",
   "send_group_message",
   "retry_group_message",
+  "sync_group_message_reply",
   "clear_group_messages",
   "start_group_new_topic",
   "update_group_knowledge",

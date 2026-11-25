@@ -99,6 +99,8 @@ pub struct AccountRecord {
   #[serde(default)]
   pub proxy_url: Option<String>,
   #[serde(default)]
+  pub timezone: Option<String>,
+  #[serde(default)]
   pub avatar_url: Option<String>,
   #[serde(default)]
   pub quota_text: Option<String>,
@@ -430,6 +432,12 @@ fn migrate_from_value(root: Value) -> Result<(AccountsStoreFile, bool), String> 
         .and_then(|v| v.as_str())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
+      let timezone = item_obj
+        .get("timezone")
+        .or_else(|| item_obj.get("timeZone"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
       let avatar_url = item_obj
         .get("avatarUrl")
         .or_else(|| item_obj.get("avatar_url"))
@@ -488,6 +496,7 @@ fn migrate_from_value(root: Value) -> Result<(AccountsStoreFile, bool), String> 
         created_at_ms,
         auto_alias,
         proxy_url,
+        timezone,
         avatar_url,
         quota_text,
         quota_percent,

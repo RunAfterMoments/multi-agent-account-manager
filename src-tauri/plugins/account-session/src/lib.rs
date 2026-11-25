@@ -1,19 +1,22 @@
-#[cfg(target_os = "android")]
+#[cfg(mobile)]
 use serde::{Deserialize, Serialize};
-#[cfg(target_os = "android")]
+#[cfg(mobile)]
 use tauri::{
   ipc::Channel,
   plugin::{Builder, PluginHandle, TauriPlugin},
   AppHandle, Manager, Runtime,
 };
 
-#[cfg(target_os = "android")]
-pub struct AndroidSessionBridge<R: Runtime>(pub PluginHandle<R>);
+#[cfg(target_os = "ios")]
+tauri::ios_plugin_binding!(init_plugin_account_session);
 
-#[cfg(target_os = "android")]
+#[cfg(mobile)]
+pub struct MobileSessionBridge<R: Runtime>(pub PluginHandle<R>);
+
+#[cfg(mobile)]
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct OpenAndroidAccountPayload {
+pub struct OpenMobileAccountPayload {
   pub provider_id: String,
   pub provider_name: String,
   pub uuid: String,
@@ -21,23 +24,26 @@ pub struct OpenAndroidAccountPayload {
   pub auto_alias: bool,
   pub entry_url: String,
   pub allowed_hosts: Vec<String>,
+  pub proxy_url: Option<String>,
+  pub timezone: Option<String>,
+  pub timezone_init_script: Option<String>,
   pub switch_seq: u64,
   pub view_instance_id: u64,
   pub is_cold_start: bool,
 }
 
-#[cfg(target_os = "android")]
+#[cfg(mobile)]
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct AndroidCapabilitiesResponse {
+pub struct MobileCapabilitiesResponse {
   pub multi_profile_supported: bool,
   pub profile_names: Vec<String>,
 }
 
-#[cfg(target_os = "android")]
+#[cfg(mobile)]
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
-pub enum AndroidSessionEvent {
+pub enum MobileSessionEvent {
   #[serde(rename_all = "camelCase")]
   PageCommitVisible {
     provider_id: String,
@@ -102,10 +108,10 @@ pub enum AndroidSessionEvent {
   },
 }
 
-#[cfg(target_os = "android")]
+#[cfg(mobile)]
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct AndroidFetchTextResponse {
+pub struct MobileFetchTextResponse {
   pub status: u16,
   pub body: String,
 }
@@ -118,24 +124,27 @@ pub struct AndroidInstallApkResponse {
   pub message: String,
 }
 
-#[cfg(target_os = "android")]
+#[cfg(mobile)]
 pub fn init<R: Runtime>() -> TauriPlugin<R> {
   Builder::new("account-session")
     .setup(|app, api| {
+      #[cfg(target_os = "android")]
       let handle =
         api.register_android_plugin("com.ldjx.accountmanager", "AccountSessionPlugin")?;
-      app.manage(AndroidSessionBridge(handle));
+      #[cfg(target_os = "ios")]
+      let handle = api.register_ios_plugin(init_plugin_account_session)?;
+      app.manage(MobileSessionBridge(handle));
       Ok(())
     })
     .build()
 }
 
-#[cfg(target_os = "android")]
+#[cfg(mobile)]
 pub async fn subscribe_events(
   app: &AppHandle,
   channel: Channel<serde_json::Value>,
 ) -> Result<(), String> {
-  let bridge = app.state::<AndroidSessionBridge<tauri::Wry>>();
+  let bridge = app.state::<MobileSessionBridge<tauri::Wry>>();
   bridge
     .0
     .run_mobile_plugin_async::<serde_json::Value>(
@@ -147,9 +156,9 @@ pub async fn subscribe_events(
     .map_err(|e| e.to_string())
 }
 
-#[cfg(target_os = "android")]
-pub async fn check_capabilities(app: &AppHandle) -> Result<AndroidCapabilitiesResponse, String> {
-  let bridge = app.state::<AndroidSessionBridge<tauri::Wry>>();
+#[cfg(mobile)]
+pub async fn check_capabilities(app: &AppHandle) -> Result<MobileCapabilitiesResponse, String> {
+  let bridge = app.state::<MobileSessionBridge<tauri::Wry>>();
   bridge
     .0
     .run_mobile_plugin_async("checkCapabilities", serde_json::json!({}))
@@ -157,12 +166,12 @@ pub async fn check_capabilities(app: &AppHandle) -> Result<AndroidCapabilitiesRe
     .map_err(|e| e.to_string())
 }
 
-#[cfg(target_os = "android")]
+#[cfg(mobile)]
 pub async fn open_account_session(
   app: &AppHandle,
-  payload: OpenAndroidAccountPayload,
+  payload: OpenMobileAccountPayload,
 ) -> Result<(), String> {
-  let bridge = app.state::<AndroidSessionBridge<tauri::Wry>>();
+  let bridge = app.state::<MobileSessionBridge<tauri::Wry>>();
   bridge
     .0
     .run_mobile_plugin_async::<serde_json::Value>("openAccountSession", payload)
@@ -171,13 +180,13 @@ pub async fn open_account_session(
     .map_err(|e| e.to_string())
 }
 
-#[cfg(target_os = "android")]
+#[cfg(mobile)]
 pub async fn update_account_title(
   app: &AppHandle,
   switch_seq: u64,
   title: &str,
 ) -> Result<(), String> {
-  let bridge = app.state::<AndroidSessionBridge<tauri::Wry>>();
+  let bridge = app.state::<MobileSessionBridge<tauri::Wry>>();
   bridge
     .0
     .run_mobile_plugin_async::<serde_json::Value>(
@@ -189,9 +198,9 @@ pub async fn update_account_title(
     .map_err(|e| e.to_string())
 }
 
-#[cfg(target_os = "android")]
+#[cfg(mobile)]
 pub async fn close_active_session(app: &AppHandle, switch_seq: u64) -> Result<(), String> {
-  let bridge = app.state::<AndroidSessionBridge<tauri::Wry>>();
+  let bridge = app.state::<MobileSessionBridge<tauri::Wry>>();
   bridge
     .0
     .run_mobile_plugin_async::<serde_json::Value>(
@@ -203,9 +212,9 @@ pub async fn close_active_session(app: &AppHandle, switch_seq: u64) -> Result<()
     .map_err(|e| e.to_string())
 }
 
-#[cfg(target_os = "android")]
+#[cfg(mobile)]
 pub async fn delete_profile(app: &AppHandle, uuid: &str) -> Result<(), String> {
-  let bridge = app.state::<AndroidSessionBridge<tauri::Wry>>();
+  let bridge = app.state::<MobileSessionBridge<tauri::Wry>>();
   bridge
     .0
     .run_mobile_plugin_async::<serde_json::Value>(
@@ -217,9 +226,9 @@ pub async fn delete_profile(app: &AppHandle, uuid: &str) -> Result<(), String> {
     .map_err(|e| e.to_string())
 }
 
-#[cfg(target_os = "android")]
+#[cfg(mobile)]
 pub async fn copy_profile_cookie(app: &AppHandle, uuid: &str, url: &str) -> Result<(), String> {
-  let bridge = app.state::<AndroidSessionBridge<tauri::Wry>>();
+  let bridge = app.state::<MobileSessionBridge<tauri::Wry>>();
   bridge
     .0
     .run_mobile_plugin_async::<serde_json::Value>(
@@ -231,14 +240,14 @@ pub async fn copy_profile_cookie(app: &AppHandle, uuid: &str, url: &str) -> Resu
     .map_err(|e| e.to_string())
 }
 
-#[cfg(target_os = "android")]
+#[cfg(mobile)]
 pub async fn import_profile_cookies(
   app: &AppHandle,
   uuid: &str,
   url: &str,
   cookies: Vec<String>,
 ) -> Result<(), String> {
-  let bridge = app.state::<AndroidSessionBridge<tauri::Wry>>();
+  let bridge = app.state::<MobileSessionBridge<tauri::Wry>>();
   bridge
     .0
     .run_mobile_plugin_async::<serde_json::Value>(
@@ -250,9 +259,9 @@ pub async fn import_profile_cookies(
     .map_err(|e| e.to_string())
 }
 
-#[cfg(target_os = "android")]
+#[cfg(mobile)]
 pub async fn open_external_url(app: &AppHandle, url: &str) -> Result<(), String> {
-  let bridge = app.state::<AndroidSessionBridge<tauri::Wry>>();
+  let bridge = app.state::<MobileSessionBridge<tauri::Wry>>();
   bridge
     .0
     .run_mobile_plugin_async::<serde_json::Value>(
@@ -264,14 +273,14 @@ pub async fn open_external_url(app: &AppHandle, url: &str) -> Result<(), String>
     .map_err(|e| e.to_string())
 }
 
-#[cfg(target_os = "android")]
+#[cfg(mobile)]
 pub async fn fetch_text(
   app: &AppHandle,
   url: &str,
   user_agent: &str,
   accept: Option<&str>,
-) -> Result<AndroidFetchTextResponse, String> {
-  let bridge = app.state::<AndroidSessionBridge<tauri::Wry>>();
+) -> Result<MobileFetchTextResponse, String> {
+  let bridge = app.state::<MobileSessionBridge<tauri::Wry>>();
   bridge
     .0
     .run_mobile_plugin_async(
@@ -294,7 +303,7 @@ pub async fn download_and_install_apk(
   filename: &str,
   user_agent: &str,
 ) -> Result<AndroidInstallApkResponse, String> {
-  let bridge = app.state::<AndroidSessionBridge<tauri::Wry>>();
+  let bridge = app.state::<MobileSessionBridge<tauri::Wry>>();
   bridge
     .0
     .run_mobile_plugin_async(

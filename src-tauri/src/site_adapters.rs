@@ -574,7 +574,7 @@ pub const NET_HOOK_INIT_JS: &str = r#"(() => {
                     const parsed = JSON.parse(ev.data);
                     const piece = pickTextFromJson(parsed);
                     if (piece.startsWith('\x00REPLACE:')) state.wsText = piece.slice(9);
-                    else if (piece && piece.length <= 4000) state.wsText += piece;
+                    else if (piece && piece.length <= 32000) state.wsText += piece;
                   } catch (_) {}
                 }
               });

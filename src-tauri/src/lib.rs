@@ -42,6 +42,7 @@ async fn add_account(
   provider_id: String,
   alias: String,
   proxy_url: Option<String>,
+  timezone: Option<String>,
   raw_cookies: Option<String>,
 ) -> Result<ManagerSnapshot, String> {
   mgr
@@ -50,6 +51,7 @@ async fn add_account(
       &provider_id,
       &alias,
       proxy_url.as_deref(),
+      timezone.as_deref(),
       raw_cookies.as_deref(),
     )
     .await
@@ -63,9 +65,17 @@ async fn rename_account(
   uuid: String,
   alias: String,
   proxy_url: Option<String>,
+  timezone: Option<String>,
 ) -> Result<ManagerSnapshot, String> {
   mgr
-    .update_account_settings(&app, &provider_id, &uuid, &alias, proxy_url.as_deref())
+    .update_account_settings(
+      &app,
+      &provider_id,
+      &uuid,
+      &alias,
+      proxy_url.as_deref(),
+      timezone.as_deref(),
+    )
     .await
 }
 
@@ -332,6 +342,20 @@ async fn retry_group_message(
 }
 
 #[tauri::command]
+async fn sync_group_message_reply(
+  app: AppHandle,
+  mgr: State<'_, Arc<SessionManager>>,
+  webview: tauri::Webview,
+  group_id: String,
+  msg_id: String,
+) -> Result<ManagerSnapshot, String> {
+  if webview.label() != "manager" {
+    return Err("仅账号管理页可以同步群聊回复".to_string());
+  }
+  mgr.sync_group_message_reply(&app, group_id, msg_id).await
+}
+
+#[tauri::command]
 async fn clear_group_messages(
   mgr: State<'_, Arc<SessionManager>>,
   webview: tauri::Webview,
@@ -509,8 +533,8 @@ pub fn run() {
   #[cfg(desktop)]
   let builder = builder.plugin(tauri_plugin_global_shortcut::Builder::new().build());
 
-  #[cfg(target_os = "android")]
-  let builder = builder.plugin(platform::android::init());
+  #[cfg(mobile)]
+  let builder = builder.plugin(platform::mobile::init());
 
   builder
     .setup(|app| {
@@ -655,6 +679,7 @@ pub fn run() {
       delete_group_chat,
       send_group_message,
       retry_group_message,
+      sync_group_message_reply,
       clear_group_messages,
       start_group_new_topic,
       update_group_knowledge,

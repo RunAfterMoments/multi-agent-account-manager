@@ -14,6 +14,8 @@ data class AndroidAccountSessionSpec(
     val autoAlias: Boolean,
     val entryUrl: String,
     val allowedHosts: List<String>,
+    val timezone: String? = null,
+    val timezoneInitScript: String? = null,
     val switchSeq: Long,
     val viewInstanceId: Long,
     val isColdStart: Boolean,

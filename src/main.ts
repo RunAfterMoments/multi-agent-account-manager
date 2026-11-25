@@ -27,6 +27,7 @@ import type {
 type AccountDraft = {
   draft: string;
   proxyDraft: string;
+  timezoneDraft: string;
   cookieDraft?: string;
   cookieImporting?: boolean;
   error?: string;
@@ -35,6 +36,17 @@ type AccountDraft = {
   proxyTestResult?: ProxyTestResult | null;
   confirmClear?: boolean;
 };
+
+const TIMEZONE_PRESETS: Array<{ label: string; value: string }> = [
+  { label: "跟随系统", value: "" },
+  { label: "纽约", value: "America/New_York" },
+  { label: "洛杉矶", value: "America/Los_Angeles" },
+  { label: "伦敦", value: "Europe/London" },
+  { label: "东京", value: "Asia/Tokyo" },
+  { label: "新加坡", value: "Asia/Singapore" },
+  { label: "上海", value: "Asia/Shanghai" },
+  { label: "UTC", value: "UTC" },
+];
 
 type ModalMode =
   | { kind: "none" }
@@ -186,6 +198,7 @@ const ICON_BOLT = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" s
 const ICON_SORT = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M6 12h12"/><path d="M10 18h4"/></svg>`;
 const ICON_GROUP = `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/><path d="M8 10h.01"/><path d="M12 10h.01"/><path d="M16 10h.01"/></svg>`;
 const ICON_PIN = `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m19 21-7-4-7 4V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v16z"/><line x1="12" x2="12" y1="7" y2="13"/><line x1="15" x2="9" y1="10" y2="10"/></svg>`;
+const syncingMsgIds = new Set<string>();
 
 const THEME_STORAGE_KEY = "maam_theme_mode";
 const systemDarkQuery = window.matchMedia("(prefers-color-scheme: dark)");
@@ -253,6 +266,14 @@ let optimisticSwitching: AccountKey | null = null;
 let busy = false;
 let viewMode: "provider" | "groups" = "provider";
 let lastGroupListScroll = 0;
+let shouldAnimateModal = false;
+let modalOverlayScrollTop = 0;
+let groupMemberPickerScrollTop = 0;
+let modalCardScrollTop = 0;
+
+function modalOverlayClass(): string {
+  return shouldAnimateModal ? "inline-modal animate-in" : "inline-modal";
+}
 const groupDrafts: Record<string, string> = {};
 const groupTargets: Record<string, AccountKey[]> = {};
 const groupAutoChannels: Record<string, string[]> = {};
@@ -315,9 +336,13 @@ function sameAccountKey(a: AccountKey, b: AccountKey): boolean {
   return a.providerId === b.providerId && a.uuid === b.uuid;
 }
 
+function isMobilePlatform(platform: ManagerSnapshot["platform"] | undefined): boolean {
+  return platform === "android" || platform === "ios";
+}
+
 function syncViewModeFromSnapshot(state: ManagerSnapshot | null): void {
   if (!state) return;
-  if (state.platform === "android") {
+  if (isMobilePlatform(state.platform)) {
     viewMode = "provider";
     return;
   }
@@ -887,6 +912,18 @@ function saveScrollPosition(): void {
     groupScrolledToBottom = msgEl.scrollHeight - msgEl.scrollTop - msgEl.clientHeight <= 64;
     groupScrollOffsets[snapshot.activeGroupId] = msgEl.scrollTop;
   }
+  const modalOverlayEl = document.querySelector<HTMLElement>(".inline-modal");
+  if (modalOverlayEl) {
+    modalOverlayScrollTop = modalOverlayEl.scrollTop;
+  }
+  const pickerEl = document.querySelector<HTMLElement>(".group-member-picker");
+  if (pickerEl) {
+    groupMemberPickerScrollTop = pickerEl.scrollTop;
+  }
+  const modalCardEl = document.querySelector<HTMLElement>(".modal-card");
+  if (modalCardEl) {
+    modalCardScrollTop = modalCardEl.scrollTop;
+  }
 }
 
 function restoreScrollPosition(): void {
@@ -907,6 +944,20 @@ function restoreScrollPosition(): void {
       msgEl.scrollTop = groupScrollOffsets[snapshot.activeGroupId];
     } else {
       msgEl.scrollTop = msgEl.scrollHeight;
+    }
+  }
+  if (modal.kind !== "none") {
+    const modalOverlayEl = document.querySelector<HTMLElement>(".inline-modal");
+    if (modalOverlayEl) {
+      modalOverlayEl.scrollTop = modalOverlayScrollTop;
+    }
+    const pickerEl = document.querySelector<HTMLElement>(".group-member-picker");
+    if (pickerEl) {
+      pickerEl.scrollTop = groupMemberPickerScrollTop;
+    }
+    const modalCardEl = document.querySelector<HTMLElement>(".modal-card");
+    if (modalCardEl) {
+      modalCardEl.scrollTop = modalCardScrollTop;
     }
   }
 }
@@ -1025,8 +1076,15 @@ async function runDownloadAndInstall(): Promise<void> {
 }
 
 async function setModal(next: ModalMode): Promise<void> {
-  const wasActive = modal.kind !== "none";
+  const prevKind = modal.kind;
+  const wasActive = prevKind !== "none";
   const isActive = next.kind !== "none";
+  if (next.kind !== prevKind) {
+    shouldAnimateModal = isActive;
+    modalOverlayScrollTop = 0;
+    groupMemberPickerScrollTop = 0;
+    modalCardScrollTop = 0;
+  }
   modal = next;
   if (wasActive !== isActive) {
     try {
@@ -1197,7 +1255,9 @@ function renderUpdateModal(): string {
           ? "更新中..."
           : updateState.outcomeStatus === "needs_permission"
             ? "已授权，继续安装"
-            : "立即下载并更新"
+            : snapshot?.platform === "ios"
+              ? "前往下载 IPA"
+              : "立即下载并更新"
       }</button>`
     : `<button id="update-recheck-btn" class="btn primary" type="button" ${disablePrimary ? "disabled" : ""}>${
         updateState.checking ? "检查中..." : "重新检查"
@@ -1208,7 +1268,7 @@ function renderUpdateModal(): string {
     : "";
 
   return `
-    <div class="inline-modal" role="dialog" aria-modal="true">
+    <div class="${modalOverlayClass()}" role="dialog" aria-modal="true">
       <div class="modal-card">
         <div class="modal-title">${title}</div>
         ${versionRow}
@@ -1224,7 +1284,22 @@ function renderUpdateModal(): string {
 }
 
 function supportsAccountProxy(platform: ManagerSnapshot["platform"]): boolean {
-  return platform === "macos" || platform === "windows";
+  return platform === "macos" || platform === "windows" || platform === "ios";
+}
+
+function formatGroupPickerHint(
+  eligibleCount: number,
+  ineligibleCount: number,
+  selectedCount: number,
+  hasPickerContent: boolean
+): string {
+  if (eligibleCount === 0 && !hasPickerContent) {
+    return "暂无可用成员，请先登录网页账号或添加 API / CLI 成员。";
+  }
+  if (ineligibleCount > 0) {
+    return `已自动过滤 ${ineligibleCount} 个未登录或登录失效网页账号（已选 ${selectedCount}/30）。`;
+  }
+  return `支持网页账号与 API / CLI 混合协同（已选 ${selectedCount}/30）。`;
 }
 
 function renderModal(state: ManagerSnapshot, provider: ProviderInfo): string {
@@ -1249,7 +1324,7 @@ function renderModal(state: ManagerSnapshot, provider: ProviderInfo): string {
           ? "未激活"
           : "已禁用";
     return `
-      <div class="inline-modal" role="dialog" aria-modal="true">
+      <div class="${modalOverlayClass()}" role="dialog" aria-modal="true">
         <div class="modal-card">
           <div class="modal-title">桌面端设置</div>
           <label class="setting-row" for="modal-tray-checkbox">
@@ -1293,10 +1368,10 @@ function renderModal(state: ManagerSnapshot, provider: ProviderInfo): string {
     const supportsProxy = supportsAccountProxy(platform);
     const title = creating
       ? `新增 ${escapeHtml(provider.shortName)} 账号`
-      : supportsProxy ? "账号设置" : "修改备注名称";
+      : "账号设置";
     const aliasPlaceholder = creating
       ? "备注名称（留空则自动获取登录邮箱）"
-      : supportsProxy ? "备注名称（留空保留原备注）" : "输入新的备注名称";
+      : "备注名称（留空保留原备注）";
     const testRes = modal.proxyTestResult;
     const renameAcc = modal.kind === "rename" ? modal.account : null;
     const currentAcc = renameAcc
@@ -1306,7 +1381,7 @@ function renderModal(state: ManagerSnapshot, provider: ProviderInfo): string {
       : null;
     const cookieInfo = currentAcc ? formatCookieExpiry(currentAcc) : null;
     return `
-      <div class="inline-modal" role="dialog" aria-modal="true">
+      <div class="${modalOverlayClass()}" role="dialog" aria-modal="true">
         <div class="modal-card">
           <div class="modal-title">${title}</div>
           <input id="modal-alias-input" class="modal-input" maxlength="60" placeholder="${aliasPlaceholder}" aria-label="备注名称" value="${escapeHtml(modal.draft)}" ${saving ? "disabled" : ""} />
@@ -1314,11 +1389,20 @@ function renderModal(state: ManagerSnapshot, provider: ProviderInfo): string {
             <label class="modal-desc" for="modal-proxy-input">HTTP CONNECT 代理（留空使用系统网络）</label>
             <div class="proxy-input-row">
               <input id="modal-proxy-input" class="modal-input" maxlength="512" placeholder="http://127.0.0.1:7890" value="${escapeHtml(modal.proxyDraft)}" autocomplete="off" spellcheck="false" ${saving ? "disabled" : ""} />
-              <button id="proxy-test-btn" class="btn mini-test-btn" type="button" ${saving || proxyTesting ? "disabled" : ""}>${proxyTesting ? "测速中..." : "测试连接"}</button>
+              ${!isMobilePlatform(platform) ? `<button id="proxy-test-btn" class="btn mini-test-btn" type="button" ${saving || proxyTesting ? "disabled" : ""}>${proxyTesting ? "测速中..." : "测试连接"}</button>` : ""}
             </div>
             ${testRes ? `<div id="proxy-test-result" class="proxy-test-box ${testRes.ok ? "ok" : "err"}">${escapeHtml(testRes.message)}</div>` : ""}
             <div class="modal-hint">仅作用于内嵌页面；外部浏览器登录与更新检查不走此代理。</div>
           ` : ""}
+          <label class="modal-desc" for="modal-timezone-input">自定义时区（留空跟随系统）</label>
+          <input id="modal-timezone-input" class="modal-input" maxlength="64" placeholder="IANA 时区（例如 America/New_York、Asia/Tokyo）" value="${escapeHtml(modal.timezoneDraft)}" autocomplete="off" spellcheck="false" ${saving ? "disabled" : ""} />
+          <div class="preset-chips">
+            ${TIMEZONE_PRESETS.map(
+              (p) =>
+                `<button class="preset-chip" data-timezone-preset="${escapeHtml(p.value)}" type="button" ${saving ? "disabled" : ""}>${escapeHtml(p.label)}</button>`
+            ).join("")}
+          </div>
+          <div class="modal-hint">${platform === "windows" ? "通过 WebView2 原生接口按账号独立生效，留空则使用系统时区。" : "文档加载前注入该账号独立页面，支持夏令时，留空则使用系统时区。"}</div>
           ${cookieInfo ? `<div class="cookie-detail-box ${cookieInfo.tone}" title="${escapeHtml(cookieInfo.tooltip)}"><span class="cookie-expiry-dot"></span><span>${escapeHtml(cookieInfo.detailText)}</span></div>` : ""}
           <div class="cookie-import-section">
             <label class="modal-desc" for="modal-cookie-import-input">${creating ? "导入 Cookie（可选，支持从 Chrome 等浏览器登录后粘贴）" : "导入 Cookie（支持从 Chrome 等浏览器登录后粘贴）"}</label>
@@ -1448,15 +1532,15 @@ function renderModal(state: ManagerSnapshot, provider: ProviderInfo): string {
       .join("");
 
     const pickerContent = `${providerGroupsHtml}${externalGroupHtml}`;
-    const hintText =
-      eligibleCount === 0 && !pickerContent
-        ? "暂无可用成员，请先登录网页账号或添加 API / CLI 成员。"
-        : ineligibleCount > 0
-          ? `已自动过滤 ${ineligibleCount} 个未登录或登录失效网页账号（已选 ${gModal.selectedMembers.length}/30）。`
-          : `支持网页账号与 API / CLI 混合协同（已选 ${gModal.selectedMembers.length}/30）。`;
+    const hintText = formatGroupPickerHint(
+      eligibleCount,
+      ineligibleCount,
+      gModal.selectedMembers.length,
+      Boolean(pickerContent)
+    );
 
     return `
-      <div class="inline-modal" role="dialog" aria-modal="true">
+      <div class="${modalOverlayClass()}" role="dialog" aria-modal="true">
         <div class="modal-card group-modal-card">
           <div class="modal-title">${editing ? `编辑「${escapeHtml(gModal.group!.name)}」` : "创建群聊"}</div>
           <input id="modal-group-name-input" class="modal-input" maxlength="32" placeholder="群聊名称（如：产品头脑风暴）" aria-label="群聊名称" value="${escapeHtml(gModal.nameDraft)}" ${saving ? "disabled" : ""} />
@@ -1467,7 +1551,7 @@ function renderModal(state: ManagerSnapshot, provider: ProviderInfo): string {
           <div class="group-member-picker">
             ${pickerContent || `<div class="group-picker-empty">当前没有可用成员，可登录网页或点击右上角添加 API / CLI</div>`}
           </div>
-          <div class="modal-hint">${escapeHtml(hintText)}</div>
+          <div id="modal-group-hint" class="modal-hint">${escapeHtml(hintText)}</div>
           ${gModal.error ? `<div id="modal-error-box" class="update-error-box" role="alert">${escapeHtml(gModal.error)}</div>` : ""}
           <div class="modal-footer">
             <button id="modal-cancel-btn" class="btn" type="button" ${saving ? "disabled" : ""}>取消</button>
@@ -1629,7 +1713,7 @@ function renderModal(state: ManagerSnapshot, provider: ProviderInfo): string {
         : saving ? "保存中..." : "保存配置";
 
     return `
-      <div class="inline-modal" role="dialog" aria-modal="true">
+      <div class="${modalOverlayClass()}" role="dialog" aria-modal="true">
         <div class="modal-card group-knowledge-modal-card">
           <div class="modal-title">共享上下文 & 技能 · ${escapeHtml(latestGroup.name)}</div>
           <div class="knowledge-tabs">
@@ -1697,7 +1781,7 @@ function renderModal(state: ManagerSnapshot, provider: ProviderInfo): string {
         `;
 
     return `
-      <div class="inline-modal" role="dialog" aria-modal="true">
+      <div class="${modalOverlayClass()}" role="dialog" aria-modal="true">
         <div class="modal-card group-knowledge-modal-card">
           <div class="modal-title">API / 本地 CLI 混合成员</div>
           <div class="modal-desc">配置直连 OpenAI 兼容接口或本地 CLI（如 Claude Code / Codex），与网页端账号混编入同一个群聊。</div>
@@ -1731,7 +1815,7 @@ function renderModal(state: ManagerSnapshot, provider: ProviderInfo): string {
   }
   if (modal.kind === "delete-group") {
     return `
-      <div class="inline-modal" role="dialog" aria-modal="true">
+      <div class="${modalOverlayClass()}" role="dialog" aria-modal="true">
         <div class="modal-card">
           <div class="modal-title">删除群聊「${escapeHtml(modal.group.name)}」</div>
           <div class="modal-desc">将删除该群聊及本地群聊记录。各成员账号与原生网页历史不受影响。</div>
@@ -1744,7 +1828,7 @@ function renderModal(state: ManagerSnapshot, provider: ProviderInfo): string {
     `;
   }
   return `
-    <div class="inline-modal" role="dialog" aria-modal="true">
+    <div class="${modalOverlayClass()}" role="dialog" aria-modal="true">
       <div class="modal-card">
         <div class="modal-title">移除「${escapeHtml(modal.account.alias)}」</div>
         <div class="modal-desc">将关闭该视图并彻底清除本机独立浏览资料（Cookie 与存储）。云端账号及历史对话仍由官方保留。</div>
@@ -1760,9 +1844,9 @@ function renderModal(state: ManagerSnapshot, provider: ProviderInfo): string {
 function renderMiddleContent(state: ManagerSnapshot, provider: ProviderInfo): string {
   const providerAccounts = state.accounts.filter((a) => a.providerId === provider.id);
   const switchingKey = effectiveSwitchingKey(state);
-  const isAndroid = state.platform === "android";
+  const isMobile = isMobilePlatform(state.platform);
   const supportsProxy = supportsAccountProxy(state.platform);
-  const supportsCookieCopy = supportsProxy || isAndroid;
+  const supportsCookieCopy = supportsProxy || isMobile;
   const canReorder = providerAccounts.length > 1 && state.conflicts.length === 0;
 
   const noticeHtml = state.notice
@@ -1793,22 +1877,22 @@ function renderMiddleContent(state: ManagerSnapshot, provider: ProviderInfo): st
     .join("");
 
   const hasUpdate = Boolean(updateState.result?.hasUpdate);
-  const androidThemeBtn = isAndroid
+  const mobileThemeBtn = isMobile
     ? `<button id="theme-toggle-btn" class="ghost-icon-btn" type="button" title="主题：${themeLabel(themeMode)}（点击切换）">${themeIcon(themeMode)}</button>`
     : "";
-  const androidUpdateBtn = isAndroid
+  const mobileUpdateBtn = isMobile
     ? `<button id="check-update-btn" class="ghost-icon-btn update-trigger-btn ${hasUpdate ? "has-update" : ""}" type="button" title="${hasUpdate ? `发现新版本 v${escapeHtml(updateState.result!.latestVersion)}` : "检查更新"}">${ICON_UPDATE}${hasUpdate ? `<span class="update-dot"></span>` : ""}</button>`
     : "";
 
   const headerBtnHtml = provider.enabled
     ? `
-      ${androidThemeBtn}
-      ${androidUpdateBtn}
-      ${!isAndroid ? `<button id="sync-all-btn" class="ghost-icon-btn" type="button" title="刷新已就绪账号额度">${ICON_REFRESH}</button>` : ""}
+      ${mobileThemeBtn}
+      ${mobileUpdateBtn}
+      ${!isMobile ? `<button id="sync-all-btn" class="ghost-icon-btn" type="button" title="刷新已就绪账号额度">${ICON_REFRESH}</button>` : ""}
       <button id="open-site-btn" class="ghost-icon-btn" type="button" title="在浏览器中打开 ${escapeHtml(provider.shortName)} 官网">${ICON_EXTERNAL}</button>
       <button id="add-account-btn" class="icon-btn primary" type="button">+ 新增</button>
     `
-    : `${androidThemeBtn}${androidUpdateBtn}<button id="open-site-btn" class="icon-btn primary" type="button">打开官网 ${ICON_EXTERNAL}</button>`;
+    : `${mobileThemeBtn}${mobileUpdateBtn}<button id="open-site-btn" class="icon-btn primary" type="button">打开官网 ${ICON_EXTERNAL}</button>`;
 
   const listToolbarHtml =
     provider.enabled && providerAccounts.length >= 2 && state.conflicts.length === 0
@@ -1865,13 +1949,16 @@ function renderMiddleContent(state: ManagerSnapshot, provider: ProviderInfo): st
 
         const isMac = navigator.userAgent.includes("Mac");
         const shortcutHint =
-          !isAndroid && idx < 9
+          !isMobile && idx < 9
             ? `<span class="shortcut-pill" title="快捷切号">${isMac ? "⌘" : "^"}${idx + 1}</span>`
             : "";
         const proxyBadgeHtml =
           supportsProxy && acc.proxyUrl
             ? `<span class="proxy-pill" title="代理：${escapeHtml(acc.proxyUrl)}">代理</span>`
             : "";
+        const timezoneBadgeHtml = acc.timezone
+          ? `<span class="proxy-pill" title="时区：${escapeHtml(acc.timezone)}">${escapeHtml(acc.timezone)}</span>`
+          : "";
         const alertBadgeHtml = switching
           ? `<span class="loading-status-badge">加载中…</span>`
           : isLoggedOut
@@ -1887,7 +1974,7 @@ function renderMiddleContent(state: ManagerSnapshot, provider: ProviderInfo): st
           compactSubHtml = `<div class="account-sub loading-text"><span class="quota-label-text">正在加载…</span></div>`;
         } else if (isLoggedOut) {
           const loginHint = active
-            ? isAndroid
+            ? isMobile
               ? "登录已失效，点击进入重新登录"
               : "登录已失效，请在右侧重新登录"
             : acc.autoAlias
@@ -1948,7 +2035,7 @@ function renderMiddleContent(state: ManagerSnapshot, provider: ProviderInfo): st
           acc.alias === "已登录账号";
 
         return `
-          <div class="${rowClass}" data-switch-uuid="${escapeHtml(acc.uuid)}" ${!isAndroid && canReorder ? `draggable="true"` : ""}>
+          <div class="${rowClass}" data-switch-uuid="${escapeHtml(acc.uuid)}" ${!isMobile && canReorder ? `draggable="true"` : ""}>
             <div class="account-header">
               <div class="avatar-wrap">
                 ${avatarNodeHtml}
@@ -1960,6 +2047,7 @@ function renderMiddleContent(state: ManagerSnapshot, provider: ProviderInfo): st
                   <span class="account-alias">${escapeHtml(acc.alias)}</span>
                   ${shortcutHint}
                   ${proxyBadgeHtml}
+                  ${timezoneBadgeHtml}
                   ${alertBadgeHtml}
                 </div>
                 ${showManualAliasHint ? `<div class="alias-manual-hint"><span>未获取到邮箱</span><button class="inline-rename-link" data-rename-uuid="${escapeHtml(acc.uuid)}" type="button">手动改名</button></div>` : ""}
@@ -1973,7 +2061,7 @@ function renderMiddleContent(state: ManagerSnapshot, provider: ProviderInfo): st
                     <button class="reorder-btn" data-move-uuid="${escapeHtml(acc.uuid)}" data-move-dir="down" title="下移" aria-label="下移" type="button" ${idx === providerAccounts.length - 1 ? "disabled" : ""}>▼</button>
                   </div>
                 ` : ""}
-                ${!isAndroid ? `
+                ${!isMobile ? `
                   <button class="action-icon-btn ${switching ? "spinning" : ""}" data-reload-uuid="${escapeHtml(acc.uuid)}" title="强制刷新页面" type="button" ${switching ? "disabled" : ""}>${ICON_REFRESH}</button>
                 ` : ""}
                 ${supportsCookieCopy ? `
@@ -1981,7 +2069,7 @@ function renderMiddleContent(state: ManagerSnapshot, provider: ProviderInfo): st
                     <span class="copy-cookie-icon" aria-hidden="true"></span>
                   </button>
                 ` : ""}
-                <button class="action-icon-btn" data-rename-uuid="${escapeHtml(acc.uuid)}" title="${supportsProxy ? "账号设置" : "修改备注"}" type="button">${ICON_EDIT}</button>
+                <button class="action-icon-btn" data-rename-uuid="${escapeHtml(acc.uuid)}" title="账号设置" type="button">${ICON_EDIT}</button>
                 <button class="action-icon-btn danger" data-remove-uuid="${escapeHtml(acc.uuid)}" title="从本机移除" type="button">${ICON_TRASH}</button>
               </div>
             </div>
@@ -2241,6 +2329,21 @@ function renderMessageTextWithMentions(content: string, memberAliases: string[])
   return out;
 }
 
+function formatReviewStageChain(labels: string[]): string {
+  if (labels.length < 2) return "";
+  return labels
+    .map((label, idx) => {
+      const stage =
+        idx === 0
+          ? "初稿"
+          : idx === labels.length - 1 && labels.length >= 3
+            ? "综合定稿"
+            : "交叉评审";
+      return `${label}（${stage}）`;
+    })
+    .join(" → ");
+}
+
 function formatComposerHintText(
   draft: string,
   selectedTargets: AccountKey[],
@@ -2266,6 +2369,15 @@ function formatComposerHintText(
         .filter((x): x is string => Boolean(x))
     );
     const extraAuto = selectedAutoChannels.filter((c) => !inlineCats.has(c.id));
+    if (workflowMode === "review") {
+      const reviewLabels = [
+        ...inline.labels.map((l) => `@${l}`),
+        ...extraAuto.map((c) => `${c.label}(自动)`),
+      ];
+      if (reviewLabels.length >= 2) {
+        return `检测到正文 @，评审流顺序：${formatReviewStageChain(reviewLabels)}`;
+      }
+    }
     if (extraAuto.length > 0) {
       return `检测到正文 @${inline.labels.join("、@")}：将同时转发给 ${extraAuto
         .map((c) => `${c.label}(自动选号)`)
@@ -2285,10 +2397,13 @@ function formatComposerHintText(
     for (const ac of selectedAutoChannels) {
       parts.push(`${ac.label}(自动按额度选号)`);
     }
+    if (workflowMode === "review" && parts.length >= 2) {
+      return `评审流顺序：${formatReviewStageChain(parts)}`;
+    }
     return `仅向 ${parts.join("、")} 发送${modeSuffix}`;
   }
   if (workflowMode === "review") {
-    return "评审流模式：按成员顺序串行执行（初稿 → 交叉评审 → 综合定稿），Enter 发送";
+    return "评审流模式：按成员顺序串行执行（初稿 → 交叉评审 → 综合定稿）；按顺序点选上方成员或在正文按顺序 @ 可自定义先后顺序";
   }
   if (workflowMode === "a2a_relay") {
     return `A2A 接力模式：成员回复正文包含 @成员 将自动触发下一跳（上限 ${maxRelayHops} 跳）`;
@@ -2581,9 +2696,24 @@ function renderGroupRightStage(state: ManagerSnapshot): string {
                   ? `<div class="group-msg-pending">${meta?.isExternal ? "正在直连执行并流式接收回复…" : "正在该账号原生对话中生成回复…"}</div>`
                   : "";
 
-            const pinHoverAction = msg.content.trim()
-              ? `<div class="group-save-ctx-wrap"><button class="group-pin-icon-btn" data-pin-msg-id="${escapeHtml(msg.id)}" data-tooltip="沉淀到共享上下文" aria-label="沉淀到共享上下文" type="button">${ICON_PIN}</button></div>`
+            const canSyncReply = Boolean(
+              senderKey &&
+                !meta?.isExternal &&
+                msg.status !== "queued" &&
+                msg.status !== "sending" &&
+                msg.status !== "streaming"
+            );
+            const isSyncing = syncingMsgIds.has(msg.id);
+            const syncBtnHtml = canSyncReply
+              ? `<button class="group-pin-icon-btn ${isSyncing ? "is-spinning" : ""}" data-sync-msg-id="${escapeHtml(msg.id)}" data-tooltip="同步最新回复（不重发）" aria-label="同步最新回复" type="button" ${isSyncing ? "disabled" : ""}>${ICON_REFRESH}</button>`
               : "";
+            const pinBtnHtml = msg.content.trim()
+              ? `<button class="group-pin-icon-btn" data-pin-msg-id="${escapeHtml(msg.id)}" data-tooltip="沉淀到共享上下文" aria-label="沉淀到共享上下文" type="button">${ICON_PIN}</button>`
+              : "";
+            const pinHoverAction =
+              syncBtnHtml || pinBtnHtml
+                ? `<div class="group-save-ctx-wrap ${isSyncing ? "is-active" : ""}">${syncBtnHtml}${pinBtnHtml}</div>`
+                : "";
 
             const authCard =
               msg.status === "needs_auth"
@@ -2592,6 +2722,7 @@ function renderGroupRightStage(state: ManagerSnapshot): string {
                     <span>${escapeHtml(msg.error || "检测到安全授权弹窗，请切到该账号确认后重试")}</span>
                     <div class="group-error-ops">
                       <button class="mini-btn primary-text" data-retry-msg-id="${escapeHtml(msg.id)}" type="button">重试</button>
+                      ${canSyncReply ? `<button class="mini-btn" data-sync-msg-id="${escapeHtml(msg.id)}" type="button" ${isSyncing ? "disabled" : ""}>${isSyncing ? "同步中…" : "同步回复"}</button>` : ""}
                       ${senderKey ? `<button class="mini-btn warn-btn" type="button" ${jumpAttrs}>前往该账号授权 →</button>` : ""}
                     </div>
                   </div>
@@ -2602,6 +2733,7 @@ function renderGroupRightStage(state: ManagerSnapshot): string {
                       <span>${escapeHtml(msg.error)}</span>
                       <div class="group-error-ops">
                         <button class="mini-btn primary-text" data-retry-msg-id="${escapeHtml(msg.id)}" type="button">重试</button>
+                        ${canSyncReply ? `<button class="mini-btn" data-sync-msg-id="${escapeHtml(msg.id)}" type="button" ${isSyncing ? "disabled" : ""}>${isSyncing ? "同步中…" : "同步回复"}</button>` : ""}
                         ${senderKey ? `<button class="mini-btn" type="button" ${jumpAttrs}>${meta?.isExternal ? "检查配置" : "前往查看"}</button>` : ""}
                       </div>
                     </div>
@@ -2744,14 +2876,21 @@ function renderGroupRightStage(state: ManagerSnapshot): string {
                     ${autoBtnHtml}
                     ${cat.items
                       .map((m) => {
-                        const activeTarget = selectedTargets.some((t) => sameAccountKey(t, m.key));
+                        const selectedIdx = selectedTargets.findIndex((t) =>
+                          sameAccountKey(t, m.key)
+                        );
+                        const activeTarget = selectedIdx >= 0;
+                        const orderPrefix =
+                          workflowMode === "review" && activeTarget
+                            ? `${selectedIdx + 1}·`
+                            : "";
                         return `
                           <button
                             class="group-target-chip ${activeTarget ? "active" : ""}"
                             data-group-target-provider="${escapeHtml(m.key.providerId)}"
                             data-group-target-uuid="${escapeHtml(m.key.uuid)}"
                             type="button"
-                          >@${escapeHtml(m.alias)}</button>
+                          >${orderPrefix}@${escapeHtml(m.alias)}</button>
                         `;
                       })
                       .join("")}
@@ -2788,6 +2927,7 @@ function render(): void {
   const preservedInputIds = new Set([
     "modal-alias-input",
     "modal-proxy-input",
+    "modal-timezone-input",
     "modal-shortcut-input",
     "modal-group-name-input",
     "modal-group-context-input",
@@ -2816,11 +2956,11 @@ function render(): void {
       : null;
 
   const provider = currentProvider(snapshot);
-  const isAndroid = snapshot.platform === "android";
-  const isGroupsView = !isAndroid && viewMode === "groups";
+  const isMobile = isMobilePlatform(snapshot.platform);
+  const isGroupsView = !isMobile && viewMode === "groups";
   const anyGroupNeedsAuth = snapshot.groupChats.some(groupHasNeedsAuth);
 
-  if (isAndroid) {
+  if (isMobile) {
     root.innerHTML = `
       <div class="mobile-shell">
         <div class="mobile-tabs">
@@ -2918,6 +3058,7 @@ function render(): void {
       accountInputSelection.direction ?? undefined
     );
   }
+  shouldAnimateModal = false;
 }
 
 function bindEvents(state: ManagerSnapshot, provider: ProviderInfo): void {
@@ -3038,6 +3179,25 @@ function bindEvents(state: ManagerSnapshot, provider: ProviderInfo): void {
         groupId: state.activeGroupId,
         msgId,
       });
+    });
+  });
+
+  document.querySelectorAll<HTMLButtonElement>("[data-sync-msg-id]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      if (modal.kind !== "none" || !state.activeGroupId || busy) return;
+      const msgId = btn.dataset.syncMsgId;
+      if (!msgId || syncingMsgIds.has(msgId)) return;
+      syncingMsgIds.add(msgId);
+      rerenderPreservingScroll();
+      try {
+        await callCommand("sync_group_message_reply", {
+          groupId: state.activeGroupId,
+          msgId,
+        });
+      } finally {
+        syncingMsgIds.delete(msgId);
+        rerenderPreservingScroll();
+      }
     });
   });
 
@@ -3663,7 +3823,7 @@ function bindEvents(state: ManagerSnapshot, provider: ProviderInfo): void {
   });
 
   const openAddModal = async () => {
-    await setModal({ kind: "add", providerId: provider.id, draft: "", proxyDraft: "", cookieDraft: "" });
+    await setModal({ kind: "add", providerId: provider.id, draft: "", proxyDraft: "", timezoneDraft: "", cookieDraft: "" });
   };
   document.querySelector("#add-account-btn")?.addEventListener("click", openAddModal);
   document.querySelector("#stage-add-btn")?.addEventListener("click", openAddModal);
@@ -3809,6 +3969,7 @@ function bindEvents(state: ManagerSnapshot, provider: ProviderInfo): void {
           account: acc,
           draft: acc.autoAlias ? "" : acc.alias,
           proxyDraft: acc.proxyUrl ?? "",
+          timezoneDraft: acc.timezone ?? "",
           cookieDraft: "",
         });
       }
@@ -3856,7 +4017,7 @@ function bindEvents(state: ManagerSnapshot, provider: ProviderInfo): void {
 
   document.querySelectorAll<HTMLElement>("[data-switch-uuid]").forEach((row) => {
     row.addEventListener("dragstart", (ev) => {
-      if (state.platform === "android" || modal.kind !== "none" || state.conflicts.length > 0 || busy) {
+      if (isMobilePlatform(state.platform) || modal.kind !== "none" || state.conflicts.length > 0 || busy) {
         ev.preventDefault();
         return;
       }
@@ -3933,7 +4094,7 @@ function bindEvents(state: ManagerSnapshot, provider: ProviderInfo): void {
       if (
         state.activeAccount?.providerId === provider.id &&
         state.activeAccount?.uuid === uuid &&
-        state.platform !== "android"
+        !isMobilePlatform(state.platform)
       ) {
         return;
       }
@@ -3952,6 +4113,15 @@ function bindEvents(state: ManagerSnapshot, provider: ProviderInfo): void {
     btn.addEventListener("click", () => {
       if (modal.kind !== "settings" || modal.saving) return;
       modal.globalShortcut = btn.dataset.shortcutPreset ?? "";
+      modal.error = undefined;
+      render();
+    });
+  });
+
+  document.querySelectorAll<HTMLButtonElement>("[data-timezone-preset]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      if ((modal.kind !== "add" && modal.kind !== "rename") || modal.saving) return;
+      modal.timezoneDraft = btn.dataset.timezonePreset ?? "";
       modal.error = undefined;
       render();
     });
@@ -4079,18 +4249,43 @@ function bindEvents(state: ManagerSnapshot, provider: ProviderInfo): void {
       const idx = modal.selectedMembers.findIndex(
         (m) => m.providerId === pid && m.uuid === uuid
       );
+      let nowChecked = false;
       if (idx >= 0) {
         modal.selectedMembers.splice(idx, 1);
+        nowChecked = false;
       } else {
         if (modal.selectedMembers.length >= 30) {
           modal.error = "单个群聊最多支持 30 个成员";
-          render();
+          rerenderPreservingScroll();
           return;
         }
         modal.selectedMembers.push({ providerId: pid, uuid });
+        nowChecked = true;
       }
       modal.error = undefined;
-      render();
+      btn.classList.toggle("selected", nowChecked);
+      const checkBoxEl = btn.querySelector<HTMLElement>(".group-check-box");
+      if (checkBoxEl) {
+        checkBoxEl.textContent = nowChecked ? "✓" : "";
+      }
+      const hintEl = document.querySelector<HTMLElement>("#modal-group-hint");
+      if (hintEl) {
+        const extCount = (state.externalAgents ?? []).length;
+        const eligibleCount =
+          state.accounts.filter((a) => isAccountGroupEligible(state, a)).length + extCount;
+        const ineligibleCount = state.accounts.length + extCount - eligibleCount;
+        hintEl.textContent = formatGroupPickerHint(
+          eligibleCount,
+          ineligibleCount,
+          modal.selectedMembers.length,
+          true
+        );
+      }
+      const confirmBtn = document.querySelector<HTMLButtonElement>("#modal-confirm-btn");
+      if (confirmBtn) {
+        confirmBtn.disabled = modal.selectedMembers.length === 0;
+      }
+      document.querySelector("#modal-error-box")?.remove();
     });
   });
 
@@ -4510,7 +4705,7 @@ function bindEvents(state: ManagerSnapshot, provider: ProviderInfo): void {
 
   document
     .querySelectorAll<HTMLInputElement>(
-      "#modal-alias-input, #modal-proxy-input, #modal-shortcut-input, #modal-group-name-input"
+      "#modal-alias-input, #modal-proxy-input, #modal-timezone-input, #modal-shortcut-input, #modal-group-name-input"
     )
     .forEach((input) => {
       input.addEventListener("input", () => {
@@ -4519,6 +4714,8 @@ function bindEvents(state: ManagerSnapshot, provider: ProviderInfo): void {
             modal.proxyDraft = input.value;
             modal.proxyTestResult = null;
             document.querySelector("#proxy-test-result")?.remove();
+          } else if (input.id === "modal-timezone-input") {
+            modal.timezoneDraft = input.value;
           } else {
             modal.draft = input.value;
           }
@@ -4584,7 +4781,7 @@ function bindEvents(state: ManagerSnapshot, provider: ProviderInfo): void {
       const supportsProxy = supportsAccountProxy(state.platform);
       const alias = currentModal.draft.trim();
       const proxyUrl = supportsProxy ? currentModal.proxyDraft.trim() : undefined;
-      if (currentModal.kind === "rename" && !supportsProxy && !alias) return;
+      const timezone = currentModal.timezoneDraft.trim();
       currentModal.error = undefined;
       currentModal.saving = true;
       render();
@@ -4596,6 +4793,7 @@ function bindEvents(state: ManagerSnapshot, provider: ProviderInfo): void {
             providerId: currentModal.providerId,
             alias,
             proxyUrl,
+            timezone,
             rawCookies: rawCookies || undefined,
           })
           : await callCommand("rename_account", {
@@ -4603,6 +4801,7 @@ function bindEvents(state: ManagerSnapshot, provider: ProviderInfo): void {
             uuid: currentModal.account.uuid,
             alias,
             proxyUrl,
+            timezone,
           });
       } finally {
         currentModal.saving = false;
@@ -4735,10 +4934,62 @@ function bindEvents(state: ManagerSnapshot, provider: ProviderInfo): void {
   });
 }
 
+function groupModalVisualSignature(s: ManagerSnapshot): string {
+  return JSON.stringify({
+    selectedProviderId: s.selectedProviderId,
+    activeGroupId: s.activeGroupId,
+    notice: s.notice,
+    conflicts: s.conflicts,
+    providers: s.providers.map((p) => [p.id, p.enabled, p.shortName]),
+    accounts: s.accounts.map((a) => [
+      a.providerId,
+      a.uuid,
+      a.alias,
+      a.authState,
+      a.avatarUrl,
+      a.cookieExpiresAtMs,
+      a.cookieSessionOnly,
+    ]),
+    accountErrors: s.accountErrors,
+    externalAgents: (s.externalAgents ?? []).map((e) => [
+      e.id,
+      e.kind,
+      e.name,
+      e.model,
+      e.command,
+    ]),
+    groupChats: s.groupChats.map((g) => {
+      const lastMsg = g.messages[g.messages.length - 1];
+      return [
+        g.id,
+        g.name,
+        g.members.length,
+        g.messages.length,
+        lastMsg ? [lastMsg.id, lastMsg.status, lastMsg.content.length] : null,
+      ];
+    }),
+  });
+}
+
 async function bootstrap(): Promise<void> {
   await listen<ManagerSnapshot>("manager-state-changed", (event) => {
+    const prevSnapshot = snapshot;
+    const nextSnapshot = event.payload;
+    if (
+      modal.kind === "group" &&
+      !modal.saving &&
+      prevSnapshot &&
+      groupModalVisualSignature(prevSnapshot) === groupModalVisualSignature(nextSnapshot)
+    ) {
+      snapshot = nextSnapshot;
+      syncViewModeFromSnapshot(snapshot);
+      if (snapshot.activeAccount || !snapshot.switchingAccount) {
+        optimisticSwitching = null;
+      }
+      return;
+    }
     saveScrollPosition();
-    snapshot = event.payload;
+    snapshot = nextSnapshot;
     syncViewModeFromSnapshot(snapshot);
     if (snapshot.activeAccount || !snapshot.switchingAccount) {
       optimisticSwitching = null;

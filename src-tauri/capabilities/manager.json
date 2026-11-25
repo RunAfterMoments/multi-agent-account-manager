@@ -32,6 +32,7 @@
     "allow-delete-group-chat",
     "allow-send-group-message",
     "allow-retry-group-message",
+    "allow-sync-group-message-reply",
     "allow-clear-group-messages",
     "allow-start-group-new-topic",
     "allow-update-group-knowledge",

@@ -37,6 +37,10 @@ use uuid::Uuid;
 
 pub const APP_TITLE: &str = "叠号";
 const MAX_GROUP_MEMBERS: usize = 30;
+#[cfg(desktop)]
+const REVIEW_INLINE_CHAR_LIMIT: usize = 1200;
+#[cfg(desktop)]
+const REVIEW_FALLBACK_CHAR_LIMIT: usize = 4500;
 #[cfg_attr(not(desktop), allow(dead_code))]
 const AUTO_ROUTE_STICKY_MAX_USED_PCT: u8 = 85;
 #[cfg_attr(not(desktop), allow(dead_code))]
@@ -1654,6 +1658,377 @@ fn build_new_chat_click_js(adapter: &SiteAdapterConfig) -> String {
 }
 
 #[cfg(desktop)]
+#[derive(Debug, Clone)]
+struct GroupAttachment {
+  filename: String,
+  mime_type: String,
+  content: String,
+}
+
+#[cfg(desktop)]
+fn build_group_attach_file_js(adapter: &SiteAdapterConfig, attachment: &GroupAttachment) -> String {
+  let adapter_json = serde_json::to_string(adapter).unwrap_or_else(|_| "{}".to_string());
+  let name_json = serde_json::to_string(&attachment.filename).unwrap_or_else(|_| "\"draft.md\"".to_string());
+  let mime_json = serde_json::to_string(&attachment.mime_type).unwrap_or_else(|_| "\"text/markdown\"".to_string());
+  let content_json = serde_json::to_string(&attachment.content).unwrap_or_else(|_| "\"\"".to_string());
+  r#"(() => {
+  try {
+    const adapter = __ADAPTER__;
+    const fileName = __FILENAME__;
+    const mimeType = __MIME__;
+    const content = __CONTENT__;
+
+    const isVisibleEl = (el, minW = 16, minH = 12) => {
+      if (!el || !el.isConnected) return false;
+      const r = el.getBoundingClientRect();
+      if (r.width < minW || r.height < minH) return false;
+      let cur = el;
+      for (let d = 0; cur && cur.nodeType === 1 && d < 8; d++) {
+        try {
+          const st = getComputedStyle(cur);
+          if (st.display === 'none' || st.visibility === 'hidden') return false;
+        } catch (_) {}
+        cur = cur.parentElement;
+      }
+      return true;
+    };
+
+    let composer = null;
+    const compSels = Array.isArray(adapter.composerSelectors) ? adapter.composerSelectors : [];
+    for (const sel of compSels) {
+      if (!sel) continue;
+      try {
+        const list = Array.from(document.querySelectorAll(sel)).filter((el) => isVisibleEl(el, 80, 16));
+        if (list.length > 0) {
+          list.sort((a, b) => b.getBoundingClientRect().bottom - a.getBoundingClientRect().bottom);
+          composer = list[0];
+          break;
+        }
+      } catch (_) {}
+    }
+    if (!composer) {
+      const fb = Array.from(document.querySelectorAll('textarea, [contenteditable="true"], [role="textbox"]'))
+        .filter((el) => isVisibleEl(el, 100, 16));
+      fb.sort((a, b) => b.getBoundingClientRect().bottom - a.getBoundingClientRect().bottom);
+      composer = fb[0] || null;
+    }
+
+    const file = new File([content], fileName, { type: mimeType });
+    const dt = new DataTransfer();
+    dt.items.add(file);
+
+    const fileInputs = Array.from(document.querySelectorAll('input[type="file"]')).filter((inp) => {
+      if (inp.disabled) return false;
+      const acc = (inp.getAttribute('accept') || '').toLowerCase();
+      if (acc && /(?:image|audio|video)\//.test(acc) && !/(?:\.md|\.txt|text\/|application\/|\*)/.test(acc)) {
+        return false;
+      }
+      return true;
+    });
+
+    if (fileInputs.length > 0) {
+      let picked = fileInputs[fileInputs.length - 1];
+      if (composer) {
+        const bar = composer.closest('form') || composer.parentElement?.parentElement || composer.parentElement;
+        if (bar) {
+          const inBar = fileInputs.find((inp) => bar.contains(inp));
+          if (inBar) picked = inBar;
+        }
+      }
+      try {
+        const desc = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'files');
+        if (desc && typeof desc.set === 'function') {
+          desc.set.call(picked, dt.files);
+        } else {
+          picked.files = dt.files;
+        }
+      } catch (_) {
+        picked.files = dt.files;
+      }
+      picked.dispatchEvent(new Event('input', { bubbles: true }));
+      picked.dispatchEvent(new Event('change', { bubbles: true }));
+      return JSON.stringify({ dispatched: true, via: 'file_input' });
+    }
+
+    const dropTarget = composer || document.body;
+    if (!dropTarget) return JSON.stringify({ dispatched: false });
+    let pasted = false;
+    try {
+      dropTarget.focus();
+      const pasteEvt = new ClipboardEvent('paste', { bubbles: true, cancelable: true, clipboardData: dt });
+      dropTarget.dispatchEvent(pasteEvt);
+      pasted = true;
+    } catch (_) {}
+    try {
+      const dragOpts = { bubbles: true, cancelable: true, dataTransfer: dt };
+      dropTarget.dispatchEvent(new DragEvent('dragenter', dragOpts));
+      dropTarget.dispatchEvent(new DragEvent('dragover', dragOpts));
+      dropTarget.dispatchEvent(new DragEvent('drop', dragOpts));
+      return JSON.stringify({ dispatched: true, via: pasted ? 'paste_drop' : 'drop' });
+    } catch (_) {
+      return JSON.stringify({ dispatched: pasted, via: pasted ? 'paste' : 'none' });
+    }
+  } catch (err) {
+    return JSON.stringify({ dispatched: false, error: String(err) });
+  }
+})()"#
+    .replace("__ADAPTER__", &adapter_json)
+    .replace("__FILENAME__", &name_json)
+    .replace("__MIME__", &mime_json)
+    .replace("__CONTENT__", &content_json)
+}
+
+#[cfg(desktop)]
+fn build_group_check_attached_js(adapter: &SiteAdapterConfig, filename: &str) -> String {
+  let adapter_json = serde_json::to_string(adapter).unwrap_or_else(|_| "{}".to_string());
+  let name_json = serde_json::to_string(filename).unwrap_or_else(|_| "\"\"".to_string());
+  r#"(() => {
+  try {
+    const adapter = __ADAPTER__;
+    const fileName = __FILENAME__;
+    const isVisibleEl = (el) => {
+      if (!el || !el.isConnected) return false;
+      const r = el.getBoundingClientRect();
+      return r.width > 12 && r.height > 12;
+    };
+    let composer = null;
+    const compSels = Array.isArray(adapter.composerSelectors) ? adapter.composerSelectors : [];
+    for (const sel of compSels) {
+      if (!sel) continue;
+      try {
+        const list = Array.from(document.querySelectorAll(sel)).filter(isVisibleEl);
+        if (list.length > 0) {
+          list.sort((a, b) => b.getBoundingClientRect().bottom - a.getBoundingClientRect().bottom);
+          composer = list[0];
+          break;
+        }
+      } catch (_) {}
+    }
+    if (!composer) {
+      const fb = Array.from(document.querySelectorAll('textarea, [contenteditable="true"], [role="textbox"]')).filter(isVisibleEl);
+      fb.sort((a, b) => b.getBoundingClientRect().bottom - a.getBoundingClientRect().bottom);
+      composer = fb[0] || null;
+    }
+    const bar = composer ? (composer.closest('form') || composer.parentElement?.parentElement?.parentElement || composer.parentElement) : document.body;
+    const barText = (bar && bar.innerText ? bar.innerText : '').toLowerCase();
+    const stem = fileName.toLowerCase();
+    const hasName = Boolean(stem && (barText.includes(stem) || (document.body?.innerText || '').toLowerCase().includes(stem)));
+    const uploading = /上传中|uploading|parsing|解析中/i.test(barText);
+    return JSON.stringify({ ready: hasName && !uploading, uploading, hasName });
+  } catch (err) {
+    return JSON.stringify({ ready: false, error: String(err) });
+  }
+})()"#
+    .replace("__ADAPTER__", &adapter_json)
+    .replace("__FILENAME__", &name_json)
+}
+
+#[cfg(desktop)]
+fn build_hark_click_preview_card_js(preview_text: &str) -> String {
+  let prev_json = serde_json::to_string(preview_text).unwrap_or_else(|_| "\"\"".to_string());
+  r#"(() => {
+  try {
+    const previewText = (__PREVIEW__ || '').trim();
+    if (!previewText) return JSON.stringify({ clicked: false });
+    const winH = window.innerHeight || document.documentElement.clientHeight || 800;
+    const isVisibleEl = (el, minW = 140, minH = 56) => {
+      if (!el || !el.isConnected) return false;
+      const r = el.getBoundingClientRect();
+      if (r.width < minW || r.height < minH || r.height > winH * 0.72) return false;
+      let cur = el;
+      for (let d = 0; cur && cur.nodeType === 1 && d < 8; d++) {
+        try {
+          const st = getComputedStyle(cur);
+          if (st.display === 'none' || st.visibility === 'hidden') return false;
+          if (parseFloat(st.opacity) < 0.05) return false;
+        } catch (_) {}
+        cur = cur.parentElement;
+      }
+      return true;
+    };
+
+    const composer = Array.from(document.querySelectorAll('textarea, [contenteditable="true"]'))
+      .find((el) => isVisibleEl(el, 80, 16));
+    let col = document.querySelector('main, [role="main"]') || document.body;
+    if (composer) {
+      let cur = composer.parentElement;
+      while (cur && cur !== document.body && cur !== document.documentElement) {
+        const r = cur.getBoundingClientRect();
+        if (r.height >= winH * 0.5 && r.width >= 260) { col = cur; break; }
+        cur = cur.parentElement;
+      }
+    }
+    const bar = composer ? (composer.closest('form') || composer.parentElement?.parentElement) : null;
+    const previewLines = previewText.split(/\r?\n/).map((l) => l.trim()).filter((l) => l.length >= 2);
+    const tailLine = previewLines.length ? previewLines[previewLines.length - 1] : '';
+    const midLine = previewLines.length >= 2 ? previewLines[Math.floor(previewLines.length / 2)] : '';
+
+    const nodes = Array.from(col.querySelectorAll('div, section, article, button, [role="button"]'));
+    let bestCard = null;
+    for (let i = nodes.length - 1; i >= 0; i--) {
+      const el = nodes[i];
+      if (!isVisibleEl(el, 180, 64)) continue;
+      if ((bar && bar.contains(el)) || el.closest('nav, aside, header, footer, form')) continue;
+      if (el.querySelector('textarea, input')) continue;
+      const txt = (el.innerText || '').trim();
+      if (!txt || txt.length < 24 || txt.length > 2600) continue;
+      const hitsTail = tailLine && txt.includes(tailLine);
+      const hitsMid = midLine && txt.includes(midLine);
+      if (!hitsTail && !hitsMid) continue;
+      if (!previewText.includes(txt.slice(0, Math.min(24, txt.length))) && txt.length > previewText.length + 120) continue;
+
+      let looksLikeCard = el.tagName === 'BUTTON' || el.getAttribute('role') === 'button';
+      try {
+        const st = getComputedStyle(el);
+        if (st.cursor === 'pointer' || st.overflowY === 'hidden' || st.overflow === 'hidden') looksLikeCard = true;
+        if ((st.maskImage && st.maskImage !== 'none') || (st.webkitMaskImage && st.webkitMaskImage !== 'none')) looksLikeCard = true;
+      } catch (_) {}
+      if (el.scrollHeight > el.clientHeight + 8) looksLikeCard = true;
+      if (!looksLikeCard) {
+        const kids = el.querySelectorAll('[style*="gradient" i], [style*="mask" i], button, [role="button"]');
+        if (kids.length > 0) looksLikeCard = true;
+      }
+      if (!looksLikeCard) continue;
+
+      if (!bestCard || el.getBoundingClientRect().top > bestCard.getBoundingClientRect().top) {
+        bestCard = el;
+      } else if (bestCard && bestCard.contains(el)) {
+        bestCard = el;
+      }
+    }
+
+    if (!bestCard) return JSON.stringify({ clicked: false });
+    const cardPreview = (bestCard.innerText || '').trim();
+    const firstLine = cardPreview.split(/\r?\n/).map((l) => l.trim()).find(Boolean) || '';
+    let introPrefix = '';
+    if (firstLine) {
+      const idx = previewText.indexOf(firstLine);
+      if (idx > 0) introPrefix = previewText.slice(0, idx).trim();
+    }
+    bestCard.click();
+    return JSON.stringify({ clicked: true, introPrefix, cardPreview });
+  } catch (err) {
+    return JSON.stringify({ clicked: false, error: String(err) });
+  }
+})()"#
+    .replace("__PREVIEW__", &prev_json)
+}
+
+#[cfg(desktop)]
+fn build_hark_read_expanded_js(card_preview: &str) -> String {
+  let card_json = serde_json::to_string(card_preview).unwrap_or_else(|_| "\"\"".to_string());
+  r#"(() => {
+  try {
+    const cardPreview = (__CARD_PREVIEW__ || '').trim();
+    const anchor = cardPreview.split(/\r?\n/).map((l) => l.trim()).find((l) => l.length >= 2) || '';
+    const winW = window.innerWidth || document.documentElement.clientWidth || 1000;
+    const winH = window.innerHeight || document.documentElement.clientHeight || 800;
+
+    const isVisibleEl = (el) => {
+      if (!el || !el.isConnected) return false;
+      const r = el.getBoundingClientRect();
+      if (r.width < winW * 0.3 || r.height < winH * 0.35) return false;
+      let cur = el;
+      for (let d = 0; cur && cur.nodeType === 1 && d < 8; d++) {
+        try {
+          const st = getComputedStyle(cur);
+          if (st.display === 'none' || st.visibility === 'hidden' || parseFloat(st.opacity) < 0.05) return false;
+        } catch (_) {}
+        cur = cur.parentElement;
+      }
+      return true;
+    };
+
+    const extractStructuredText = (rootNode) => {
+      if (!rootNode) return '';
+      const skipSel = 'nav, aside, header, footer, button, script, style, svg, noscript, [hidden], [aria-hidden="true"]';
+      const blockSel = 'p, div, li, tr, h1, h2, h3, h4, h5, h6, pre, blockquote, article, section';
+      const parts = [];
+      let lastBlk = null;
+      let lastRow = null;
+      let lastCell = null;
+      const walker = document.createTreeWalker(rootNode, 4);
+      let n;
+      while ((n = walker.nextNode())) {
+        const v = n.nodeValue;
+        if (!v || !v.trim()) continue;
+        const p = n.parentElement;
+        if (!p || (p.closest && p.closest(skipSel))) continue;
+        const row = p.closest ? p.closest('tr') : null;
+        const cell = p.closest ? p.closest('td, th') : null;
+        const blk = (p.closest && p.closest(blockSel)) || p;
+        if (parts.length > 0) {
+          if (row && row === lastRow && cell && cell !== lastCell) parts.push(' | ');
+          else if (blk !== lastBlk) parts.push('\n');
+        }
+        parts.push(v.trim());
+        lastBlk = blk;
+        lastRow = row;
+        lastCell = cell;
+      }
+      return parts.join('').replace(/\n{3,}/g, '\n\n').trim();
+    };
+
+    const candidates = Array.from(document.querySelectorAll('[role="dialog"], [aria-modal="true"], dialog, article, main, section, div'))
+      .filter((el) => {
+        if (!isVisibleEl(el) || el === document.body) return false;
+        if (el.closest('nav, aside')) return false;
+        if (el.querySelector('textarea')) return false;
+        const txt = (el.innerText || '').trim();
+        if (!txt || txt.length <= cardPreview.length + 20) return false;
+        if (anchor && !txt.includes(anchor)) return false;
+        return true;
+      });
+
+    if (candidates.length === 0) return JSON.stringify({ text: '' });
+    candidates.sort((a, b) => {
+      const aModal = a.matches('[role="dialog"], [aria-modal="true"], dialog') ? 1 : 0;
+      const bModal = b.matches('[role="dialog"], [aria-modal="true"], dialog') ? 1 : 0;
+      if (aModal !== bModal) return bModal - aModal;
+      const ra = a.getBoundingClientRect();
+      const rb = b.getBoundingClientRect();
+      return (ra.width * ra.height) - (rb.width * rb.height);
+    });
+
+    let extracted = extractStructuredText(candidates[0]);
+    extracted = extracted
+      .replace(/^(?:摘要|Summary|Brief)\s*\r?\n+/i, '')
+      .replace(/(?:\r?\n+\s*(?:摘要|Summary|Brief)\s*)+$/i, '')
+      .trim();
+    return JSON.stringify({ text: extracted });
+  } catch (err) {
+    return JSON.stringify({ text: '', error: String(err) });
+  }
+})()"#
+    .replace("__CARD_PREVIEW__", &card_json)
+}
+
+#[cfg(desktop)]
+fn build_hark_close_expanded_js() -> String {
+  r#"(() => {
+  try {
+    const btns = Array.from(document.querySelectorAll('button, [role="button"]')).filter((b) => {
+      if (!b || !b.isConnected || b.disabled) return false;
+      if (b.closest('nav, aside')) return false;
+      const r = b.getBoundingClientRect();
+      return r.width >= 20 && r.height >= 20 && r.top >= 0 && r.top <= 110 && r.left >= 0 && r.left <= 140;
+    });
+    const labeled = btns.find((b) => /close|collapse|back|收起|关闭|返回/i.test((b.getAttribute('aria-label') || '') + ' ' + (b.getAttribute('title') || '')));
+    const target = labeled || btns.find((b) => Boolean(b.querySelector('svg')));
+    if (target) {
+      target.click();
+      return JSON.stringify({ closed: true, via: 'button' });
+    }
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', keyCode: 27, bubbles: true }));
+    return JSON.stringify({ closed: true, via: 'escape' });
+  } catch (err) {
+    return JSON.stringify({ closed: false, error: String(err) });
+  }
+})()"#
+    .to_string()
+}
+
+#[cfg(desktop)]
 fn build_group_send_js(adapter: &SiteAdapterConfig, job_id: &str, prompt_text: &str) -> String {
   let adapter_json = serde_json::to_string(adapter).unwrap_or_else(|_| "{}".to_string());
   let job_json = serde_json::to_string(job_id).unwrap_or_else(|_| "\"\"".to_string());
@@ -1893,6 +2268,7 @@ fn build_group_send_js(adapter: &SiteAdapterConfig, job_id: &str, prompt_text: &
     const baselineInfo = collectBaseline();
     const baselineBlocks = baselineInfo.texts;
     const baselineMainText = getCleanMainText();
+    const normWs = (s) => (s || '').replace(/\s+/g, ' ').trim();
     const stripBaselineTail = (raw) => {
       let s = (raw || '').trim();
       for (let k = 0; k < 6; k++) {
@@ -1911,16 +2287,54 @@ fn build_group_send_js(adapter: &SiteAdapterConfig, job_id: &str, prompt_text: &
       const c = stripBaselineTail(ln);
       if (c) baselineCleanSet.add(c);
     }
+    const sRoot = getSearchRoot();
+    const baselineDomEls = new WeakSet();
+    try {
+      for (const el of sRoot.querySelectorAll('*')) {
+        baselineDomEls.add(el);
+      }
+    } catch (_) {}
+    let lastBaselineEl = baselineInfo.els.length > 0 ? baselineInfo.els[baselineInfo.els.length - 1] : null;
+    if (!lastBaselineEl && sRoot) {
+      try {
+        const allRootEls = Array.from(sRoot.querySelectorAll('*'));
+        for (let i = allRootEls.length - 1; i >= 0; i--) {
+          const el = allRootEls[i];
+          if (!el || isExcludedContainer(el) || el.children.length > 0) continue;
+          if (!isVisibleEl(el, 8, 8)) continue;
+          if ((el.textContent || '').trim()) {
+            lastBaselineEl = el;
+            break;
+          }
+        }
+      } catch (_) {}
+    }
+    const baselineMainNorm = normWs(baselineMainText);
+    const baselineBlockNorms = baselineBlocks
+      .map((bt) => normWs(stripBaselineTail(bt)))
+      .filter((s) => s.length >= 8);
     const lines = promptText.split('\n').map((l) => l.trim()).filter(Boolean);
     const isFooterLine = (l) => l.includes('不要复述上方方括号标题') || l.includes('不要重复上方协议标签') || l.includes('不要重复以上协议标签');
     const promptNeedle = (lines.length >= 2 && isFooterLine(lines[lines.length - 1]))
       ? lines[lines.length - 2]
       : (lines.length > 0 ? lines[lines.length - 1] : promptText.trim());
+    const headCandidates = lines.filter((l) => !/^\[[^\]]{1,24}\]$/.test(l) && !isFooterLine(l));
+    const headPick = headCandidates.find((l) => {
+      const n40 = normWs(l).slice(0, 40);
+      return n40 && (!baselineMainNorm || !baselineMainNorm.includes(n40));
+    }) || headCandidates[0] || '';
+    const promptHead = headPick.slice(0, 48);
     const endMarker = '（请直接回答「当前问题」，不要复述上方方括号标题）';
     const baselineMarkerCount = baselineMainText ? (baselineMainText.split(endMarker).length - 1) : 0;
     const baselineNeedleCount = (baselineMainText && promptNeedle) ? (baselineMainText.split(promptNeedle).length - 1) : 0;
-    const busyRe = /Researching\s+\w+|Searching\s+for\b|正在搜索|正在联网搜索|正在检索|努力思考中|努力工作中/gi;
+    const baselineHeadCount = (baselineMainText && promptHead) ? (baselineMainText.split(promptHead).length - 1) : 0;
+    const busyRe = /Researching\s+\w+|Searching\s+for\b|正在搜索|正在联网搜索|正在检索|正在读取|正在解析|正在加载|正在生成|正在处理|努力思考中|努力工作中/gi;
     const baselineBodyBusyCount = ((document.body && document.body.innerText) ? (document.body.innerText.match(busyRe) || []).length : 0);
+
+    if (window.__maamNet) {
+      window.__maamNet.esText = '';
+      window.__maamNet.wsText = '';
+    }
 
     window.__maamGroupJobs = window.__maamGroupJobs || {};
     if (window.__maamGroupJobs[jobId] && window.__maamGroupJobs[jobId].observer) {
@@ -1933,15 +2347,21 @@ fn build_group_send_js(adapter: &SiteAdapterConfig, job_id: &str, prompt_text: &
       chatColRect: { left: colRect.left, right: colRect.right, width: colRect.width },
       promptText,
       promptNeedle,
+      promptHead,
       baselineCount: baselineBlocks.length,
       baselineSet: new Set(baselineBlocks.map((t) => t.slice(0, 220))),
       baselineExact: new Set(baselineBlocks),
       baselineCleanSet,
       baselineEls: new Set(baselineInfo.els),
+      baselineDomEls,
+      lastBaselineEl,
       baselineMainText,
+      baselineMainNorm,
+      baselineBlockNorms,
       baselineLines: new Set(baselineMainText.split(/\r?\n/).map((l) => l.trim()).filter(Boolean)),
       baselineMarkerCount,
       baselineNeedleCount,
+      baselineHeadCount,
       baselineBodyBusyCount,
       netStartSeq: (window.__maamNet && window.__maamNet.seq) || 0,
       netStartAt: Date.now(),
@@ -2089,7 +2509,7 @@ fn build_group_send_js(adapter: &SiteAdapterConfig, job_id: &str, prompt_text: &
           dispatchEnter();
           setTimeout(() => {
             try {
-              const curBlocks = collectBlocks();
+              const curBlocks = collectBaseline().texts;
               const rem = (composer.value || composer.innerText || '').trim();
               if (curBlocks.length <= baselineBlocks.length && rem.length >= Math.min(20, promptText.trim().length)) {
                 const sb = findSendBtn(true);
@@ -2106,7 +2526,7 @@ fn build_group_send_js(adapter: &SiteAdapterConfig, job_id: &str, prompt_text: &
           sendBtn.click();
           setTimeout(() => {
             try {
-              const curBlocks = collectBlocks();
+              const curBlocks = collectBaseline().texts;
               const rem = (composer.value || composer.innerText || '').trim();
               if (curBlocks.length <= baselineBlocks.length && rem.length >= Math.min(20, promptText.trim().length)) {
                 dispatchEnter();
@@ -2322,7 +2742,7 @@ fn build_group_poll_js(adapter: &SiteAdapterConfig, job_id: &str) -> String {
       }
     }
 
-    const busyRe = /Researching\s+\w+|Searching\s+for\b|正在搜索|正在联网搜索|正在检索|努力思考中|努力工作中/gi;
+    const busyRe = /Researching\s+\w+|Searching\s+for\b|正在搜索|正在联网搜索|正在检索|正在读取|正在解析|正在加载|正在生成|正在处理|努力思考中|努力工作中/gi;
     const curBodyBusyCount = ((document.body && document.body.innerText) ? (document.body.innerText.match(busyRe) || []).length : 0);
     if (curBodyBusyCount > (job.baselineBodyBusyCount || 0)) {
       domGenerating = true;
@@ -2347,13 +2767,15 @@ fn build_group_poll_js(adapter: &SiteAdapterConfig, job_id: &str) -> String {
       const s = (txt || '').trim();
       if (!s) return false;
       if (isTransientStatusText(s)) return !isIdleOnlyStatus(s);
-      const lines = s.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+      const lines = s.split(/\r?\n/).map((l) => l.trim().replace(/[。….\s]+$/g, '')).filter(Boolean);
       if (lines.length === 0 || lines.length > 3 || s.length > 100) return false;
       return lines.every((l) =>
         /^(?:Muse|Hark|ChatGPT|Claude|Gemini|DeepSeek)$/i.test(l)
-        || /^(?:正在|努力|开始)?(?:搜索|联网搜索|检索|查询|思考|深度思考|分析|阅读|浏览|整理|生成|处理|准备|加载|连接|预热|调用|执行|工作|研究)[^\n。！？!?]{0,30}$/.test(l)
-        || /^(?:已(?:搜索|阅读|检索|浏览|思考)[^\n。！？!?]{0,24})$/.test(l)
-        || /^(?:Searching|Researching|Thinking|Analyzing|Reading|Browsing|Generating|Loading|Working|Warming\s*up|Sending|Retrieving)\b[^\n.!?]{0,70}$/i.test(l)
+        || /^(?:正在|努力|准备|开始)[^\n。！？!?]{1,32}$/.test(l)
+        || /^[\u4e00-\u9fa5A-Za-z0-9 _\-]{1,18}中$/.test(l)
+        || /^(?:正在|努力|开始)?(?:搜索|联网搜索|检索|查询|思考|深度思考|分析|阅读|读取|读入|解析|打开|下载|提取|整合|合并|修订|完善|优化|确认|等待|接收|获取|拉取|同步|写入|保存|浏览|整理|生成|处理|准备|加载|连接|预热|调用|执行|工作|研究|检查|审阅|评审|核对|评估|起草|撰写|编写|规划|制定|综合|汇总|梳理|对比|查看|构思|草拟|校验|复核|总结)[^\n。！？!?]{0,30}$/.test(l)
+        || /^(?:已(?:搜索|阅读|读取|检索|解析|接收|获取|加载|打开|提取|合并|整合|浏览|思考|检查|审阅|核对)[^\n。！？!?]{0,24})$/.test(l)
+        || /^(?:Searching|Researching|Thinking|Analyzing|Reading|Browsing|Generating|Loading|Fetching|Parsing|Opening|Merging|Synthesizing|Processing|Preparing|Running|Calling|Executing|Working|Warming\s*up|Sending|Retrieving|Checking|Reviewing|Drafting|Writing|Planning|Summarizing|Verifying|Evaluating)\b[^\n.!?]{0,70}$/i.test(l)
       );
     };
     const escRe = (v) => v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -2370,7 +2792,7 @@ fn build_group_poll_js(adapter: &SiteAdapterConfig, job_id: &str) -> String {
         if (!isIdleOnlyStatus(s) && !extraIdleRe.test(s)) statusBusy = true;
         return '';
       }
-      const leadStatusRe = /^(?:(?:Muse|Hark)\s*\r?\n+|(?:正在预热|预热中|空闲中|仍在发送中|发送中|正在搜索网页|正在联网搜索|正在搜索|搜索中|正在思考|思考中|已(?:搜索|阅读|检索)[^\r\n]{0,20}|Thinking\.*|Searching\.*|Thought for \d+s?)\s*\r?\n+)+/i;
+      const leadStatusRe = /^(?:(?:Muse|Hark)\s*\r?\n+|(?:正在预热|预热中|空闲中|仍在发送中|发送中|正在搜索网页|正在联网搜索|正在搜索|搜索中|正在思考|思考中|读取中|解析中|处理中|生成中|正在[^\r\n。！？!?]{1,28}[。….]?|已(?:搜索|阅读|读取|检索|解析)[^\r\n]{0,20}[。….]?|Thinking[.\s]*|Searching[.\s]*|Reading[.\s]*|Thought for \d+s?)\s*\r?\n+)+/i;
       s = s.replace(leadStatusRe, '').trim();
       const leadSpeakerRe = /^(?:(?:Gemini|ChatGPT|Claude|DeepSeek|Grok|Kimi)\s*(?:说|said|says)\s*[:：]?\s*\r?\n+|(?:Gemini|ChatGPT|Claude|DeepSeek|Grok|Kimi)\s*(?:说|said|says)\s*[:：]\s*)+/i;
       s = s.replace(leadSpeakerRe, '').trim();
@@ -2399,11 +2821,17 @@ fn build_group_poll_js(adapter: &SiteAdapterConfig, job_id: &str) -> String {
       return s;
     };
 
+    const normWs = (s) => (s || '').replace(/\s+/g, ' ').trim();
     const promptNorm = (job.promptText || '').trim();
+    const promptNormWs = normWs(promptNorm);
     const isSameAsPrompt = (t) => {
       const s = (t || '').trim();
       if (!s) return true;
       if (s === promptNorm) return true;
+      const nt = normWs(s);
+      if (nt.length >= 12 && promptNormWs.includes(nt)) return true;
+      if (job.promptHead && s.includes(job.promptHead) && s.length <= promptNorm.length + 120) return true;
+      if (promptNorm.startsWith('[阶段要求]') && s.startsWith('[阶段要求]') && s.length <= promptNorm.length + 120) return true;
       if (job.promptNeedle && s === job.promptNeedle && s.length <= promptNorm.length + 12) return true;
       if ((s.includes('不要复述上方方括号标题') || s.includes('不要重复上方协议标签') || s.includes('不要重复以上协议标签')) && (s.includes('[当前问题]') || s.includes('[用户问题]') || s.includes('[当前群聊发言]'))) return true;
       return false;
@@ -2482,14 +2910,55 @@ fn build_group_poll_js(adapter: &SiteAdapterConfig, job_id: &str) -> String {
       if (t) return t;
       return extractCleanText(el, false);
     };
+    const stripTailLite = (raw) => {
+      let s = (raw || '').trim();
+      for (let k = 0; k < 6; k++) {
+        const next = s.replace(/(?:\r?\n|\s|^)(?:\d{1,2}:\d{2}|Muse|Hark|已阅读|已发送|已连接|空闲中|复制|Copy)$/i, '').trim();
+        if (next === s) break;
+        s = next;
+      }
+      return s;
+    };
     const isOldBaselineText = (t) => {
-      if (!t) return true;
-      if (job.baselineExact && job.baselineExact.has(t)) return true;
-      if (job.baselineCleanSet && job.baselineCleanSet.has(t)) return true;
-      if (job.baselineLines && job.baselineLines.has(t)) return true;
-      if (t.length >= 4 && job.baselineMainText && job.baselineMainText.includes(t)) return true;
+      const raw = (t || '').trim();
+      if (!raw) return true;
+      const stripped = stripTailLite(raw);
+      const nt = normWs(stripped);
+      if (!nt) return true;
+      if (job.baselineExact && (job.baselineExact.has(raw) || job.baselineExact.has(stripped))) return true;
+      if (job.baselineCleanSet && (job.baselineCleanSet.has(raw) || job.baselineCleanSet.has(stripped))) return true;
+      if (job.baselineLines && (job.baselineLines.has(raw) || job.baselineLines.has(stripped))) return true;
+      if (nt.length >= 4 && job.baselineMainNorm && job.baselineMainNorm.includes(nt)) return true;
+      if (nt.length >= 60 && job.baselineMainNorm) {
+        const head48 = nt.slice(0, 48);
+        const tail48 = nt.slice(-48);
+        if (job.baselineMainNorm.includes(head48) && job.baselineMainNorm.includes(tail48)) return true;
+        const tLines = stripped.split(/\r?\n/).map((l) => normWs(l)).filter((l) => l.length >= 12);
+        if (tLines.length >= 3) {
+          let hits = 0;
+          for (const ln of tLines) {
+            if (job.baselineMainNorm.includes(ln)) hits++;
+          }
+          if (hits / tLines.length >= 0.7) return true;
+        }
+      }
+      if (nt.length >= 24 && Array.isArray(job.baselineBlockNorms)) {
+        for (const b of job.baselineBlockNorms) {
+          if (b.includes(nt) || (nt.includes(b) && b.length >= nt.length * 0.75)) return true;
+        }
+      }
       return false;
     };
+    const isBaselineNode = (el) => Boolean(el && job.baselineDomEls && job.baselineDomEls.has(el));
+    const isAfterLastBaseline = (el) => Boolean(
+      el
+      && job.lastBaselineEl
+      && job.lastBaselineEl.isConnected
+      && el !== job.lastBaselineEl
+      && !el.contains(job.lastBaselineEl)
+      && !job.lastBaselineEl.contains(el)
+      && (job.lastBaselineEl.compareDocumentPosition(el) & 4)
+    );
 
     const adapterAsst = Array.isArray(adapter.assistantMessageSelectors) ? adapter.assistantMessageSelectors.filter(Boolean) : [];
     const baseMsgSelector = '[data-message-author-role], [data-role], [data-testid="message-bubble"], [data-testid="message-text"], [data-testid*="assistant" i], [data-testid*="response" i], [data-testid*="turn" i], article, [class*="markdown" i], [class*="prose" i]';
@@ -2504,24 +2973,39 @@ fn build_group_poll_js(adapter: &SiteAdapterConfig, job_id: &str) -> String {
     const needleIdx = job.promptNeedle ? fullMain.lastIndexOf(job.promptNeedle) : -1;
     const curMarkerCount = fullMain ? (fullMain.split(endMarker).length - 1) : 0;
     const curNeedleCount = (fullMain && job.promptNeedle) ? (fullMain.split(job.promptNeedle).length - 1) : 0;
+    const curHeadCount = (fullMain && job.promptHead) ? (fullMain.split(job.promptHead).length - 1) : 0;
     const hasNewMarker = curMarkerCount > (job.baselineMarkerCount || 0);
     const hasNewNeedle = curNeedleCount > (job.baselineNeedleCount || 0);
-    const hasNewPromptByTail = markerIdx >= 0 && markerIdx >= Math.max(0, (job.baselineMainText || '').length - 120);
-    const hasNewUserTurn = hasNewMarker || hasNewNeedle || hasNewPromptByTail;
+    const hasNewHead = curHeadCount > (job.baselineHeadCount || 0);
+    const hasNewUserTurn = hasNewMarker || hasNewNeedle || hasNewHead;
 
     let userIdx = -1;
-    const needlePrefix = job.promptNeedle && job.promptNeedle.length > 24 ? job.promptNeedle.slice(0, 24) : job.promptNeedle;
-    if (needlePrefix) {
+    const needleFull = job.promptNeedle || '';
+    const needlePrefix = needleFull.length > 24 ? needleFull.slice(0, 24) : needleFull;
+    const headFull = job.promptHead || '';
+    const headPrefix = headFull.length > 24 ? headFull.slice(0, 24) : headFull;
+    const matchesPromptSig = (txt) => Boolean(
+      txt && (
+        (needleFull && txt.includes(needleFull))
+        || (needlePrefix.length >= 6 && txt.includes(needlePrefix))
+        || (headFull && txt.includes(headFull))
+        || (headPrefix.length >= 8 && txt.includes(headPrefix))
+      )
+    );
+    if (needlePrefix || headPrefix || hasNewMarker) {
       for (let i = allNodes.length - 1; i >= 0; i--) {
-        const rawT = getNodeText(allNodes[i]);
-        if (rawT && (i >= (job.baselineCount || 0) || hasNewUserTurn || !isOldBaselineText(rawT)) && (rawT.includes(job.promptNeedle) || rawT.includes(needlePrefix))) {
+        const el = allNodes[i];
+        const rawT = getNodeText(el);
+        if (!rawT) continue;
+        if (isBaselineNode(el) && (!hasNewUserTurn || isOldBaselineText(rawT))) continue;
+        if (matchesPromptSig(rawT) || (hasNewMarker && !isBaselineNode(el) && rawT.includes(endMarker))) {
           userIdx = i;
           break;
         }
       }
     }
     let userAnchorEl = userIdx >= 0 ? allNodes[userIdx] : null;
-    if (!userAnchorEl && (needlePrefix || hasNewMarker)) {
+    if (!userAnchorEl && (needlePrefix || headPrefix || hasNewMarker)) {
       try {
         const walker = document.createTreeWalker(searchRoot, 4);
         let tNode;
@@ -2529,7 +3013,9 @@ fn build_group_poll_js(adapter: &SiteAdapterConfig, job_id: &str) -> String {
           const p = tNode.parentElement;
           if (!p || isExcluded(p)) continue;
           const v = (tNode.nodeValue || '').trim();
-          if (v && ((job.promptNeedle && v.includes(job.promptNeedle)) || (needlePrefix && v.includes(needlePrefix)) || v.includes(endMarker))) {
+          if (!v) continue;
+          if (isBaselineNode(p) && (!hasNewUserTurn || isOldBaselineText(v))) continue;
+          if (matchesPromptSig(v) || (hasNewMarker && !isBaselineNode(p) && v.includes(endMarker))) {
             userAnchorEl = p;
           }
         }
@@ -2542,8 +3028,562 @@ fn build_group_poll_js(adapter: &SiteAdapterConfig, job_id: &str) -> String {
       let cur = userTurnBox.parentElement;
       while (cur && cur !== searchRoot && cur !== chatCol && cur !== document.body) {
         if (composerBar && cur.contains(composerBar)) break;
+        if (job.lastBaselineEl && job.lastBaselineEl.isConnected && cur.contains(job.lastBaselineEl)) break;
         const ct = (cur.innerText || '').trim();
-        if (ct.length > promptNorm.length + 48) break;
+        if (ct.length > promptNorm.length + 120) break;
+        let hasAssistantSibling = false;
+        let seenBranch = false;
+        for (const ch of cur.children) {
+          if (ch === userTurnBox || ch.contains(userTurnBox)) {
+            seenBranch = true;
+            continue;
+          }
+          if (seenBranch) {
+            const st = (ch.innerText || '').trim();
+            if (st && !trivialSiblingRe.test(st)) {
+              hasAssistantSibling = true;
+              break;
+            }
+          }
+        }
+        if (hasAssistantSibling) break;
+        userTurnBox = cur;
+        cur = cur.parentElement;
+      }
+    }
+
+    const extractAfterUserTurn = (rootNode, turnBox) => {
+      if (!rootNode || !turnBox) return { text: '', hasFreshDom: false };
+      const skipSel = 'nav, aside, header, footer, form, button, script, style, time, svg, noscript, template, [hidden], [aria-hidden="true"]';
+      const blockSel = 'p, div, li, tr, h1, h2, h3, h4, h5, h6, pre, blockquote, article, section';
+      const parts = [];
+      let hasFreshDom = false;
+      let lastBlk = null;
+      let lastRow = null;
+      let lastCell = null;
+      try {
+        const walker = document.createTreeWalker(rootNode, 4);
+        let n;
+        while ((n = walker.nextNode())) {
+          const v = n.nodeValue;
+          if (!v || !v.trim()) continue;
+          const p = n.parentElement;
+          if (!p || (composerBar && composerBar.contains(p)) || (p.closest && p.closest(skipSel))) continue;
+          if (turnBox === p || turnBox.contains(p) || (turnBox.compareDocumentPosition(p) & 4) === 0) continue;
+          if (isBaselineNode(p) && job.lastBaselineEl && job.lastBaselineEl.isConnected && (job.lastBaselineEl.compareDocumentPosition(p) & 4) === 0) continue;
+          if (isOutOfColBounds(p) || !isVisibleEl(p, 1, 1)) continue;
+          if (!isBaselineNode(p)) hasFreshDom = true;
+          const row = p.closest ? p.closest('tr') : null;
+          const cell = p.closest ? p.closest('td, th') : null;
+          const blk = (p.closest && p.closest(blockSel)) || p;
+          if (parts.length > 0) {
+            if (row && row === lastRow && cell && cell !== lastCell) parts.push(' | ');
+            else if (blk !== lastBlk) parts.push('\n');
+          }
+          parts.push(v.trim());
+          lastBlk = blk;
+          lastRow = row;
+          lastCell = cell;
+        }
+      } catch (_) {}
+      return { text: parts.join('').replace(/\n{3,}/g, '\n\n').trim(), hasFreshDom };
+    };
+
+    const isBeforeUserAnchor = (el) => {
+      const ref = userTurnBox || userAnchorEl;
+      if (!ref || !el) return false;
+      if (el === ref || el.contains(ref) || ref.contains(el)) return true;
+      return (ref.compareDocumentPosition(el) & 4) === 0;
+    };
+
+    const sentIntoDom = Boolean(userTurnBox) || userIdx >= 0 || hasNewUserTurn || allNodes.length > (job.baselineCount || 0);
+    const stillUnsent = !sentIntoDom && composerVal.length >= Math.min(20, promptNorm.length) && composerVal === promptNorm;
+
+    const now = Date.now();
+    const isAsyncAgent = Boolean(adapter.asyncAgent);
+    const netState = window.__maamNet;
+    const apiPats = Array.isArray(adapter.chatApiPatterns)
+      ? adapter.chatApiPatterns.map((p) => String(p || '').toLowerCase()).filter(Boolean)
+      : [];
+    const netEntries = (netState && Array.isArray(netState.entries))
+      ? netState.entries.filter((e) => e && e.id > (job.netStartSeq || 0))
+      : [];
+    const relevantNet = netEntries.filter((e) => {
+      const u = (e.url || '').toLowerCase();
+      const patMatch = apiPats.length ? apiPats.some((p) => u.includes(p)) : false;
+      return e.method === 'POST' || e.isStream || patMatch;
+    });
+    const poolNet = relevantNet.filter((e) => e.method === 'POST' || e.isStream);
+    const activePostStream = poolNet.some((e) => (e.method === 'POST' || (e.isStream && !isAsyncAgent)) && !e.done && (now - (e.updatedAt || e.startedAt || 0)) < 12000);
+    const activePushStream = !isAsyncAgent && Boolean(netState && ((netState.wsLastAt > (job.netStartAt || 0) && now - netState.wsLastAt < 4000) || (netState.esLastAt > (job.netStartAt || 0) && now - netState.esLastAt < 4000)));
+    const netGenerating = activePostStream || activePushStream;
+
+    let candidateText = '';
+    if (!stillUnsent) {
+      const confirmedNewTurn = Boolean(userTurnBox) && (!isBaselineNode(userTurnBox) || hasNewUserTurn);
+      if (confirmedNewTurn) {
+        const afterRes = extractAfterUserTurn(searchRoot, userTurnBox);
+        const afterDom = cleanChrome(afterRes.text);
+        if (afterDom && !isSameAsPrompt(afterDom)) {
+          if (!isOldBaselineText(afterDom) || (afterRes.hasFreshDom && afterDom.length <= 80)) {
+            candidateText = afterDom;
+          }
+        }
+      }
+
+      if (!candidateText && (confirmedNewTurn || hasNewUserTurn || allNodes.length > (job.baselineCount || 0))) {
+        const baseAsstSelector = '[data-message-author-role="assistant"], [data-role="assistant"], [data-testid*="assistant" i]';
+        const assistantSelector = adapterAsst.length ? adapterAsst.join(', ') + ', ' + baseAsstSelector : baseAsstSelector;
+        let rawAsstNodes = [];
+        try { rawAsstNodes = Array.from(searchRoot.querySelectorAll(assistantSelector)); } catch (_) { rawAsstNodes = Array.from(searchRoot.querySelectorAll(baseAsstSelector)); }
+        const assistantNodes = rawAsstNodes.filter((el) => !isExcluded(el) && !isMessageWrapper(el) && isVisibleEl(el, 20, 12));
+        const collectedAsst = [];
+        for (let i = 0; i < assistantNodes.length; i++) {
+          const node = assistantNodes[i];
+          if (isBeforeUserAnchor(node)) continue;
+          if (job.baselineEls && job.baselineEls.has(node)) continue;
+          if (isBaselineNode(node) && isOldBaselineText(cleanChrome(getNodeText(node)))) continue;
+          if (!userTurnBox && job.lastBaselineEl && job.lastBaselineEl.isConnected && !isAfterLastBaseline(node)) continue;
+          if (assistantNodes.some((other) => other !== node && other.contains(node))) continue;
+          const t = cleanChrome(getNodeText(node));
+          if (!t || isSameAsPrompt(t)) continue;
+          const allowShortRepeat = confirmedNewTurn && !isBaselineNode(node) && t.length <= 80;
+          if (!allowShortRepeat && isOldBaselineText(t)) continue;
+          collectedAsst.push(t);
+        }
+        if (collectedAsst.length > 0) {
+          candidateText = userTurnBox ? collectedAsst.join('\n\n') : collectedAsst[collectedAsst.length - 1];
+        }
+      }
+
+      if (!candidateText && !userTurnBox && (hasNewUserTurn || allNodes.length > (job.baselineCount || 0))) {
+        for (let i = allNodes.length - 1; i >= 0; i--) {
+          if (i < (job.baselineCount || 0)) continue;
+          const el = allNodes[i];
+          if (job.baselineEls && job.baselineEls.has(el)) continue;
+          if (isBaselineNode(el)) continue;
+          if (job.lastBaselineEl && job.lastBaselineEl.isConnected && !isAfterLastBaseline(el)) continue;
+          if (el.getAttribute('data-message-author-role') === 'user' || el.getAttribute('data-role') === 'user') continue;
+          const rawElText = getNodeText(el);
+          if (!rawElText || matchesPromptSig(rawElText)) continue;
+          if (job.baselineSet && job.baselineSet.has(rawElText.slice(0, 220))) continue;
+          let t = rawElText;
+          if (t.startsWith(promptNorm)) t = t.slice(promptNorm.length).trim();
+          t = cleanChrome(t);
+          if (!t || isSameAsPrompt(t) || isOldBaselineText(t)) continue;
+          candidateText = t;
+          break;
+        }
+      }
+
+      if (!candidateText) {
+        let sliceStart = -1;
+        if (hasNewMarker && markerIdx >= 0) {
+          sliceStart = markerIdx + endMarker.length;
+        } else if (hasNewNeedle && needleIdx >= 0) {
+          sliceStart = needleIdx + job.promptNeedle.length;
+        }
+        if (sliceStart >= 0) {
+          const after = cleanChrome(fullMain.slice(sliceStart));
+          if (after && !isSameAsPrompt(after) && !isOldBaselineText(after)) candidateText = after;
+        }
+      }
+
+      if (!candidateText) {
+        for (let i = poolNet.length - 1; i >= 0; i--) {
+          const nt = cleanChrome((poolNet[i].text || '').trim());
+          if (nt && !isSameAsPrompt(nt) && !isOldBaselineText(nt)) {
+            candidateText = nt;
+            break;
+          }
+        }
+        if (!candidateText && netState && netState.esLastAt > (job.netStartAt || 0) && netState.esText) {
+          const est = cleanChrome(netState.esText);
+          if (est && !isSameAsPrompt(est) && !isOldBaselineText(est)) candidateText = est;
+        }
+      }
+    }
+
+    const cleanupJob = () => {
+      if (job && job.observer) {
+        try { job.observer.disconnect(); } catch (_) {}
+      }
+      delete window.__maamGroupJobs[jobId];
+    };
+
+    if (statusBusy) {
+      domGenerating = true;
+    }
+    const isGenerating = domGenerating || netGenerating;
+
+    if (candidateText && candidateText !== job.lastText) {
+      job.lastText = candidateText;
+      job.lastChangedAt = now;
+    }
+
+    const stableMs = now - (job.lastChangedAt || job.startedAt);
+    const elapsedMs = now - job.startedAt;
+    const recentDomMut = Boolean(job.lastDomMutAt && (now - job.lastDomMutAt) < (isAsyncAgent ? 2500 : 1200));
+    const effectiveGenerating = isGenerating || recentDomMut;
+
+    if (job.lastText) {
+      const trimmedLines = job.lastText.trim().split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+      const lastLine = trimmedLines.length ? trimmedLines[trimmedLines.length - 1] : '';
+      const looksIncomplete =
+        (job.lastText.length < 24 && !/[。！？.!?]$/.test(job.lastText))
+        || /(?:[:：\-—*•]|^(?:#{1,6}\s+|\d+[.、]\s*)[^\n。！？.!?]{1,28})$/.test(lastLine);
+      const neededStableMs = isAsyncAgent
+        ? (looksIncomplete ? 9000 : (job.lastText.length < 40 ? 6000 : 4500))
+        : (looksIncomplete ? 3600 : (job.lastText.length < 24 ? 1800 : 1400));
+      const quietFallbackMs = Math.max(neededStableMs + 1500, isAsyncAgent ? 7500 : 4200);
+      const noDomFallbackMs = Math.max(neededStableMs + 2000, isAsyncAgent ? 9000 : 4800);
+      const hardStableCapMs = isAsyncAgent ? 30000 : 22000;
+      if (
+        (!effectiveGenerating && stableMs >= neededStableMs)
+        || (!isGenerating && stableMs >= quietFallbackMs)
+        || (!domGenerating && !recentDomMut && stableMs >= noDomFallbackMs)
+        || stableMs >= hardStableCapMs
+      ) {
+        cleanupJob();
+        return JSON.stringify({ state: 'done', text: job.lastText });
+      }
+      return JSON.stringify({ state: 'streaming', text: job.lastText, transient: false });
+    }
+
+    const okPost = [...relevantNet].reverse().find((e) => e.method === 'POST' && e.status >= 200 && e.status < 300);
+    const fatalChatNet = [...relevantNet].reverse().find((e) => e.status === 401 || e.status === 403 || e.status === 429 || (e.method === 'POST' && e.status >= 400));
+    if (!isGenerating && fatalChatNet && (now - (fatalChatNet.updatedAt || fatalChatNet.startedAt)) >= 2500) {
+      cleanupJob();
+      const msg = (fatalChatNet.status === 401 || fatalChatNet.status === 403)
+        ? ('目标站点鉴权失效（HTTP ' + fatalChatNet.status + '），请前往该账号页面重新登录')
+        : fatalChatNet.status === 429
+          ? '触发目标站点限流（HTTP 429），请稍后点击重试'
+          : ('目标接口报错（HTTP ' + fatalChatNet.status + (fatalChatNet.errorSnippet ? '：' + fatalChatNet.errorSnippet : '') + '）');
+      return JSON.stringify({ state: 'error', text: '', error: msg });
+    }
+
+    const stuckStillSending = Boolean(progressText && progressText.includes('仍在发送中') && elapsedMs >= 15000);
+    if (stuckStillSending) {
+      cleanupJob();
+      return JSON.stringify({ state: 'stalled_retry', text: '' });
+    }
+
+    if (isAsyncAgent && !job.lastText && !progressText && sentIntoDom && elapsedMs >= 7000) {
+      progressText = okPost
+        ? ('服务端已接收（HTTP ' + okPost.status + '），等待异步回复…')
+        : '消息已发出，等待服务端响应…';
+    }
+
+    const timedOut = stillUnsent
+      ? (elapsedMs >= 20000)
+      : isAsyncAgent
+        ? (elapsedMs >= 95000)
+        : (!isGenerating && elapsedMs >= 65000);
+    if (timedOut) {
+      cleanupJob();
+      const waitedSec = Math.round(elapsedMs / 1000);
+      const msg = stillUnsent
+        ? '消息已填入但未能自动触发发送，请前往该账号页面检查输入框'
+        : okPost
+          ? ('服务端已接收消息（HTTP ' + okPost.status + '，已等待 ' + waitedSec + ' 秒），但未返回回复（可能服务端静默跳过或长连接中断），可前往查看或手动重试')
+          : (!sentIntoDom && !relevantNet.some((e) => e.method === 'POST'))
+            ? '未检测到发送请求发出，请检查该账号登录或网络状态后重试'
+            : ('发送后未检测到新回复（已等待 ' + waitedSec + ' 秒），可前往查看或手动重试');
+      return JSON.stringify({ state: 'error', text: '', error: msg });
+    }
+
+    return JSON.stringify({ state: 'streaming', text: progressText, transient: Boolean(progressText) });
+  } catch (err) {
+    return JSON.stringify({ state: 'error', text: '', error: String(err) });
+  }
+})()"#
+    .replace("__ADAPTER__", &adapter_json)
+    .replace("__JOB_ID__", &job_json)
+}
+
+#[cfg(desktop)]
+fn build_group_sync_latest_js(adapter: &SiteAdapterConfig, raw_user_content: &str) -> String {
+  let adapter_json = serde_json::to_string(adapter).unwrap_or_else(|_| "{}".to_string());
+  let query_json = serde_json::to_string(raw_user_content).unwrap_or_else(|_| "\"\"".to_string());
+  r#"(() => {
+  try {
+    const adapter = __ADAPTER__;
+    const rawUserContent = __QUERY__;
+    const endMarker = '（请直接回答「当前问题」，不要复述上方方括号标题）';
+
+    const isVisibleEl = (el, minW = 16, minH = 12) => {
+      if (!el || !el.isConnected) return false;
+      const r = el.getBoundingClientRect();
+      if (r.width < minW || r.height < minH) return false;
+      let cur = el;
+      for (let d = 0; cur && cur.nodeType === 1 && d < 8; d++) {
+        try {
+          const st = getComputedStyle(cur);
+          if (st.display === 'none' || st.visibility === 'hidden') return false;
+          const op = parseFloat(st.opacity);
+          if (!Number.isNaN(op) && op < 0.05) return false;
+        } catch (_) {}
+        cur = cur.parentElement;
+      }
+      return true;
+    };
+
+    const resolveActiveComposer = () => {
+      const compSels = Array.isArray(adapter.composerSelectors) ? adapter.composerSelectors : [];
+      for (const sel of compSels) {
+        if (!sel) continue;
+        try {
+          const list = Array.from(document.querySelectorAll(sel)).filter((el) => isVisibleEl(el, 80, 16));
+          if (list.length > 0) {
+            list.sort((a, b) => b.getBoundingClientRect().bottom - a.getBoundingClientRect().bottom);
+            return list[0];
+          }
+        } catch (_) {}
+      }
+      const fallback = Array.from(document.querySelectorAll('textarea, [contenteditable="true"], [role="textbox"]'))
+        .filter((el) => isVisibleEl(el, 100, 16));
+      fallback.sort((a, b) => b.getBoundingClientRect().bottom - a.getBoundingClientRect().bottom);
+      return fallback[0] || null;
+    };
+    const resolveChatColumn = (comp) => {
+      const winH = window.innerHeight || document.documentElement.clientHeight || 800;
+      if (comp && comp.isConnected) {
+        let cur = comp.parentElement;
+        while (cur && cur !== document.body && cur !== document.documentElement) {
+          const r = cur.getBoundingClientRect();
+          if (r.height >= winH * 0.5 && r.width >= 220) {
+            return cur;
+          }
+          cur = cur.parentElement;
+        }
+      }
+      return document.querySelector('main, [role="main"]') || document.body;
+    };
+    const resolveComposerBar = (comp, col) => {
+      const winH = window.innerHeight || document.documentElement.clientHeight || 800;
+      if (!comp || !comp.isConnected) return null;
+      let bar = comp;
+      let cur = comp.parentElement;
+      while (cur && cur !== col && cur !== document.body) {
+        const r = cur.getBoundingClientRect();
+        if (r.height >= winH * 0.36) break;
+        bar = cur;
+        cur = cur.parentElement;
+      }
+      return bar;
+    };
+
+    const activeComposer = resolveActiveComposer();
+    const chatCol = resolveChatColumn(activeComposer);
+    const composerBar = resolveComposerBar(activeComposer, chatCol);
+    const colRect = (chatCol && chatCol !== document.body) ? chatCol.getBoundingClientRect() : null;
+
+    let scopedList = null;
+    const adapterListSels = Array.isArray(adapter.messageListSelectors) ? adapter.messageListSelectors : [];
+    for (const sel of adapterListSels) {
+      if (!sel || sel === 'main') continue;
+      try {
+        const el = chatCol.querySelector(sel);
+        if (el && el.getBoundingClientRect().height > 10) { scopedList = el; break; }
+      } catch (_) {}
+    }
+    if (!scopedList) {
+      scopedList = chatCol.querySelector('[data-testid="message-list"], [data-testid*="chat-messages" i], [data-testid*="message-feed" i]');
+    }
+    const searchRoot = scopedList || chatCol;
+    const isOutOfColBounds = (el) => {
+      if (!colRect || colRect.width < 120 || !el || !el.getBoundingClientRect) return false;
+      const r = el.getBoundingClientRect();
+      if (r.width === 0 && r.height === 0) return false;
+      return r.right < colRect.left - 16 || r.left > colRect.right + 16;
+    };
+    const isExcluded = (el) => Boolean(
+      (composerBar && composerBar.contains(el))
+      || (el.closest && el.closest('nav, aside, header, footer, form'))
+      || isOutOfColBounds(el)
+    );
+    const isMessageWrapper = (el) => {
+      const tid = (el.getAttribute('data-testid') || '').toLowerCase();
+      if (/list|container|scroll|wrapper|feed|history|timestamp|time|date|header|footer|avatar/.test(tid)) return true;
+      const nested = el.querySelectorAll('[data-message-author-role], [data-role], [data-testid="message-bubble"], [data-testid="message-text"], article').length;
+      return nested > 1;
+    };
+    const extractCleanText = (rootNode, skipChrome) => {
+      if (!rootNode) return '';
+      const skipSel = skipChrome
+        ? 'nav, aside, header, footer, form, button, script, style, time, svg, noscript, template, [hidden], [aria-hidden="true"]'
+        : 'script, style, time, svg, noscript, template, [hidden], [aria-hidden="true"]';
+      const blockSel = 'p, div, li, tr, h1, h2, h3, h4, h5, h6, pre, blockquote, article, section';
+      const parts = [];
+      let lastBlk = null;
+      let lastRow = null;
+      let lastCell = null;
+      try {
+        const walker = document.createTreeWalker(rootNode, 4);
+        let n;
+        while ((n = walker.nextNode())) {
+          const v = n.nodeValue;
+          if (!v || !v.trim()) continue;
+          const p = n.parentElement;
+          if (!p || (skipChrome && composerBar && composerBar.contains(p)) || (p.closest && p.closest(skipSel))) continue;
+          if (skipChrome && isOutOfColBounds(p)) continue;
+          const row = p.closest ? p.closest('tr') : null;
+          const cell = p.closest ? p.closest('td, th') : null;
+          const blk = (p.closest && p.closest(blockSel)) || p;
+          if (parts.length > 0) {
+            if (row && row === lastRow && cell && cell !== lastCell) parts.push(' | ');
+            else if (blk !== lastBlk) parts.push('\n');
+          }
+          parts.push(v.trim());
+          lastBlk = blk;
+          lastRow = row;
+          lastCell = cell;
+        }
+      } catch (_) {}
+      return parts.join('').replace(/\n{3,}/g, '\n\n').trim();
+    };
+    const getNodeText = (el) => {
+      if (!el) return '';
+      if (el.querySelector && el.querySelector('table, tr')) {
+        return extractCleanText(el, false);
+      }
+      const t = (el.innerText || '').trim();
+      if (t) return t;
+      return extractCleanText(el, false);
+    };
+
+    const extraWords = Array.isArray(adapter.transientStatusWords)
+      ? adapter.transientStatusWords.map((w) => String(w || '').trim()).filter(Boolean)
+      : [];
+    const isIdleOnlyStatus = (s) => /^(?:(?:Muse|Hark|空闲中|已连接|已阅读|消息|Idle|Connected)[….\s]*)+$/i.test((s || '').trim());
+    const isTransientStatusText = (s) => {
+      const t = (s || '').trim();
+      if (!t) return false;
+      if (extraWords.some((w) => t === w || t === ('Muse\n' + w) || t === ('Hark\n' + w))) {
+        return true;
+      }
+      return /^(?:(?:Muse|Hark)[ \t\r\n]+(?:正在[\u4e00-\u9fa5]{1,10}|[\u4e00-\u9fa5]{1,8}中|已连接|已阅读|消息|Thinking|Warming\s*up|Sending|Working|Searching|Researching|Replying|Retrieving|Loading|Idle|Connected)[….\s]*|(?:Muse|Hark)[ \t\r\n]*|(?:正在预热|预热中|空闲中|已连接|连接中|正在连接|仍在发送中|发送中|努力工作中|工作中|努力思考中|正在思考|思考中|正在搜索|正在搜索网页|正在联网搜索|搜索中|正在检索|检索中|正在回复|回复中|正在分析|分析中|正在查询|查询中|正在处理|处理中|正在生成|生成中|正在准备|准备中|加载中|待命中|已阅读|消息|Thinking|Warming\s*up|Sending|Working|Searching|Researching|Replying|Retrieving|Loading|Idle|Connected)[….\s]*)+$/i.test(t);
+    };
+    const isTransientProgressOnly = (txt) => {
+      const s = (txt || '').trim();
+      if (!s) return false;
+      if (isTransientStatusText(s)) return !isIdleOnlyStatus(s);
+      const lines = s.split(/\r?\n/).map((l) => l.trim().replace(/[。….\s]+$/g, '')).filter(Boolean);
+      if (lines.length === 0 || lines.length > 3 || s.length > 100) return false;
+      return lines.every((l) =>
+        /^(?:Muse|Hark|ChatGPT|Claude|Gemini|DeepSeek)$/i.test(l)
+        || /^(?:正在|努力|准备|开始)[^\n。！？!?]{1,32}$/.test(l)
+        || /^[\u4e00-\u9fa5A-Za-z0-9 _\-]{1,18}中$/.test(l)
+        || /^(?:正在|努力|开始)?(?:搜索|联网搜索|检索|查询|思考|深度思考|分析|阅读|读取|读入|解析|打开|下载|提取|整合|合并|修订|完善|优化|确认|等待|接收|获取|拉取|同步|写入|保存|浏览|整理|生成|处理|准备|加载|连接|预热|调用|执行|工作|研究|检查|审阅|评审|核对|评估|起草|撰写|编写|规划|制定|综合|汇总|梳理|对比|查看|构思|草拟|校验|复核|总结)[^\n。！？!?]{0,30}$/.test(l)
+        || /^(?:已(?:搜索|阅读|读取|检索|解析|接收|获取|加载|打开|提取|合并|整合|浏览|思考|检查|审阅|核对)[^\n。！？!?]{0,24})$/.test(l)
+        || /^(?:Searching|Researching|Thinking|Analyzing|Reading|Browsing|Generating|Loading|Fetching|Parsing|Opening|Merging|Synthesizing|Processing|Preparing|Running|Calling|Executing|Working|Warming\s*up|Sending|Retrieving|Checking|Reviewing|Drafting|Writing|Planning|Summarizing|Verifying|Evaluating)\b[^\n.!?]{0,70}$/i.test(l)
+      );
+    };
+    const escRe = (v) => v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const cleanChrome = (txt) => {
+      let s = (txt || '')
+        .replace(/(\r?\n\s*(复制|Copy|Copy code|Regenerate|重新生成|重试|Retry|Share|分享|Edit|编辑|Like|Dislike)\s*)+$/gi, '')
+        .trim();
+      if (isTransientProgressOnly(s) || isTransientStatusText(s)) return '';
+      const leadStatusRe = /^(?:(?:Muse|Hark)\s*\r?\n+|(?:正在预热|预热中|空闲中|仍在发送中|发送中|正在搜索网页|正在联网搜索|正在搜索|搜索中|正在思考|思考中|读取中|解析中|处理中|生成中|正在[^\r\n。！？!?]{1,28}[。….]?|已(?:搜索|阅读|读取|检索|解析)[^\r\n]{0,20}[。….]?|Thinking[.\s]*|Searching[.\s]*|Reading[.\s]*|Thought for \d+s?)\s*\r?\n+)+/i;
+      s = s.replace(leadStatusRe, '').trim();
+      const leadSpeakerRe = /^(?:(?:Gemini|ChatGPT|Claude|DeepSeek|Grok|Kimi)\s*(?:说|said|says)\s*[:：]?\s*\r?\n+|(?:Gemini|ChatGPT|Claude|DeepSeek|Grok|Kimi)\s*(?:说|said|says)\s*[:：]\s*)+/i;
+      s = s.replace(leadSpeakerRe, '').trim();
+      if (/^(?:Gemini|ChatGPT|Claude|DeepSeek|Grok|Kimi)\s*(?:说|said|says)\s*[:：]?$/i.test(s)) return '';
+      const tailRe = /(?:(?:Muse|Hark)[ \t\r\n]+(?:正在[\u4e00-\u9fa5]{1,10}|[\u4e00-\u9fa5]{1,8}中|已连接|已阅读|消息|Thinking|Warming\s*up|Sending|Working|Searching|Researching|Replying|Retrieving|Loading|Idle|Connected)(?:[ \t\r\n]+消息)?)+$|(?:\r?\n|\s|^)(?:Muse|Hark|已连接|连接中|正在连接|正在预热|预热中|空闲中|仍在发送中|发送中|努力工作中|工作中|努力思考中|正在思考|思考中|正在搜索|正在搜索网页|搜索中|正在检索|检索中|正在回复|回复中|正在分析|分析中|正在查询|查询中|正在处理|处理中|正在生成|生成中|正在准备|准备中|加载中|待命中|消息|停止|发送|Sending|已阅读|给\s*Hark\s*发消息|附加文件|开始听写|添加附件|发送消息|留下心情|共享页面|更多选项|Go to Ideas|Customize your Feed|\d{1,2}:\d{2})$/i;
+      for (let k = 0; k < 10; k++) {
+        let next = s.replace(tailRe, '').trim();
+        for (const ew of extraWords) {
+          const ewRe = new RegExp('(?:\\r?\\n|\\s|^)(?:(?:Muse|Hark)\\s+)?' + escRe(ew) + '$', 'i');
+          next = next.replace(ewRe, '').trim();
+        }
+        if (next === s) break;
+        s = next;
+      }
+      if (isTransientProgressOnly(s) || isTransientStatusText(s)) return '';
+      return s;
+    };
+
+    const normWs = (s) => (s || '').replace(/\s+/g, ' ').trim();
+    const rawQ = (rawUserContent || '').trim();
+    const qLines = rawQ.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+    qLines.sort((a, b) => b.length - a.length);
+    const qLongest = qLines[0] || rawQ;
+    const qNeedle = qLongest.slice(0, 48);
+    const qPrefix = qNeedle.length > 24 ? qNeedle.slice(0, 24) : qNeedle;
+    const rawQNorm = normWs(rawQ);
+    const isPromptOverlap = (t) => {
+      const s = (t || '').trim();
+      if (!s) return true;
+      if (rawQ && s === rawQ) return true;
+      const ns = normWs(s);
+      if (rawQNorm && ns.length >= 12 && rawQNorm.includes(ns)) return true;
+      if ((s.includes('不要复述上方方括号标题') || s.includes('不要重复上方协议标签') || s.includes('不要重复以上协议标签')) && (s.includes('[当前问题]') || s.includes('[用户问题]') || s.includes('[当前群聊发言]'))) return true;
+      if (s.startsWith('[阶段要求]') && s.includes(endMarker)) return true;
+      return false;
+    };
+
+    const adapterAsst = Array.isArray(adapter.assistantMessageSelectors) ? adapter.assistantMessageSelectors.filter(Boolean) : [];
+    const baseMsgSelector = '[data-message-author-role], [data-role], [data-testid="message-bubble"], [data-testid="message-text"], [data-testid*="assistant" i], [data-testid*="response" i], [data-testid*="turn" i], article, [class*="markdown" i], [class*="prose" i]';
+    const allNodesSelector = adapterAsst.length ? adapterAsst.join(', ') + ', ' + baseMsgSelector : baseMsgSelector;
+    let rawNodeList = [];
+    try { rawNodeList = Array.from(searchRoot.querySelectorAll(allNodesSelector)); } catch (_) { rawNodeList = Array.from(searchRoot.querySelectorAll(baseMsgSelector)); }
+    const allNodes = rawNodeList.filter((el) => !isExcluded(el) && !isMessageWrapper(el) && isVisibleEl(el, 20, 12));
+
+    let userAnchorEl = null;
+    if (qPrefix.length >= 4) {
+      for (let i = allNodes.length - 1; i >= 0; i--) {
+        const rawT = getNodeText(allNodes[i]);
+        if (rawT && ((qNeedle && rawT.includes(qNeedle)) || (qPrefix.length >= 6 && rawT.includes(qPrefix)))) {
+          userAnchorEl = allNodes[i];
+          break;
+        }
+      }
+      if (!userAnchorEl) {
+        try {
+          const walker = document.createTreeWalker(searchRoot, 4);
+          let tNode;
+          while ((tNode = walker.nextNode())) {
+            const p = tNode.parentElement;
+            if (!p || isExcluded(p)) continue;
+            const v = (tNode.nodeValue || '').trim();
+            if (v && ((qNeedle && v.includes(qNeedle)) || (qPrefix.length >= 6 && v.includes(qPrefix)))) {
+              userAnchorEl = p;
+            }
+          }
+        } catch (_) {}
+      }
+    }
+    if (!userAnchorEl) {
+      for (let i = allNodes.length - 1; i >= 0; i--) {
+        const rawT = getNodeText(allNodes[i]);
+        if (rawT && (rawT.includes(endMarker) || rawT.includes('[当前问题]') || rawT.includes('[阶段要求]'))) {
+          userAnchorEl = allNodes[i];
+          break;
+        }
+      }
+      if (!userAnchorEl) {
+        try {
+          const walker = document.createTreeWalker(searchRoot, 4);
+          let tNode;
+          while ((tNode = walker.nextNode())) {
+            const p = tNode.parentElement;
+            if (!p || isExcluded(p)) continue;
+            const v = (tNode.nodeValue || '').trim();
+            if (v && (v.includes(endMarker) || v.includes('[当前问题]') || v.includes('[阶段要求]'))) {
+              userAnchorEl = p;
+            }
+          }
+        } catch (_) {}
+      }
+    }
+
+    let userTurnBox = userAnchorEl;
+    if (userTurnBox) {
+      const trivialSiblingRe = /^(?:\d{1,2}:\d{2}|👍|❤️|😂|🎉|复制|编辑|重试|Copy|Edit|Retry|已发送|已读)$/i;
+      let cur = userTurnBox.parentElement;
+      while (cur && cur !== searchRoot && cur !== chatCol && cur !== document.body) {
+        if (composerBar && cur.contains(composerBar)) break;
         let hasAssistantSibling = false;
         let seenBranch = false;
         for (const ch of cur.children) {
@@ -2606,193 +3646,59 @@ fn build_group_poll_js(adapter: &SiteAdapterConfig, job_id: &str) -> String {
       return (ref.compareDocumentPosition(el) & 4) === 0;
     };
 
-    const sentIntoDom = Boolean(userTurnBox) || userIdx >= 0 || hasNewUserTurn || allNodes.length > (job.baselineCount || 0);
-    const stillUnsent = !sentIntoDom && composerVal.length >= Math.min(20, promptNorm.length) && composerVal === promptNorm;
+    let text = '';
+    if (userTurnBox) {
+      const afterDom = cleanChrome(extractAfterUserTurn(searchRoot, userTurnBox));
+      if (afterDom && !isPromptOverlap(afterDom)) {
+        text = afterDom;
+      }
+    }
 
-    const now = Date.now();
-    const isAsyncAgent = Boolean(adapter.asyncAgent);
-    const netState = window.__maamNet;
-    const apiPats = Array.isArray(adapter.chatApiPatterns)
-      ? adapter.chatApiPatterns.map((p) => String(p || '').toLowerCase()).filter(Boolean)
-      : [];
-    const netEntries = (netState && Array.isArray(netState.entries))
-      ? netState.entries.filter((e) => e && e.id > (job.netStartSeq || 0))
-      : [];
-    const relevantNet = netEntries.filter((e) => {
-      const u = (e.url || '').toLowerCase();
-      const patMatch = apiPats.length ? apiPats.some((p) => u.includes(p)) : false;
-      return e.method === 'POST' || e.isStream || patMatch;
+    if (!text) {
+      const baseAsstSelector = '[data-message-author-role="assistant"], [data-role="assistant"], [data-testid*="assistant" i]';
+      const assistantSelector = adapterAsst.length ? adapterAsst.join(', ') + ', ' + baseAsstSelector : baseAsstSelector;
+      let rawAsstNodes = [];
+      try { rawAsstNodes = Array.from(searchRoot.querySelectorAll(assistantSelector)); } catch (_) { rawAsstNodes = Array.from(searchRoot.querySelectorAll(baseAsstSelector)); }
+      const assistantNodes = rawAsstNodes.filter((el) => !isExcluded(el) && !isMessageWrapper(el) && isVisibleEl(el, 20, 12));
+      const collected = [];
+      for (let i = 0; i < assistantNodes.length; i++) {
+        const node = assistantNodes[i];
+        if (userTurnBox && isBeforeUserAnchor(node)) continue;
+        if (assistantNodes.some((other) => other !== node && other.contains(node))) continue;
+        const t = cleanChrome(getNodeText(node));
+        if (!t || isPromptOverlap(t)) continue;
+        collected.push(t);
+      }
+      if (collected.length > 0) {
+        text = userTurnBox ? collected.join('\n\n') : collected[collected.length - 1];
+      }
+    }
+
+    if (!text) {
+      for (let i = allNodes.length - 1; i >= 0; i--) {
+        const el = allNodes[i];
+        if (userTurnBox && isBeforeUserAnchor(el)) continue;
+        if (el.getAttribute('data-message-author-role') === 'user' || el.getAttribute('data-role') === 'user') continue;
+        const rawT = getNodeText(el);
+        if (!rawT || rawT.includes('[阶段要求]') || rawT.includes(endMarker) || (qNeedle && rawT.includes(qNeedle))) continue;
+        const t = cleanChrome(rawT);
+        if (!t || isPromptOverlap(t)) continue;
+        text = t;
+        break;
+      }
+    }
+
+    return JSON.stringify({
+      ok: Boolean(text),
+      text: text || '',
+      error: text ? '' : '未在当前页面检测到可同步的助手回复',
     });
-    const poolNet = relevantNet.filter((e) => e.method === 'POST' || e.isStream);
-    const activePostStream = poolNet.some((e) => (e.method === 'POST' || (e.isStream && !isAsyncAgent)) && !e.done && (now - (e.updatedAt || e.startedAt || 0)) < 12000);
-    const activePushStream = !isAsyncAgent && Boolean(netState && ((netState.wsLastAt > (job.netStartAt || 0) && now - netState.wsLastAt < 4000) || (netState.esLastAt > (job.netStartAt || 0) && now - netState.esLastAt < 4000)));
-    const netGenerating = activePostStream || activePushStream;
-
-    let candidateText = '';
-    if (!stillUnsent) {
-      if (userTurnBox && (hasNewUserTurn || userIdx >= 0 || !isOldBaselineText(getNodeText(userTurnBox)))) {
-        const afterDom = cleanChrome(extractAfterUserTurn(searchRoot, userTurnBox));
-        if (afterDom && !isSameAsPrompt(afterDom)) {
-          candidateText = afterDom;
-        }
-      }
-
-      if (!candidateText && (userTurnBox || hasNewUserTurn || allNodes.length > (job.baselineCount || 0))) {
-        const baseAsstSelector = '[data-message-author-role="assistant"], [data-role="assistant"], [data-testid*="assistant" i]';
-        const assistantSelector = adapterAsst.length ? adapterAsst.join(', ') + ', ' + baseAsstSelector : baseAsstSelector;
-        let rawAsstNodes = [];
-        try { rawAsstNodes = Array.from(searchRoot.querySelectorAll(assistantSelector)); } catch (_) { rawAsstNodes = Array.from(searchRoot.querySelectorAll(baseAsstSelector)); }
-        const assistantNodes = rawAsstNodes.filter((el) => !isExcluded(el) && !isMessageWrapper(el) && isVisibleEl(el, 20, 12));
-        const allowBaselineRepeat = Boolean(userTurnBox && (userIdx >= 0 || hasNewUserTurn));
-        const collectedAsst = [];
-        for (let i = 0; i < assistantNodes.length; i++) {
-          const node = assistantNodes[i];
-          if (isBeforeUserAnchor(node)) continue;
-          if (!userTurnBox && job.baselineEls && job.baselineEls.has(node)) continue;
-          if (assistantNodes.some((other) => other !== node && other.contains(node))) continue;
-          const t = cleanChrome(getNodeText(node));
-          if (!t || isSameAsPrompt(t) || (!allowBaselineRepeat && isOldBaselineText(t))) continue;
-          collectedAsst.push(t);
-        }
-        if (collectedAsst.length > 0) {
-          candidateText = userTurnBox ? collectedAsst.join('\n\n') : collectedAsst[collectedAsst.length - 1];
-        }
-      }
-
-      if (!candidateText && !userTurnBox && (hasNewUserTurn || allNodes.length > (job.baselineCount || 0))) {
-        for (let i = allNodes.length - 1; i >= 0; i--) {
-          if (i < (job.baselineCount || 0)) continue;
-          const el = allNodes[i];
-          if (job.baselineEls && job.baselineEls.has(el)) continue;
-          if (el.getAttribute('data-message-author-role') === 'user' || el.getAttribute('data-role') === 'user') continue;
-          if (job.baselineSet && job.baselineSet.has(getNodeText(el).slice(0, 220))) continue;
-          let t = getNodeText(el);
-          if (!t) continue;
-          if (t.startsWith(promptNorm)) t = t.slice(promptNorm.length).trim();
-          t = cleanChrome(t);
-          if (!t || isSameAsPrompt(t) || isOldBaselineText(t)) continue;
-          candidateText = t;
-          break;
-        }
-      }
-
-      if (!candidateText) {
-        let sliceStart = -1;
-        if (hasNewMarker && markerIdx >= 0) {
-          sliceStart = markerIdx + endMarker.length;
-        } else if (hasNewPromptByTail && markerIdx >= 0 && markerIdx >= needleIdx) {
-          sliceStart = markerIdx + endMarker.length;
-        } else if ((hasNewNeedle || needleIdx >= Math.max(0, (job.baselineMainText || '').length - 120)) && needleIdx >= 0) {
-          sliceStart = needleIdx + job.promptNeedle.length;
-        }
-        if (sliceStart >= 0) {
-          const after = cleanChrome(fullMain.slice(sliceStart));
-          if (after && !isSameAsPrompt(after)) candidateText = after;
-        }
-      }
-
-      if (!candidateText) {
-        for (let i = poolNet.length - 1; i >= 0; i--) {
-          const nt = cleanChrome((poolNet[i].text || '').trim());
-          if (nt && !isSameAsPrompt(nt) && !isOldBaselineText(nt)) {
-            candidateText = nt;
-            break;
-          }
-        }
-        if (!candidateText && netState && netState.esLastAt > (job.netStartAt || 0) && netState.esText) {
-          const est = cleanChrome(netState.esText);
-          if (est && !isSameAsPrompt(est) && !isOldBaselineText(est)) candidateText = est;
-        }
-      }
-    }
-
-    const cleanupJob = () => {
-      if (job && job.observer) {
-        try { job.observer.disconnect(); } catch (_) {}
-      }
-      delete window.__maamGroupJobs[jobId];
-    };
-
-    if (statusBusy) {
-      domGenerating = true;
-    }
-    const isGenerating = domGenerating || netGenerating;
-
-    if (candidateText && candidateText !== job.lastText) {
-      job.lastText = candidateText;
-      job.lastChangedAt = now;
-    }
-
-    const stableMs = now - (job.lastChangedAt || job.startedAt);
-    const elapsedMs = now - job.startedAt;
-    const recentDomMut = Boolean(job.lastDomMutAt && (now - job.lastDomMutAt) < 1200);
-    const effectiveGenerating = isGenerating || recentDomMut;
-
-    if (job.lastText) {
-      const neededStableMs = isAsyncAgent
-        ? (job.lastText.length < 24 ? 2200 : 1800)
-        : (job.lastText.length < 24 ? 1800 : 1400);
-      if (
-        (!effectiveGenerating && stableMs >= neededStableMs)
-        || (!isGenerating && stableMs >= 4200)
-        || (!domGenerating && !recentDomMut && stableMs >= 4800)
-        || stableMs >= 22000
-      ) {
-        cleanupJob();
-        return JSON.stringify({ state: 'done', text: job.lastText });
-      }
-      return JSON.stringify({ state: 'streaming', text: job.lastText, transient: false });
-    }
-
-    const okPost = [...relevantNet].reverse().find((e) => e.method === 'POST' && e.status >= 200 && e.status < 300);
-    const fatalChatNet = [...relevantNet].reverse().find((e) => e.status === 401 || e.status === 403 || e.status === 429 || (e.method === 'POST' && e.status >= 400));
-    if (!isGenerating && fatalChatNet && (now - (fatalChatNet.updatedAt || fatalChatNet.startedAt)) >= 2500) {
-      cleanupJob();
-      const msg = (fatalChatNet.status === 401 || fatalChatNet.status === 403)
-        ? ('目标站点鉴权失效（HTTP ' + fatalChatNet.status + '），请前往该账号页面重新登录')
-        : fatalChatNet.status === 429
-          ? '触发目标站点限流（HTTP 429），请稍后点击重试'
-          : ('目标接口报错（HTTP ' + fatalChatNet.status + (fatalChatNet.errorSnippet ? '：' + fatalChatNet.errorSnippet : '') + '）');
-      return JSON.stringify({ state: 'error', text: '', error: msg });
-    }
-
-    const stuckStillSending = Boolean(progressText && progressText.includes('仍在发送中') && elapsedMs >= 15000);
-    if (stuckStillSending) {
-      cleanupJob();
-      return JSON.stringify({ state: 'stalled_retry', text: '' });
-    }
-
-    if (isAsyncAgent && !job.lastText && !progressText && sentIntoDom && elapsedMs >= 7000) {
-      progressText = okPost
-        ? ('服务端已接收（HTTP ' + okPost.status + '），等待异步回复…')
-        : '消息已发出，等待服务端响应…';
-    }
-
-    const timedOut = stillUnsent
-      ? (elapsedMs >= 20000)
-      : isAsyncAgent
-        ? (elapsedMs >= 95000)
-        : (!isGenerating && elapsedMs >= 65000);
-    if (timedOut) {
-      cleanupJob();
-      const waitedSec = Math.round(elapsedMs / 1000);
-      const msg = stillUnsent
-        ? '消息已填入但未能自动触发发送，请前往该账号页面检查输入框'
-        : okPost
-          ? ('服务端已接收消息（HTTP ' + okPost.status + '，已等待 ' + waitedSec + ' 秒），但未返回回复（可能服务端静默跳过或长连接中断），可前往查看或手动重试')
-          : (!sentIntoDom && !relevantNet.some((e) => e.method === 'POST'))
-            ? '未检测到发送请求发出，请检查该账号登录或网络状态后重试'
-            : ('发送后未检测到新回复（已等待 ' + waitedSec + ' 秒），可前往查看或手动重试');
-      return JSON.stringify({ state: 'error', text: '', error: msg });
-    }
-
-    return JSON.stringify({ state: 'streaming', text: progressText, transient: Boolean(progressText) });
   } catch (err) {
-    return JSON.stringify({ state: 'error', text: '', error: String(err) });
+    return JSON.stringify({ ok: false, text: '', error: String(err) });
   }
 })()"#
     .replace("__ADAPTER__", &adapter_json)
-    .replace("__JOB_ID__", &job_json)
+    .replace("__QUERY__", &query_json)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -3256,25 +4162,25 @@ impl SessionManager {
       }
     }
 
-    #[cfg(target_os = "android")]
+    #[cfg(mobile)]
     {
       let mgr = Arc::clone(self);
       let app_clone = app.clone();
       let channel = tauri::ipc::Channel::new(move |body| {
         if let tauri::ipc::InvokeResponseBody::Json(raw_json) = body {
           if let Ok(evt) =
-            serde_json::from_str::<crate::platform::android::AndroidSessionEvent>(&raw_json)
+            serde_json::from_str::<crate::platform::mobile::MobileSessionEvent>(&raw_json)
           {
             let mgr_inner = Arc::clone(&mgr);
             let app_inner = app_clone.clone();
             tauri::async_runtime::spawn(async move {
-              mgr_inner.handle_android_event(&app_inner, evt).await;
+              mgr_inner.handle_mobile_event(&app_inner, evt).await;
             });
           }
         }
         Ok(())
       });
-      let _ = crate::platform::android::subscribe_events(app, channel).await;
+      let _ = crate::platform::mobile::subscribe_events(app, channel).await;
     }
 
     self.retry_pending_cleanups(app).await;
@@ -3381,11 +4287,11 @@ impl SessionManager {
       };
       platform::delete_desktop_profile(app, &app_data_dir, uuid_str).await
     }
-    #[cfg(target_os = "android")]
+    #[cfg(mobile)]
     {
-      crate::platform::android::delete_profile(app, uuid_str).await
+      crate::platform::mobile::delete_profile(app, uuid_str).await
     }
-    #[cfg(all(not(desktop), not(target_os = "android")))]
+    #[cfg(all(not(desktop), not(mobile)))]
     {
       let _ = (app, uuid_str);
       Ok(())
@@ -3526,10 +4432,10 @@ impl SessionManager {
           }
         }
       }
-      #[cfg(target_os = "android")]
+      #[cfg(mobile)]
       {
         let _ = old_slot;
-        let _ = crate::platform::android::close_active_session(app, next_seq).await;
+        let _ = crate::platform::mobile::close_active_session(app, next_seq).await;
       }
     }
     #[cfg(desktop)]
@@ -3789,6 +4695,7 @@ impl SessionManager {
     raw_provider: &str,
     raw_alias: &str,
     raw_proxy_url: Option<&str>,
+    raw_timezone: Option<&str>,
     raw_cookies: Option<&str>,
   ) -> Result<ManagerSnapshot, String> {
     let provider_id = ProviderId::parse(raw_provider).ok_or_else(|| "无效的服务标识".to_string())?;
@@ -3800,6 +4707,7 @@ impl SessionManager {
     };
     let proxy_url = platform::parse_account_proxy(raw_proxy_url.unwrap_or_default())?
       .map(|url| platform::format_account_proxy(&url));
+    let timezone = platform::parse_account_timezone(raw_timezone.unwrap_or_default())?;
     let proxy_raw = proxy_url.clone().unwrap_or_default();
 
     let cookie_raw_opt = raw_cookies
@@ -3860,6 +4768,7 @@ impl SessionManager {
         created_at_ms: now_ms(),
         auto_alias,
         proxy_url,
+        timezone,
         avatar_url: None,
         quota_text: None,
         quota_percent: None,
@@ -3944,14 +4853,19 @@ impl SessionManager {
     raw_uuid: &str,
     raw_alias: &str,
     raw_proxy_url: Option<&str>,
+    raw_timezone: Option<&str>,
   ) -> Result<ManagerSnapshot, String> {
     let provider_id = ProviderId::parse(raw_provider).ok_or_else(|| "无效的服务标识".to_string())?;
     let uuid = normalize_uuid(raw_uuid).ok_or_else(|| "无效的账号 UUID".to_string())?;
     let alias = raw_alias.trim();
-    if alias.is_empty() && (raw_proxy_url.is_none() || !platform::SUPPORTS_ACCOUNT_PROXY) {
+    if alias.is_empty()
+      && raw_timezone.is_none()
+      && (raw_proxy_url.is_none() || !platform::SUPPORTS_ACCOUNT_PROXY)
+    {
       return Err("账号别名不能为空".to_string());
     }
     let proxy_update = raw_proxy_url.map(platform::parse_account_proxy).transpose()?;
+    let timezone_update = raw_timezone.map(platform::parse_account_timezone).transpose()?;
 
     let mut locked = self.inner.lock().await;
     let spec = resolve_provider(&provider_id)
@@ -3970,9 +4884,13 @@ impl SessionManager {
     if let Some(proxy) = proxy_update {
       updated.proxy_url = proxy.map(|url| platform::format_account_proxy(&url));
     }
+    if let Some(tz) = timezone_update {
+      updated.timezone = tz;
+    }
     let proxy_changed = updated.proxy_url != locked.store.accounts[index].proxy_url;
-    if proxy_changed && !locked.conflicts.is_empty() {
-      return Err("请先处理 UUID 归属冲突后再修改代理".to_string());
+    let timezone_changed = updated.timezone != locked.store.accounts[index].timezone;
+    if (proxy_changed || timezone_changed) && !locked.conflicts.is_empty() {
+      return Err("请先处理 UUID 归属冲突后再修改代理或时区".to_string());
     }
     if updated == locked.store.accounts[index] {
       return Ok(Self::snapshot_from_locked(&locked));
@@ -3983,8 +4901,8 @@ impl SessionManager {
       return Err(err);
     }
 
-    #[cfg(any(target_os = "macos", windows))]
-    if proxy_changed {
+    #[cfg(desktop)]
+    if proxy_changed || timezone_changed {
       let key = AccountKey {
         provider_id: provider_id.clone(),
         uuid: uuid.clone(),
@@ -4015,9 +4933,9 @@ impl SessionManager {
         if let Some(main_win) = app.get_window("main") {
           let _ = main_win.set_title(&title);
         }
-        #[cfg(target_os = "android")]
+        #[cfg(mobile)]
         {
-          let _ = crate::platform::android::update_account_title(app, slot.switch_seq, &title).await;
+          let _ = crate::platform::mobile::update_account_title(app, slot.switch_seq, &title).await;
         }
       }
     }
@@ -4071,12 +4989,12 @@ impl SessionManager {
       self.apply_cookie_expiry_summary(app, &key, summary).await;
       platform::write_cookie_clipboard(app, header).await
     }
-    #[cfg(target_os = "android")]
+    #[cfg(mobile)]
     {
       drop(locked);
-      platform::android::copy_profile_cookie(app, &key.uuid, url.as_str()).await
+      platform::mobile::copy_profile_cookie(app, &key.uuid, url.as_str()).await
     }
-    #[cfg(not(any(target_os = "macos", windows, target_os = "android")))]
+    #[cfg(not(any(target_os = "macos", windows, mobile)))]
     {
       drop(locked);
       let _ = (app, url);
@@ -4265,18 +5183,18 @@ impl SessionManager {
       apply_res
     }
 
-    #[cfg(target_os = "android")]
+    #[cfg(mobile)]
     {
       let _ = (self, proxy_raw, profile_dir);
       let headers = specs
         .iter()
         .map(platform::imported_cookie_to_set_cookie_header)
         .collect::<Vec<_>>();
-      platform::android::import_profile_cookies(app, &key.uuid, url.as_str(), headers).await?;
+      platform::mobile::import_profile_cookies(app, &key.uuid, url.as_str(), headers).await?;
       Ok(None)
     }
 
-    #[cfg(not(any(desktop, target_os = "android")))]
+    #[cfg(not(any(desktop, mobile)))]
     {
       let _ = (self, app, key, url, proxy_raw, profile_dir, specs);
       Err("当前平台不支持导入 Cookie".to_string())
@@ -4397,7 +5315,7 @@ impl SessionManager {
       Ok(snap)
     }
 
-    #[cfg(target_os = "android")]
+    #[cfg(mobile)]
     {
       let _ = win_cold_summary;
       let snap = {
@@ -4422,7 +5340,7 @@ impl SessionManager {
       Ok(snap)
     }
 
-    #[cfg(not(any(desktop, target_os = "android")))]
+    #[cfg(not(any(desktop, mobile)))]
     {
       let _ = (win_cold_summary, cookie_hint);
       Err("当前平台不支持导入 Cookie".to_string())
@@ -4889,9 +5807,9 @@ impl SessionManager {
       let _ = app;
       platform::open_external_browser(&homepage)?;
     }
-    #[cfg(target_os = "android")]
+    #[cfg(mobile)]
     {
-      crate::platform::android::open_external_url(app, &homepage).await?;
+      crate::platform::mobile::open_external_url(app, &homepage).await?;
     }
 
     Ok(self.get_snapshot().await)
@@ -5380,7 +6298,7 @@ impl SessionManager {
       }
     }
 
-    #[cfg(target_os = "android")]
+    #[cfg(mobile)]
     {
       let view_instance_id = self.view_counter.fetch_add(1, Ordering::SeqCst);
       let account_record = {
@@ -5418,7 +6336,7 @@ impl SessionManager {
       };
 
       self
-        .open_android_session(app, account_record, next_seq, view_instance_id, is_cold_start)
+        .open_mobile_session(app, account_record, next_seq, view_instance_id, is_cold_start)
         .await
     }
   }
@@ -5537,6 +6455,7 @@ impl SessionManager {
     parsed_uuid: Uuid,
     profile_dir: &std::path::Path,
     proxy_url: Option<&Url>,
+    timezone: Option<&str>,
     webview_label: &str,
     view_instance_id: u64,
     allow_blank: Arc<AtomicBool>,
@@ -5574,6 +6493,7 @@ impl SessionManager {
     let app_for_popup_dl = app.clone();
     let pending_for_popup_dl = Arc::clone(&pending_downloads);
 
+    #[allow(unused_mut)]
     let mut builder = tauri::webview::WebviewBuilder::new(
       webview_label,
       tauri::WebviewUrl::External("about:blank".parse().expect("valid blank url")),
@@ -5590,7 +6510,16 @@ impl SessionManager {
     ))
     .initialization_script(LOGIN_CAPTURE_INIT_JS)
     .initialization_script(BACKGROUND_RAF_INIT_JS)
-    .initialization_script(crate::site_adapters::NET_HOOK_INIT_JS)
+    .initialization_script(crate::site_adapters::NET_HOOK_INIT_JS);
+
+    let timezone_js = timezone.map(platform::build_timezone_override_init_js);
+    #[cfg(not(windows))]
+    if let Some(ref tz_script) = timezone_js {
+      builder = builder.initialization_script(tz_script);
+    }
+    let popup_timezone_js = timezone_js;
+
+    let mut builder = builder
     .on_navigation(move |url| {
       if !alive_nav.load(Ordering::SeqCst) {
         return false;
@@ -5658,6 +6587,7 @@ impl SessionManager {
       let popup_mgr_dl = Arc::clone(&mgr_for_popup_dl);
       let popup_app_dl = app_for_popup_dl.clone();
       let popup_pending_dl = Arc::clone(&pending_for_popup_dl);
+      let popup_tz_js = popup_timezone_js.clone();
 
       let popup_builder = tauri::WebviewWindowBuilder::new(
         &app_for_popup,
@@ -5665,7 +6595,13 @@ impl SessionManager {
         tauri::WebviewUrl::External("about:blank".parse().expect("valid blank url")),
       )
       .window_features(features)
-      .initialization_script(LOGIN_CAPTURE_INIT_JS)
+      .initialization_script(LOGIN_CAPTURE_INIT_JS);
+      let popup_builder = if let Some(ref tz_script) = popup_tz_js {
+        popup_builder.initialization_script(tz_script)
+      } else {
+        popup_builder
+      };
+      let popup_builder = popup_builder
       .title(&popup_title)
       .on_download(move |_wv, event| {
         popup_mgr_dl.handle_desktop_download_event(&popup_app_dl, &popup_pending_dl, event)
@@ -5845,7 +6781,7 @@ impl SessionManager {
     let retry_until = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
 
     loop {
-      let (proxy_url, provider_spec) = {
+      let (proxy_url, timezone, provider_spec) = {
         let locked = self.inner.lock().await;
         if !Self::is_view_instance_valid(&locked, key, view_instance_id) {
           return Ok(());
@@ -5860,6 +6796,7 @@ impl SessionManager {
           .ok_or_else(|| "账号不存在，已阻止加载".to_string())?;
         (
           platform::parse_account_proxy(account.proxy_url.as_deref().unwrap_or_default())?,
+          account.timezone.clone(),
           spec,
         )
       };
@@ -5870,6 +6807,7 @@ impl SessionManager {
         parsed_uuid,
         profile_dir,
         proxy_url.as_ref(),
+        timezone.as_deref(),
         webview_label,
         view_instance_id,
         Arc::new(AtomicBool::new(true)),
@@ -5923,7 +6861,7 @@ impl SessionManager {
     load_gen: &Arc<AtomicU64>,
   ) -> Result<(), String> {
     let _ = load_gen;
-    let (proxy_url, uuid, profile_dir, entry_url_str) = {
+    let (proxy_url, timezone, uuid, profile_dir, entry_url_str) = {
       let locked = self.inner.lock().await;
       if !Self::is_view_instance_valid(&locked, key, view_instance_id) {
         drop(locked);
@@ -5939,13 +6877,18 @@ impl SessionManager {
         .find(|account| account.provider_id == key.provider_id && account.uuid == key.uuid)
         .ok_or_else(|| "账号不存在，已阻止加载".to_string())?;
       let proxy_url = platform::parse_account_proxy(account.proxy_url.as_deref().unwrap_or_default())?;
+      let timezone = account.timezone.clone();
       let uuid = Uuid::parse_str(&key.uuid).map_err(|err| format!("非法 UUID: {err}"))?;
       let profile_dir = locked.app_data_dir.join("profiles").join(&key.uuid);
-      (proxy_url, uuid, profile_dir, spec.info.entry_url)
+      (proxy_url, timezone, uuid, profile_dir, spec.info.entry_url)
     };
     let uses_proxy = proxy_url.is_some();
 
     platform::verify_desktop_profile_binding(webview, uuid, &profile_dir).await?;
+    #[cfg(windows)]
+    platform::configure_windows_timezone(webview, timezone.as_deref()).await?;
+    #[cfg(not(windows))]
+    let _ = timezone;
     #[cfg(target_os = "macos")]
     platform::configure_desktop_proxy(webview, proxy_url).await?;
     #[cfg(target_os = "macos")]
@@ -6625,8 +7568,8 @@ impl SessionManager {
     }
   }
 
-  #[cfg(target_os = "android")]
-  async fn open_android_session(
+  #[cfg(mobile)]
+  async fn open_mobile_session(
     self: &Arc<Self>,
     app: &AppHandle,
     account: AccountRecord,
@@ -6634,21 +7577,22 @@ impl SessionManager {
     view_instance_id: u64,
     is_cold_start: bool,
   ) -> Result<ManagerSnapshot, String> {
-    let caps = match crate::platform::android::check_capabilities(app).await {
+    let caps = match crate::platform::mobile::check_capabilities(app).await {
       Ok(c) => c,
       Err(err) => {
         let mut locked = self.inner.lock().await;
-        locked.notice = Some(format!("检测 Android WebView 多资料能力失败: {err}"));
+        locked.notice = Some(format!("检测移动端 WebView 独立容器能力失败: {err}"));
         return Ok(Self::snapshot_from_locked(&locked));
       }
     };
 
     if !caps.multi_profile_supported {
       let mut locked = self.inner.lock().await;
-      locked.notice = Some(
-        "当前设备系统 WebView 不支持 MULTI_PROFILE 多资料隔离，请先更新 Android System WebView 后重试"
-          .to_string(),
-      );
+      #[cfg(target_os = "ios")]
+      let msg = "当前系统 WKWebView 不支持独立会话隔离（需 iOS 17+）";
+      #[cfg(not(target_os = "ios"))]
+      let msg = "当前设备系统 WebView 不支持 MULTI_PROFILE 多资料隔离，请先更新 Android System WebView 后重试";
+      locked.notice = Some(msg.to_string());
       return Ok(Self::snapshot_from_locked(&locked));
     }
 
@@ -6679,7 +7623,11 @@ impl SessionManager {
       spec
     };
 
-    let payload = crate::platform::android::OpenAndroidAccountPayload {
+    let timezone_init_script = account
+      .timezone
+      .as_deref()
+      .map(platform::build_timezone_override_init_js);
+    let payload = crate::platform::mobile::OpenMobileAccountPayload {
       provider_id: account.provider_id.as_str().to_string(),
       provider_name: spec.info.short_name,
       uuid: account.uuid.clone(),
@@ -6687,16 +7635,19 @@ impl SessionManager {
       auto_alias: account.auto_alias,
       entry_url: spec.info.entry_url,
       allowed_hosts: spec.allowed_hosts,
+      proxy_url: account.proxy_url.clone(),
+      timezone: account.timezone.clone(),
+      timezone_init_script,
       switch_seq: expected_seq,
       view_instance_id,
       is_cold_start,
     };
 
-    if let Err(err) = crate::platform::android::open_account_session(app, payload).await {
+    if let Err(err) = crate::platform::mobile::open_account_session(app, payload).await {
       let mut locked = self.inner.lock().await;
       if self.current_seq.load(Ordering::SeqCst) == expected_seq {
         locked.active_slot = None;
-        locked.notice = Some(format!("打开 Android 独立会话页面失败: {err}"));
+        locked.notice = Some(format!("打开独立会话页面失败: {err}"));
       }
       return Ok(Self::snapshot_from_locked(&locked));
     }
@@ -6704,15 +7655,15 @@ impl SessionManager {
     Ok(self.get_snapshot().await)
   }
 
-  #[cfg(target_os = "android")]
-  async fn handle_android_event(
+  #[cfg(mobile)]
+  async fn handle_mobile_event(
     self: &Arc<Self>,
     app: &AppHandle,
-    event: crate::platform::android::AndroidSessionEvent,
+    event: crate::platform::mobile::MobileSessionEvent,
   ) {
-    use crate::platform::android::AndroidSessionEvent;
+    use crate::platform::mobile::MobileSessionEvent;
     match event {
-      AndroidSessionEvent::PageCommitVisible {
+      MobileSessionEvent::PageCommitVisible {
         provider_id,
         uuid,
         switch_seq,
@@ -6729,7 +7680,7 @@ impl SessionManager {
           return;
         };
         self
-          .commit_android_session(
+          .commit_mobile_session(
             app,
             AccountKey {
               provider_id: pid,
@@ -6741,7 +7692,7 @@ impl SessionManager {
           )
           .await;
       }
-      AndroidSessionEvent::IdentityDetected {
+      MobileSessionEvent::IdentityDetected {
         provider_id,
         uuid,
         switch_seq,
@@ -6779,7 +7730,7 @@ impl SessionManager {
           )
           .await;
       }
-      AndroidSessionEvent::SessionFailed {
+      MobileSessionEvent::SessionFailed {
         switch_seq,
         view_instance_id,
         reason,
@@ -6803,7 +7754,7 @@ impl SessionManager {
         };
         self.emit_snapshot(app, &snap);
       }
-      AndroidSessionEvent::ActivityClosed {
+      MobileSessionEvent::ActivityClosed {
         switch_seq,
         view_instance_id,
       } => {
@@ -6823,7 +7774,7 @@ impl SessionManager {
         };
         self.emit_snapshot(app, &snap);
       }
-      AndroidSessionEvent::ExternalAuthUnavailable {
+      MobileSessionEvent::ExternalAuthUnavailable {
         switch_seq,
         view_instance_id,
         reason,
@@ -6844,7 +7795,7 @@ impl SessionManager {
         };
         self.emit_snapshot(app, &snap);
       }
-      AndroidSessionEvent::RecreateRequested { previous_switch_seq } => {
+      MobileSessionEvent::RecreateRequested { previous_switch_seq } => {
         let fallback = {
           let mut locked = self.inner.lock().await;
           if self.current_seq.load(Ordering::SeqCst) == previous_switch_seq {
@@ -6859,7 +7810,7 @@ impl SessionManager {
           self.emit_snapshot(app, &snap);
         }
       }
-      AndroidSessionEvent::UpdateProgress {
+      MobileSessionEvent::UpdateProgress {
         stage,
         downloaded,
         total,
@@ -6877,7 +7828,7 @@ impl SessionManager {
           },
         );
       }
-      AndroidSessionEvent::SessionLoggedOut {
+      MobileSessionEvent::SessionLoggedOut {
         provider_id,
         uuid,
         switch_seq,
@@ -6904,8 +7855,8 @@ impl SessionManager {
     }
   }
 
-  #[cfg(target_os = "android")]
-  async fn commit_android_session(
+  #[cfg(mobile)]
+  async fn commit_mobile_session(
     &self,
     app: &AppHandle,
     key: AccountKey,
@@ -6968,7 +7919,7 @@ impl SessionManager {
           slot.committed = true;
         }
         let title = format!("{} · {}", spec.info.short_name, acc.alias);
-        let _ = crate::platform::android::update_account_title(app, expected_seq, &title).await;
+        let _ = crate::platform::mobile::update_account_title(app, expected_seq, &title).await;
         Some(Self::snapshot_from_locked(&locked))
       }
     };
@@ -7951,14 +8902,14 @@ impl SessionManager {
       if let Some(main_win) = app.get_window("main") {
         let _ = main_win.set_title(&title);
       }
-      #[cfg(target_os = "android")]
+      #[cfg(mobile)]
       {
         let seq_opt = {
           let locked = self.inner.lock().await;
           locked.active_slot.as_ref().map(|s| s.switch_seq)
         };
         if let Some(seq) = seq_opt {
-          let _ = crate::platform::android::update_account_title(app, seq, &title).await;
+          let _ = crate::platform::mobile::update_account_title(app, seq, &title).await;
         }
       }
     }
@@ -9092,10 +10043,17 @@ impl SessionManager {
         })
         .collect()
     } else if !requested_keys.is_empty() {
-      eligible_members
+      let mut seen = Vec::new();
+      requested_keys
         .iter()
-        .filter(|(ek, _)| requested_keys.contains(ek))
-        .cloned()
+        .filter_map(|rk| {
+          if seen.contains(&rk) {
+            return None;
+          }
+          let found = eligible_members.iter().find(|(ek, _)| ek == rk).cloned()?;
+          seen.push(rk);
+          Some(found)
+        })
         .collect()
     } else {
       Vec::new()
@@ -9344,6 +10302,8 @@ impl SessionManager {
                   &uid,
                   &raw_content,
                   stage_label.as_deref(),
+                  None,
+                  None,
                   0,
                   auto_ch.as_ref(),
                 )
@@ -9368,6 +10328,8 @@ impl SessionManager {
     user_msg_id: &str,
     raw_user_content: &str,
     stage_instruction: Option<&str>,
+    fallback_stage_instruction: Option<&str>,
+    attachment: Option<&GroupAttachment>,
     hop_depth: u8,
     auto_channel: Option<&ProviderId>,
   ) -> Option<(AccountKey, String)> {
@@ -9380,6 +10342,8 @@ impl SessionManager {
         user_msg_id,
         raw_user_content,
         stage_instruction,
+        fallback_stage_instruction,
+        attachment,
         hop_depth,
       )
       .await
@@ -9470,6 +10434,8 @@ impl SessionManager {
           user_msg_id,
           raw_user_content,
           stage_instruction,
+          fallback_stage_instruction,
+          attachment,
           hop_depth,
         )
         .await
@@ -9609,12 +10575,154 @@ impl SessionManager {
             &user_msg_id,
             &raw_content,
             stage_label.as_deref(),
+            None,
+            None,
             hop_depth,
             auto_ch.as_ref(),
           )
           .await;
       });
 
+      Ok(snap)
+    }
+  }
+
+  pub async fn sync_group_message_reply(
+    self: &Arc<Self>,
+    app: &AppHandle,
+    group_id: String,
+    msg_id: String,
+  ) -> Result<ManagerSnapshot, String> {
+    #[cfg(not(desktop))]
+    {
+      let _ = (app, group_id, msg_id);
+      Err("群聊功能暂仅支持桌面端".to_string())
+    }
+
+    #[cfg(desktop)]
+    {
+      let (member_key, raw_user_content, app_data_dir) = {
+        let locked = self.inner.lock().await;
+        if !locked.conflicts.is_empty() {
+          return Err("存在 UUID 归属冲突，请先处理冲突后再同步".to_string());
+        }
+        let g_idx = locked
+          .store
+          .group_chats
+          .iter()
+          .position(|g| g.id == group_id)
+          .ok_or_else(|| "未找到对应的群聊".to_string())?;
+        let msg_idx = locked.store.group_chats[g_idx]
+          .messages
+          .iter()
+          .position(|m| m.id == msg_id && m.role == "assistant")
+          .ok_or_else(|| "未找到可同步的回复消息".to_string())?;
+
+        let target_msg = &locked.store.group_chats[g_idx].messages[msg_idx];
+        if matches!(
+          target_msg.status,
+          GroupReplyStatus::Queued | GroupReplyStatus::Sending | GroupReplyStatus::Streaming
+        ) {
+          return Err("该消息仍在生成中，请稍候".to_string());
+        }
+        let member_key = target_msg
+          .sender
+          .clone()
+          .ok_or_else(|| "找不到该消息对应的成员".to_string())?;
+        if member_key.provider_id.is_external() {
+          return Err("API/CLI 成员不支持从页面同步，请使用重试".to_string());
+        }
+        let member_available = locked
+          .store
+          .accounts
+          .iter()
+          .find(|a| a.provider_id == member_key.provider_id && a.uuid == member_key.uuid)
+          .is_some_and(|acc| {
+            acc.auth_state != AuthState::LoggedOut
+              && resolve_provider(&acc.provider_id).is_some_and(|s| s.info.enabled)
+          });
+        if !member_available {
+          return Err("该成员当前未登录或配置不可用，请先检查成员状态".to_string());
+        }
+        let raw_user_content = locked.store.group_chats[g_idx].messages[..msg_idx]
+          .iter()
+          .rev()
+          .find(|m| m.role == "user" && !m.content.trim().is_empty())
+          .map(|m| m.content.clone())
+          .unwrap_or_default();
+
+        (member_key, raw_user_content, locked.app_data_dir.clone())
+      };
+
+      let (wv, _) = self
+        .ensure_group_member_webview_ready(app, &member_key)
+        .await?;
+      Self::wake_and_settle_group_webview(&wv).await;
+
+      let host = wv
+        .url()
+        .ok()
+        .and_then(|u| u.host_str().map(|s| s.to_ascii_lowercase()))
+        .unwrap_or_default();
+      let adapter = site_adapters::resolve_adapter_for_host(&app_data_dir, &host);
+      let is_hark = host.contains("hark.com");
+
+      let sync_js = build_group_sync_latest_js(&adapter, &raw_user_content);
+      let res = Self::eval_json_callback(&wv, &sync_js)
+        .await
+        .ok_or_else(|| "读取该账号页面内容超时，请前往原生页面确认后重试".to_string())?;
+      let raw_text = res
+        .get("text")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+      let mut final_text = Self::clean_extracted_reply_text(&raw_text);
+      if is_hark && !final_text.trim().is_empty() {
+        final_text = self
+          .extract_hark_expanded_card_if_needed(&wv, &final_text)
+          .await;
+        final_text = Self::clean_extracted_reply_text(&final_text);
+      }
+      if final_text.trim().is_empty() {
+        let err_hint = res
+          .get("error")
+          .and_then(|v| v.as_str())
+          .filter(|s| !s.trim().is_empty())
+          .unwrap_or("暂未从该账号原生页面读取到有效回复，请前往页面确认后再同步");
+        return Err(err_hint.to_string());
+      }
+
+      let snap = {
+        let mut locked = self.inner.lock().await;
+        let g = locked
+          .store
+          .group_chats
+          .iter_mut()
+          .find(|g| g.id == group_id)
+          .ok_or_else(|| "未找到对应的群聊".to_string())?;
+        let m = g
+          .messages
+          .iter_mut()
+          .find(|m| m.id == msg_id && m.role == "assistant")
+          .ok_or_else(|| "未找到可同步的回复消息".to_string())?;
+        let prev_status = m.status;
+        let prev_content = std::mem::replace(&mut m.content, final_text);
+        let prev_error = m.error.take();
+        m.status = GroupReplyStatus::Done;
+        if let Err(err) = save_store_atomic(&locked.store_path, &locked.store) {
+          if let Some(g_rev) = locked.store.group_chats.iter_mut().find(|g| g.id == group_id) {
+            if let Some(m_rev) = g_rev.messages.iter_mut().find(|m| m.id == msg_id) {
+              m_rev.status = prev_status;
+              m_rev.content = prev_content;
+              m_rev.error = prev_error;
+            }
+          }
+          return Err(err);
+        }
+        Self::snapshot_from_locked(&locked)
+      };
+
+      self.emit_snapshot(app, &snap);
       Ok(snap)
     }
   }
@@ -10305,11 +11413,16 @@ impl SessionManager {
       return Some((system_section, user_section, full_prompt, fingerprint));
     }
 
-    let cutoff = group
+    let mut cutoff = group
       .messages
       .iter()
       .position(|m| m.id == msg_id)
       .unwrap_or(group.messages.len());
+    if group.workflow_mode == GroupWorkflowMode::Review && stage_clean.is_some() {
+      if let Some(user_pos) = group.messages.iter().position(|m| m.id == user_msg_id) {
+        cutoff = cutoff.min(user_pos);
+      }
+    }
     let history_lines = group.messages[..cutoff]
       .iter()
       .rev()
@@ -10431,6 +11544,8 @@ impl SessionManager {
     user_msg_id: &str,
     raw_user_content: &str,
     stage_instruction: Option<&str>,
+    fallback_stage_instruction: Option<&str>,
+    attachment: Option<&GroupAttachment>,
     hop_depth: u8,
   ) -> Option<String> {
     let transport = {
@@ -10483,6 +11598,8 @@ impl SessionManager {
               user_msg_id,
               raw_user_content,
               stage_instruction,
+              fallback_stage_instruction,
+              attachment,
               hop_depth,
             )
             .await
@@ -10702,6 +11819,106 @@ impl SessionManager {
   }
 
   #[cfg(desktop)]
+  async fn try_attach_file_in_webview(
+    wv: &tauri::Webview,
+    adapter: &SiteAdapterConfig,
+    attachment: &GroupAttachment,
+  ) -> bool {
+    let attach_js = build_group_attach_file_js(adapter, attachment);
+    let dispatched = Self::eval_json_callback(wv, &attach_js)
+      .await
+      .and_then(|v| v.get("dispatched").and_then(|b| b.as_bool()))
+      .unwrap_or(false);
+    if !dispatched {
+      return false;
+    }
+    let check_js = build_group_check_attached_js(adapter, &attachment.filename);
+    for _ in 0..6 {
+      tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+      if Self::eval_json_callback(wv, &check_js)
+        .await
+        .and_then(|v| v.get("ready").and_then(|b| b.as_bool()))
+        .unwrap_or(false)
+      {
+        return true;
+      }
+    }
+    false
+  }
+
+  #[cfg(desktop)]
+  async fn extract_hark_expanded_card_if_needed(
+    &self,
+    wv: &tauri::Webview,
+    preview_text: &str,
+  ) -> String {
+    let click_js = build_hark_click_preview_card_js(preview_text);
+    let Some(click_res) = Self::eval_json_callback(wv, &click_js).await else {
+      return preview_text.to_string();
+    };
+    if !click_res
+      .get("clicked")
+      .and_then(|v| v.as_bool())
+      .unwrap_or(false)
+    {
+      return preview_text.to_string();
+    }
+
+    let intro_prefix = click_res
+      .get("introPrefix")
+      .and_then(|v| v.as_str())
+      .unwrap_or("")
+      .trim()
+      .to_string();
+    let card_preview = click_res
+      .get("cardPreview")
+      .and_then(|v| v.as_str())
+      .unwrap_or(preview_text)
+      .trim()
+      .to_string();
+
+    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+    let read_js = build_hark_read_expanded_js(&card_preview);
+    let mut best_expanded = String::new();
+    let mut stable_hits = 0usize;
+    for _ in 0..8 {
+      if let Some(res) = Self::eval_json_callback(wv, &read_js).await {
+        let cur = res
+          .get("text")
+          .and_then(|v| v.as_str())
+          .map(Self::clean_extracted_reply_text)
+          .unwrap_or_default();
+        if cur.chars().count() > card_preview.chars().count() + 24 {
+          if cur == best_expanded {
+            stable_hits += 1;
+            if stable_hits >= 1 {
+              break;
+            }
+          } else {
+            best_expanded = cur;
+            stable_hits = 0;
+          }
+        }
+      }
+      tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+    }
+
+    let _ = Self::eval_json_callback(wv, &build_hark_close_expanded_js()).await;
+    tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+
+    if best_expanded.chars().count() <= card_preview.chars().count() + 24 {
+      return preview_text.to_string();
+    }
+    if intro_prefix.is_empty() {
+      best_expanded
+    } else if best_expanded.starts_with(&intro_prefix) {
+      best_expanded
+    } else {
+      format!("{intro_prefix}\n\n{best_expanded}")
+    }
+  }
+
+  #[cfg(desktop)]
   #[allow(clippy::too_many_arguments)]
   async fn execute_webview_member_turn(
     self: &Arc<Self>,
@@ -10712,6 +11929,8 @@ impl SessionManager {
     user_msg_id: &str,
     raw_user_content: &str,
     stage_instruction: Option<&str>,
+    fallback_stage_instruction: Option<&str>,
+    attachment: Option<&GroupAttachment>,
     hop_depth: u8,
   ) -> Option<String> {
     if !self
@@ -10787,7 +12006,33 @@ impl SessionManager {
         )
       };
 
-      let mut send_js = build_group_send_js(&adapter, msg_id, &prompt_text);
+      let mut effective_stage_instruction = stage_instruction;
+      let mut effective_prompt_text = prompt_text;
+      if let Some(att) = attachment {
+        let attached_ok = Self::try_attach_file_in_webview(&wv, &adapter, att).await;
+        if !attached_ok {
+          if let Some(fb_stage) = fallback_stage_instruction {
+            effective_stage_instruction = Some(fb_stage);
+            if let Some((_, _, fb_prompt, _)) = self
+              .build_turn_prompt_for_member(
+                group_id,
+                member_key,
+                view_instance_id,
+                msg_id,
+                user_msg_id,
+                raw_user_content,
+                effective_stage_instruction,
+                hop_depth,
+              )
+              .await
+            {
+              effective_prompt_text = fb_prompt;
+            }
+          }
+        }
+      }
+
+      let mut send_js = build_group_send_js(&adapter, msg_id, &effective_prompt_text);
       let mut send_res_opt = None;
       let mut send_eval_misses = 0usize;
       let mut recovered_dead_wv = false;
@@ -10820,7 +12065,7 @@ impl SessionManager {
                     msg_id,
                     user_msg_id,
                     raw_user_content,
-                    stage_instruction,
+                    effective_stage_instruction,
                     hop_depth,
                   )
                   .await
@@ -10920,7 +12165,7 @@ impl SessionManager {
       let mut last_pushed_is_transient = false;
       let mut poll_eval_misses = 0usize;
       let mut trigger_reload_retry = false;
-      for _ in 0..300 {
+      for _ in 0..420 {
         tokio::time::sleep(std::time::Duration::from_millis(450)).await;
         let res = match Self::eval_json_callback(&wv, &poll_js).await {
           Some(v) => {
@@ -10994,13 +12239,16 @@ impl SessionManager {
             return None;
           }
           "done" => {
-            let final_text = if !text.is_empty() {
+            let mut final_text = if !text.is_empty() {
               text
             } else if !last_pushed_is_transient {
               last_pushed_text
             } else {
               String::new()
             };
+            if adapter.id == "hark" && !final_text.trim().is_empty() {
+              final_text = self.extract_hark_expanded_card_if_needed(&wv, &final_text).await;
+            }
             self
               .update_group_message_state(
                 app,
@@ -11130,13 +12378,20 @@ impl SessionManager {
       }
 
       if !last_pushed_text.is_empty() && !last_pushed_is_transient {
+        let final_text = if adapter.id == "hark" {
+          self
+            .extract_hark_expanded_card_if_needed(&wv, &last_pushed_text)
+            .await
+        } else {
+          last_pushed_text
+        };
         self
           .update_group_message_state(
             app,
             group_id,
             msg_id,
             GroupReplyStatus::Done,
-            Some(last_pushed_text.clone()),
+            Some(final_text.clone()),
             Some(None),
             true,
           )
@@ -11151,7 +12406,7 @@ impl SessionManager {
             &adapter,
           )
           .await;
-        return Some(last_pushed_text);
+        return Some(final_text);
       }
       break;
     }
@@ -11203,14 +12458,19 @@ impl SessionManager {
     let mut completed: Vec<(String, String)> = Vec::new();
     for (pos, (idx, member_key, msg_id, stage_label, auto_ch)) in jobs.iter().enumerate() {
       let is_hark = member_key.provider_id.is_hark();
-      let stage_inst = if *idx == 0 {
-        "请针对「当前问题」给出清晰完整的初始方案与关键依据。".to_string()
+      let is_external = member_key.provider_id.is_external();
+      let (stage_inst, fallback_stage_inst, attachment) = if *idx == 0 {
+        let s = if is_hark {
+          "请针对「当前问题」给出清晰完整的初始方案与关键依据，请直接在回复正文完整输出内容，不要省略。".to_string()
+        } else {
+          "请针对「当前问题」给出清晰完整的初始方案与关键依据。".to_string()
+        };
+        (s, None, None)
       } else {
-        let prev_summary = completed
+        let full_prev_summary = completed
           .iter()
           .enumerate()
           .map(|(i, (speaker, text))| {
-            let snip: String = text.trim().chars().take(1200).collect();
             let clean_label = if is_hark {
               format!("草稿要点{}", i + 1)
             } else if speaker.contains('@') {
@@ -11218,27 +12478,70 @@ impl SessionManager {
             } else {
               format!("前稿（{speaker}）")
             };
-            format!("- {clean_label}: {snip}")
+            format!("### {clean_label}\n{}", text.trim())
           })
           .collect::<Vec<_>>()
-          .join("\n");
-        if is_hark {
-          if stage_label.as_deref() == Some("综合定稿") {
+          .join("\n\n");
+
+        let format_with_body = |body: &str| -> String {
+          if is_hark {
+            if stage_label.as_deref() == Some("综合定稿") {
+              format!(
+                "请结合以下待完善方案与修改建议，为我整理输出最终可直接落地的完整结论，请直接在回复正文完整输出内容，不要省略：\n{body}"
+              )
+            } else {
+              format!(
+                "以下是一份待完善的方案要点，请直接为我指出其中的漏洞、边界风险与遗漏并给出具体修改建议，请直接在回复正文完整输出内容，不要省略：\n{body}"
+              )
+            }
+          } else if stage_label.as_deref() == Some("综合定稿") {
+            format!("请结合以下初稿与审阅意见，整合输出最终可直接落地的完整结论：\n{body}")
+          } else {
+            format!("请检查以下初稿中的漏洞、边界风险与遗漏，并给出具体修正建议：\n{body}")
+          }
+        };
+
+        let char_count = full_prev_summary.chars().count();
+        if is_external || char_count <= REVIEW_INLINE_CHAR_LIMIT {
+          (format_with_body(&full_prev_summary), None, None)
+        } else {
+          let filename = format!("review-stage-{pos}.md");
+          let attachment_note = if is_hark {
+            if stage_label.as_deref() == Some("综合定稿") {
+              format!(
+                "请完整阅读我附带的 `{filename}` 文档（内含前期方案与修改建议），为我整理输出最终可直接落地的完整结论，请直接在回复正文完整输出内容，不要省略。"
+              )
+            } else {
+              format!(
+                "请完整阅读我附带的 `{filename}` 文档（内含待完善的方案要点），直接为我指出其中的漏洞、边界风险与遗漏并给出具体修改建议，请直接在回复正文完整输出内容，不要省略。"
+              )
+            }
+          } else if stage_label.as_deref() == Some("综合定稿") {
             format!(
-              "请结合以下待完善方案与修改建议，为我整理输出最终可直接落地的完整结论：\n{prev_summary}"
+              "请完整阅读附件 `{filename}` 中的初稿与审阅意见，整合输出最终可直接落地的完整结论。"
             )
           } else {
             format!(
-              "以下是一份待完善的方案要点，请直接为我指出其中的漏洞、边界风险与遗漏并给出具体修改建议：\n{prev_summary}"
+              "请完整阅读附件 `{filename}` 中的前期方案内容，检查其中的漏洞、边界风险与遗漏，并给出具体修正建议。"
             )
-          }
-        } else if stage_label.as_deref() == Some("综合定稿") {
-          format!(
-            "请结合以下初稿与审阅意见，整合输出最终可直接落地的完整结论：\n{prev_summary}"
-          )
-        } else {
-          format!(
-            "请检查以下初稿中的漏洞、边界风险与遗漏，并给出具体修正建议：\n{prev_summary}"
+          };
+          let truncated_body: String = full_prev_summary
+            .chars()
+            .take(REVIEW_FALLBACK_CHAR_LIMIT)
+            .collect();
+          let fallback_body = if char_count > REVIEW_FALLBACK_CHAR_LIMIT {
+            format!("{truncated_body}\n...(后续超长内容已略)")
+          } else {
+            truncated_body
+          };
+          (
+            attachment_note,
+            Some(format_with_body(&fallback_body)),
+            Some(GroupAttachment {
+              filename,
+              mime_type: "text/markdown".to_string(),
+              content: full_prev_summary,
+            }),
           )
         }
       };
@@ -11252,6 +12555,8 @@ impl SessionManager {
           &user_msg_id,
           &raw_user_content,
           Some(&stage_inst),
+          fallback_stage_inst.as_deref(),
+          attachment.as_ref(),
           0,
           auto_ch.as_ref(),
         )
@@ -11324,6 +12629,8 @@ impl SessionManager {
         &user_msg_id,
         &raw_user_content,
         stage_hint.as_deref(),
+        None,
+        None,
         hop_depth,
         auto_ch.as_ref(),
       )
@@ -11488,6 +12795,7 @@ mod tests {
       created_at_ms: 1,
       auto_alias: false,
       proxy_url: None,
+      timezone: None,
       avatar_url: None,
       quota_text: None,
       quota_percent: None,

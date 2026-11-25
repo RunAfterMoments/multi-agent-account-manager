@@ -43,6 +43,9 @@ class OpenSessionArgs {
     var autoAlias: Boolean = false
     var entryUrl: String = ""
     var allowedHosts: Array<String> = emptyArray()
+    var proxyUrl: String? = null
+    var timezone: String? = null
+    var timezoneInitScript: String? = null
     var switchSeq: Long = 0L
     var viewInstanceId: Long = 0L
     var isColdStart: Boolean = false
@@ -158,6 +161,8 @@ class AccountSessionPlugin(private val activity: Activity) : Plugin(activity) {
                 autoAlias = args.autoAlias,
                 entryUrl = args.entryUrl,
                 allowedHosts = args.allowedHosts.toList(),
+                timezone = args.timezone,
+                timezoneInitScript = args.timezoneInitScript,
                 switchSeq = args.switchSeq,
                 viewInstanceId = args.viewInstanceId,
                 isColdStart = args.isColdStart,

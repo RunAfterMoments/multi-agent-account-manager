@@ -219,6 +219,7 @@ fn default_filename_for_platform(version: &str, url: &str) -> String {
     "macos" => format!("account-manager-{ver}-macos.app.tar.gz"),
     "windows" => format!("account-manager-{ver}-windows-setup.exe"),
     "android" => format!("account-manager-{ver}-android.apk"),
+    "ios" => "account-manager-ios-unsigned.ipa".to_string(),
     _ => format!("account-manager-{ver}.bin"),
   }
 }
@@ -248,6 +249,14 @@ fn select_github_asset<'a>(assets: &'a [GithubAsset], platform: &str) -> Option<
         assets
           .iter()
           .find(|a| a.name.to_ascii_lowercase().ends_with(".apk"))
+      }),
+    "ios" => assets
+      .iter()
+      .find(|a| a.name.to_ascii_lowercase().ends_with("-ios-unsigned.ipa"))
+      .or_else(|| {
+        assets
+          .iter()
+          .find(|a| a.name.to_ascii_lowercase().ends_with(".ipa"))
       }),
     _ => None,
   }
@@ -310,9 +319,9 @@ async fn fetch_text_with_status(
     Ok((status, body))
   }
 
-  #[cfg(target_os = "android")]
+  #[cfg(mobile)]
   {
-    let res = crate::platform::android::fetch_text(app, url, user_agent, accept).await?;
+    let res = crate::platform::mobile::fetch_text(app, url, user_agent, accept).await?;
     Ok((res.status, res.body))
   }
 }
@@ -830,7 +839,7 @@ pub async fn download_and_install_update(
   #[cfg(target_os = "android")]
   {
     let sha = extract_sha256_digest(req.sha256.as_deref());
-    let res = crate::platform::android::download_and_install_apk(
+    let res = crate::platform::mobile::download_and_install_apk(
       app,
       validated_url.as_str(),
       sha.as_deref(),
@@ -841,6 +850,16 @@ pub async fn download_and_install_update(
     Ok(InstallUpdateOutcome {
       status: res.status,
       message: res.message,
+    })
+  }
+
+  #[cfg(target_os = "ios")]
+  {
+    let _ = (filename, user_agent);
+    crate::platform::mobile::open_external_url(app, validated_url.as_str()).await?;
+    Ok(InstallUpdateOutcome {
+      status: "installer_launched".to_string(),
+      message: "已在 Safari 打开新版 IPA 下载地址，下载后请通过自签工具覆盖安装".to_string(),
     })
   }
 
@@ -909,8 +928,8 @@ pub async fn open_external_url(app: &AppHandle, raw_url: &str) -> Result<(), Str
     crate::platform::open_external_browser(parsed.as_str())
   }
 
-  #[cfg(target_os = "android")]
+  #[cfg(mobile)]
   {
-    crate::platform::android::open_external_url(app, parsed.as_str()).await
+    crate::platform::mobile::open_external_url(app, parsed.as_str()).await
   }
 }

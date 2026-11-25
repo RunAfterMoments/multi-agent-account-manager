@@ -1215,6 +1215,9 @@ body,
   flex-direction: column;
   overflow-y: auto;
   z-index: 30;
+}
+
+.inline-modal.animate-in {
   animation: maam-fade-in 0.14s ease-out;
 }
 
@@ -1350,7 +1353,6 @@ body,
   flex-direction: column;
   align-items: center;
   gap: 13px;
-  animation: maam-fade-in 0.16s ease-out;
 }
 
 .stage-logo-orbit {
@@ -3212,6 +3214,9 @@ body,
 .group-save-ctx-wrap {
   position: absolute;
   bottom: 4px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
   opacity: 0;
   pointer-events: none;
   transform: translateY(2px);
@@ -3230,10 +3235,17 @@ body,
 }
 
 .group-bubble:hover .group-save-ctx-wrap,
-.group-save-ctx-wrap:focus-within {
+.group-save-ctx-wrap:focus-within,
+.group-save-ctx-wrap.is-active {
   opacity: 1;
   pointer-events: auto;
   transform: translateY(0);
+}
+
+@keyframes group-sync-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .group-pin-icon-btn {
@@ -3251,6 +3263,15 @@ body,
   cursor: pointer;
   box-shadow: 0 2px 6px rgba(15, 23, 42, 0.08);
   transition: all 0.14s ease;
+}
+
+.group-pin-icon-btn:disabled {
+  opacity: 0.65;
+  cursor: wait;
+}
+
+.group-pin-icon-btn.is-spinning svg {
+  animation: group-sync-spin 0.8s linear infinite;
 }
 
 .group-pin-icon-btn:hover {

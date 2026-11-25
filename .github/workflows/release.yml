@@ -142,9 +142,44 @@ jobs:
           path: ${{ runner.temp }}/account-manager-*.apk
           if-no-files-found: error
 
+  ios:
+    name: iOS (Unsigned IPA)
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: 1
+      IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ./src-tauri -> target
+      - name: Ensure iOS CLI dependencies
+        run: |
+          for pkg in xcodegen libimobiledevice cocoapods; do
+            brew list "$pkg" >/dev/null 2>&1 || brew install "$pkg"
+          done
+      - run: npm ci
+      - name: Build unsigned iOS IPA
+        run: bash scripts/build-ios-ipa.sh
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ios-unsigned-ipa
+          path: src-tauri/target/ios/account-manager-ios-unsigned.ipa
+          if-no-files-found: error
+
   publish:
     name: Publish Release
-    needs: [desktop, android]
+    needs: [desktop, android, ios]
     if: github.ref_type == 'tag' || (github.event_name == 'workflow_dispatch' && inputs.publish_release == true && inputs.android_variant == 'release')
     runs-on: ubuntu-24.04
     permissions:
@@ -166,6 +201,10 @@ jobs:
         with:
           name: android-universal-release
           path: ${{ runner.temp }}/artifacts/android
+      - uses: actions/download-artifact@v7
+        with:
+          name: ios-unsigned-ipa
+          path: ${{ runner.temp }}/artifacts/ios
       - name: Prepare release assets and latest.json
         run: |
           pub_dir="$RUNNER_TEMP/publish"
@@ -175,8 +214,9 @@ jobs:
           mac_dmg=$(find "$RUNNER_TEMP/artifacts/macos" -name '*.dmg' -type f | head -n 1)
           win_exe=$(find "$RUNNER_TEMP/artifacts/windows" -name '*-setup.exe' -type f | head -n 1)
           android_apk=$(find "$RUNNER_TEMP/artifacts/android" -name '*-release.apk' -type f | head -n 1)
+          ios_ipa=$(find "$RUNNER_TEMP/artifacts/ios" -name '*.ipa' -type f | head -n 1)
 
-          if [ -z "$mac_tar" ] || [ -z "$mac_dmg" ] || [ -z "$win_exe" ] || [ -z "$android_apk" ]; then
+          if [ -z "$mac_tar" ] || [ -z "$mac_dmg" ] || [ -z "$win_exe" ] || [ -z "$android_apk" ] || [ -z "$ios_ipa" ]; then
             echo "Missing required build artifact(s)" >&2
             exit 1
           fi
@@ -185,6 +225,7 @@ jobs:
           cp "$mac_dmg" "$pub_dir/account-manager-macos-universal.dmg"
           cp "$win_exe" "$pub_dir/account-manager-windows-x64-setup.exe"
           cp "$android_apk" "$pub_dir/account-manager-android-universal-release.apk"
+          cp "$ios_ipa" "$pub_dir/account-manager-ios-unsigned.ipa"
 
           cfg_version=$(jq -r '.version' src-tauri/tauri.conf.json)
           if [ "${{ github.ref_type }}" = "tag" ]; then
@@ -201,6 +242,8 @@ jobs:
           win_size=$(stat -c%s "$pub_dir/account-manager-windows-x64-setup.exe")
           apk_sha=$(sha256sum "$pub_dir/account-manager-android-universal-release.apk" | awk '{print $1}')
           apk_size=$(stat -c%s "$pub_dir/account-manager-android-universal-release.apk")
+          ipa_sha=$(sha256sum "$pub_dir/account-manager-ios-unsigned.ipa" | awk '{print $1}')
+          ipa_size=$(stat -c%s "$pub_dir/account-manager-ios-unsigned.ipa")
 
           base_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}"
           pub_date=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
@@ -226,6 +269,9 @@ jobs:
             --arg apk_url "${base_url}/account-manager-android-universal-release.apk" \
             --arg apk_sha "$apk_sha" \
             --argjson apk_size "$apk_size" \
+            --arg ipa_url "${base_url}/account-manager-ios-unsigned.ipa" \
+            --arg ipa_sha "$ipa_sha" \
+            --argjson ipa_size "$ipa_size" \
             '{
               version: $version,
               notes: $notes,
@@ -249,6 +295,12 @@ jobs:
                   sha256: $apk_sha,
                   filename: "account-manager-android-universal-release.apk",
                   size: $apk_size
+                },
+                ios: {
+                  url: $ipa_url,
+                  sha256: $ipa_sha,
+                  filename: "account-manager-ios-unsigned.ipa",
+                  size: $ipa_size
                 }
               }
             }' > "$pub_dir/latest.json"
@@ -265,6 +317,7 @@ jobs:
             "$pub_dir/account-manager-macos-universal.dmg"
             "$pub_dir/account-manager-windows-x64-setup.exe"
             "$pub_dir/account-manager-android-universal-release.apk"
+            "$pub_dir/account-manager-ios-unsigned.ipa"
             "$pub_dir/latest.json"
           )
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then

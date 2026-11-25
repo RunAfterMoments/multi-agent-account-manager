@@ -1343,6 +1343,9 @@ class AccountWebActivity : AppCompatActivity() {
                 if (view !== mainWebView || currentSpec !== spec) return
                 mainLoadFailed = false
                 committedAuthority = null
+                spec.timezoneInitScript?.takeIf { it.isNotBlank() }?.let { tzScript ->
+                    view.evaluateJavascript(tzScript, null)
+                }
             }
 
             override fun onReceivedError(view: WebView, request: WebResourceRequest, error: WebResourceError) {
@@ -1544,6 +1547,15 @@ class AccountWebActivity : AppCompatActivity() {
                 }
                 val isRedirect = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) request.isRedirect else false
                 return decideMainFrameOverride(view, spec, request.url, isRedirect, isPopup = true)
+            }
+
+            override fun onPageStarted(view: WebView, url: String?, favicon: Bitmap?) {
+                if (view !== popupWebView || !AccountSessionCoordinator.isCurrent(spec.switchSeq, spec.viewInstanceId)) {
+                    return
+                }
+                spec.timezoneInitScript?.takeIf { it.isNotBlank() }?.let { tzScript ->
+                    view.evaluateJavascript(tzScript, null)
+                }
             }
 
             override fun onPageCommitVisible(view: WebView, url: String) {
@@ -1845,6 +1857,17 @@ class AccountWebActivity : AppCompatActivity() {
                             "https://*.hark.com",
                         ),
                     )
+                }
+            }
+            spec.timezoneInitScript?.takeIf { it.isNotBlank() }?.let { tzScript ->
+                if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
+                    runCatching {
+                        WebViewCompat.addDocumentStartJavaScript(
+                            wv,
+                            tzScript,
+                            setOf("*"),
+                        )
+                    }
                 }
             }
         }
