@@ -232,6 +232,25 @@ pub async fn copy_profile_cookie(app: &AppHandle, uuid: &str, url: &str) -> Resu
 }
 
 #[cfg(target_os = "android")]
+pub async fn import_profile_cookies(
+  app: &AppHandle,
+  uuid: &str,
+  url: &str,
+  cookies: Vec<String>,
+) -> Result<(), String> {
+  let bridge = app.state::<AndroidSessionBridge<tauri::Wry>>();
+  bridge
+    .0
+    .run_mobile_plugin_async::<serde_json::Value>(
+      "importProfileCookies",
+      serde_json::json!({ "uuid": uuid, "url": url, "cookies": cookies }),
+    )
+    .await
+    .map(|_| ())
+    .map_err(|e| e.to_string())
+}
+
+#[cfg(target_os = "android")]
 pub async fn open_external_url(app: &AppHandle, url: &str) -> Result<(), String> {
   let bridge = app.state::<AndroidSessionBridge<tauri::Wry>>();
   bridge

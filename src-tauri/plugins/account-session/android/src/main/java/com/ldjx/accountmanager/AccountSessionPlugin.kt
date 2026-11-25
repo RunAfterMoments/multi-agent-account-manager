@@ -71,6 +71,13 @@ class CopyProfileCookieArgs {
 }
 
 @InvokeArg
+class ImportProfileCookiesArgs {
+    var uuid: String = ""
+    var url: String = ""
+    var cookies: Array<String> = emptyArray()
+}
+
+@InvokeArg
 class OpenExternalUrlArgs {
     var url: String = ""
 }
@@ -257,11 +264,45 @@ class AccountSessionPlugin(private val activity: Activity) : Plugin(activity) {
     }
 
     @Command
+    fun importProfileCookies(invoke: Invoke) {
+        val args = invoke.parseArgs(ImportProfileCookiesArgs::class.java)
+        activity.runOnUiThread {
+            try {
+                if (!WebViewFeature.isFeatureSupported(WebViewFeature.MULTI_PROFILE)) {
+                    invoke.reject("系统 WebView 不支持 MULTI_PROFILE")
+                    return@runOnUiThread
+                }
+                val cookieManager = ProfileStore.getInstance().getProfile(args.uuid)?.cookieManager
+                if (cookieManager == null) {
+                    invoke.reject("无法访问该账号的隔离 Cookie 存储")
+                    return@runOnUiThread
+                }
+                cookieManager.setAcceptCookie(true)
+                for (header in args.cookies) {
+                    if (header.isNotBlank()) {
+                        cookieManager.setCookie(args.url, header)
+                    }
+                }
+                cookieManager.flush()
+                invoke.resolve(JSObject())
+            } catch (error: Exception) {
+                invoke.reject("导入 Cookie 失败，请检查格式后重试")
+            }
+        }
+    }
+
+    @Command
     fun openExternalUrl(invoke: Invoke) {
         val args = invoke.parseArgs(OpenExternalUrlArgs::class.java)
         activity.runOnUiThread {
             try {
-                val intent = Intent(Intent.ACTION_VIEW, Uri.parse(args.url)).apply {
+                val uri = Uri.parse(args.url)
+                val scheme = uri.scheme?.lowercase() ?: ""
+                if (scheme != "http" && scheme != "https") {
+                    invoke.reject("仅允许打开 http/https 外部链接")
+                    return@runOnUiThread
+                }
+                val intent = Intent(Intent.ACTION_VIEW, uri).apply {
                     addCategory(Intent.CATEGORY_BROWSABLE)
                     addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 }

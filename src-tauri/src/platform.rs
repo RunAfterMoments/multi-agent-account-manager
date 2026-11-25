@@ -1,4 +1,6 @@
+#[cfg(desktop)]
 use std::path::Path;
+#[cfg(desktop)]
 use uuid::Uuid;
 
 pub fn current_platform_name() -> &'static str {
@@ -990,6 +992,573 @@ pub async fn write_cookie_clipboard(app: &tauri::AppHandle, header: String) -> R
   receiver.await.map_err(|_| "写入系统剪贴板中断".to_string())?
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportedCookieSpec {
+  pub name: String,
+  pub value: String,
+  pub domain: String,
+  pub path: String,
+  pub secure: bool,
+  pub http_only: bool,
+  pub same_site: Option<String>,
+  pub max_age_secs: Option<i64>,
+}
+
+fn normalize_same_site(raw: Option<&str>) -> Option<String> {
+  let s = raw?.trim().to_ascii_lowercase();
+  match s.as_str() {
+    "lax" => Some("lax".to_string()),
+    "strict" => Some("strict".to_string()),
+    "none" | "no_restriction" => Some("none".to_string()),
+    _ => None,
+  }
+}
+
+fn push_validated_imported_cookie(
+  out: &mut Vec<ImportedCookieSpec>,
+  seen: &mut std::collections::HashMap<(String, String, String), usize>,
+  default_host: &str,
+  allowed_hosts: &[String],
+  raw_name: &str,
+  raw_value: &str,
+  raw_domain: Option<&str>,
+  raw_path: Option<&str>,
+  mut secure: bool,
+  http_only: bool,
+  same_site: Option<String>,
+  max_age_secs: Option<i64>,
+) {
+  let name = raw_name.trim();
+  if name.is_empty()
+    || !name
+      .bytes()
+      .all(|b| b.is_ascii_graphic() && !matches!(b, b';' | b'='))
+  {
+    return;
+  }
+  if raw_value.bytes().any(|b| matches!(b, b'\r' | b'\n' | 0)) {
+    return;
+  }
+  let value = raw_value.to_string();
+
+  let default_clean = default_host.trim().to_ascii_lowercase();
+  let mut domain = raw_domain
+    .map(|d| d.trim().to_ascii_lowercase())
+    .filter(|d| !d.is_empty())
+    .unwrap_or_else(|| default_clean.clone());
+  let check_host = domain.trim_start_matches('.');
+  if check_host.is_empty()
+    || (!crate::providers::host_matches(check_host, &default_clean)
+      && !allowed_hosts
+        .iter()
+        .any(|allowed| crate::providers::host_matches(check_host, allowed)))
+  {
+    return;
+  }
+
+  let raw_p = raw_path.map(|p| p.trim()).unwrap_or("/");
+  let mut path = if raw_p.is_empty() {
+    "/".to_string()
+  } else if raw_p.starts_with('/') {
+    raw_p.to_string()
+  } else {
+    format!("/{raw_p}")
+  };
+
+  if name.starts_with("__Host-") {
+    domain = check_host.to_string();
+    path = "/".to_string();
+    secure = true;
+  } else if name.starts_with("__Secure-") {
+    secure = true;
+  }
+
+  let spec = ImportedCookieSpec {
+    name: name.to_string(),
+    value,
+    domain: domain.clone(),
+    path: path.clone(),
+    secure,
+    http_only,
+    same_site,
+    max_age_secs,
+  };
+  let key = (name.to_string(), domain, path);
+  if let Some(&idx) = seen.get(&key) {
+    out[idx] = spec;
+  } else {
+    let idx = out.len();
+    seen.insert(key, idx);
+    out.push(spec);
+  }
+}
+
+pub fn parse_imported_cookies(
+  raw: &str,
+  default_host: &str,
+  allowed_hosts: &[String],
+  now_secs: i64,
+) -> Result<Vec<ImportedCookieSpec>, String> {
+  let trimmed = raw.trim();
+  if trimmed.is_empty() {
+    return Err("请先粘贴要导入的 Cookie 内容".to_string());
+  }
+
+  let mut out = Vec::new();
+  let mut seen = std::collections::HashMap::new();
+
+  if trimmed.starts_with('[') || trimmed.starts_with('{') {
+    let val: serde_json::Value = serde_json::from_str(trimmed)
+      .map_err(|_| "JSON 格式 Cookie 无法解析，请检查是否复制完整".to_string())?;
+    let arr = if let Some(list) = val.as_array() {
+      list.as_slice()
+    } else if let Some(list) = val.get("cookies").and_then(|v| v.as_array()) {
+      list.as_slice()
+    } else {
+      return Err("JSON Cookie 必须是数组或包含 cookies 数组的对象".to_string());
+    };
+    for item in arr {
+      let Some(obj) = item.as_object() else {
+        continue;
+      };
+      let Some(name) = obj.get("name").and_then(|v| v.as_str()) else {
+        continue;
+      };
+      let Some(value) = obj.get("value").and_then(|v| v.as_str()) else {
+        continue;
+      };
+      let exp_num = obj
+        .get("expirationDate")
+        .or_else(|| obj.get("expires"))
+        .and_then(|v| v.as_f64());
+      let max_age_secs = if let Some(raw_exp) = exp_num.filter(|n| n.is_finite() && *n > 0.0) {
+        let exp_secs = if raw_exp > 1_000_000_000_000.0 {
+          (raw_exp / 1000.0) as i64
+        } else {
+          raw_exp as i64
+        };
+        if exp_secs <= now_secs {
+          continue;
+        }
+        Some((exp_secs - now_secs).clamp(60, 365 * 86_400))
+      } else {
+        None
+      };
+      let domain = obj.get("domain").and_then(|v| v.as_str());
+      let path = obj.get("path").and_then(|v| v.as_str());
+      let secure = obj.get("secure").and_then(|v| v.as_bool()).unwrap_or(true);
+      let http_only = obj
+        .get("httpOnly")
+        .or_else(|| obj.get("http_only"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+      let same_site = normalize_same_site(
+        obj
+          .get("sameSite")
+          .or_else(|| obj.get("same_site"))
+          .and_then(|v| v.as_str()),
+      );
+      push_validated_imported_cookie(
+        &mut out,
+        &mut seen,
+        default_host,
+        allowed_hosts,
+        name,
+        value,
+        domain,
+        path,
+        secure,
+        http_only,
+        same_site,
+        max_age_secs,
+      );
+    }
+  } else {
+    let has_netscape_tabs = trimmed.lines().any(|line| {
+      let l = line.trim();
+      if l.is_empty() {
+        return false;
+      }
+      let effective = l.strip_prefix("#HttpOnly_").unwrap_or(l);
+      if effective.starts_with('#') {
+        return false;
+      }
+      effective.matches('\t').count() >= 6
+    });
+
+    if has_netscape_tabs {
+      for line in trimmed.lines() {
+        let l = line.trim();
+        if l.is_empty() {
+          continue;
+        }
+        let (http_only, effective) = if let Some(rest) = l.strip_prefix("#HttpOnly_") {
+          (true, rest)
+        } else {
+          if l.starts_with('#') {
+            continue;
+          }
+          (false, l)
+        };
+        let parts: Vec<&str> = effective.splitn(7, '\t').collect();
+        if parts.len() != 7 {
+          continue;
+        }
+        let domain = parts[0].trim();
+        let path = parts[2].trim();
+        let secure = parts[3].trim().eq_ignore_ascii_case("true") || parts[3].trim() == "1";
+        let expiry = parts[4].trim().parse::<i64>().unwrap_or(0);
+        if expiry > 0 && expiry <= now_secs {
+          continue;
+        }
+        let max_age_secs = if expiry > now_secs {
+          Some((expiry - now_secs).clamp(60, 365 * 86_400))
+        } else {
+          None
+        };
+        let name = parts[5];
+        let value = parts[6];
+        push_validated_imported_cookie(
+          &mut out,
+          &mut seen,
+          default_host,
+          allowed_hosts,
+          name,
+          value,
+          Some(domain),
+          Some(path),
+          secure,
+          http_only,
+          None,
+          max_age_secs,
+        );
+      }
+    } else {
+      for segment in trimmed.split([';', '\r', '\n']) {
+        let mut s = segment.trim();
+        if s.is_empty() {
+          continue;
+        }
+        if s.len() >= 7 && s[..7].eq_ignore_ascii_case("cookie:") {
+          s = s[7..].trim();
+        }
+        let Some((raw_name, raw_val)) = s.split_once('=') else {
+          continue;
+        };
+        push_validated_imported_cookie(
+          &mut out,
+          &mut seen,
+          default_host,
+          allowed_hosts,
+          raw_name,
+          raw_val.trim(),
+          None,
+          Some("/"),
+          true,
+          false,
+          Some("lax".to_string()),
+          Some(30 * 86_400),
+        );
+      }
+    }
+  }
+
+  if out.is_empty() {
+    return Err("未解析到适用于当前服务的有效 Cookie，请检查粘贴格式或域名".to_string());
+  }
+  Ok(out)
+}
+
+fn is_valid_identity_email_str(s: &str) -> bool {
+  let Some((local, domain)) = s.split_once('@') else {
+    return false;
+  };
+  if local.is_empty() || domain.len() < 4 || !domain.contains('.') {
+    return false;
+  }
+  if !local
+    .bytes()
+    .all(|b| b.is_ascii_alphanumeric() || b"._%+-".contains(&b))
+  {
+    return false;
+  }
+  let mut parts = domain.split('.');
+  let Some(last) = parts.clone().last() else {
+    return false;
+  };
+  if last.len() < 2 || !last.bytes().all(|b| b.is_ascii_alphabetic()) {
+    return false;
+  }
+  parts.all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
+}
+
+fn is_bad_identity_email(email: &str) -> bool {
+  let lower = email.to_ascii_lowercase();
+  let prefix_bad = [
+    "support@",
+    "privacy@",
+    "help@",
+    "legal@",
+    "press@",
+    "noreply@",
+    "no-reply@",
+    "info@",
+    "security@",
+    "contact@",
+    "abuse@",
+    "feedback@",
+    "sales@",
+    "terms@",
+    "hello@",
+    "team@",
+    "admin@",
+    "postmaster@",
+    "notifications@",
+  ];
+  if prefix_bad.iter().any(|p| lower.starts_with(p)) {
+    return true;
+  }
+  lower.ends_with("@example.com")
+    || lower.ends_with("@sentry.io")
+    || lower.ends_with("@wixpress.com")
+}
+
+fn is_provider_identity_email(email: &str) -> bool {
+  let lower = email.to_ascii_lowercase();
+  lower.ends_with("@muse.ai")
+    || lower.ends_with("@mail.muse.ai")
+    || lower.ends_with("@hark.com")
+    || lower.ends_with("@meta.com")
+    || lower.ends_with("@facebook.com")
+}
+
+fn push_email_candidates_from_text(text: &str, out: &mut Vec<String>) {
+  let bytes = text.as_bytes();
+  for (idx, &b) in bytes.iter().enumerate() {
+    if b != b'@' {
+      continue;
+    }
+    let mut start = idx;
+    while start > 0 {
+      let c = bytes[start - 1];
+      if c.is_ascii_alphanumeric() || b"._%+-".contains(&c) {
+        start -= 1;
+      } else {
+        break;
+      }
+    }
+    let mut end = idx + 1;
+    while end < bytes.len() {
+      let c = bytes[end];
+      if c.is_ascii_alphanumeric() || b".-".contains(&c) {
+        end += 1;
+      } else {
+        break;
+      }
+    }
+    let candidate = text[start..end].trim_matches('.').to_ascii_lowercase();
+    if is_valid_identity_email_str(&candidate) && !is_bad_identity_email(&candidate) {
+      out.push(candidate);
+    }
+  }
+}
+
+fn percent_decode_lossy(input: &str) -> String {
+  let bytes = input.as_bytes();
+  let mut out = Vec::with_capacity(bytes.len());
+  let mut i = 0;
+  while i < bytes.len() {
+    if bytes[i] == b'%' && i + 2 < bytes.len() {
+      let h1 = (bytes[i + 1] as char).to_digit(16);
+      let h2 = (bytes[i + 2] as char).to_digit(16);
+      if let (Some(a), Some(b)) = (h1, h2) {
+        out.push(((a << 4) | b) as u8);
+        i += 3;
+        continue;
+      }
+    }
+    out.push(bytes[i]);
+    i += 1;
+  }
+  String::from_utf8_lossy(&out).into_owned()
+}
+
+fn decode_base64_url_loose(input: &str) -> Option<Vec<u8>> {
+  let clean = input.trim().trim_end_matches('=');
+  if clean.len() < 4 {
+    return None;
+  }
+  let mut out = Vec::with_capacity((clean.len() * 3) / 4);
+  let mut buf: u32 = 0;
+  let mut bits: u8 = 0;
+  for b in clean.bytes() {
+    let val = match b {
+      b'A'..=b'Z' => b - b'A',
+      b'a'..=b'z' => b - b'a' + 26,
+      b'0'..=b'9' => b - b'0' + 52,
+      b'-' | b'+' => 62,
+      b'_' | b'/' => 63,
+      _ => return None,
+    };
+    buf = (buf << 6) | (val as u32);
+    bits += 6;
+    if bits >= 8 {
+      bits -= 8;
+      out.push(((buf >> bits) & 0xff) as u8);
+    }
+  }
+  Some(out)
+}
+
+fn extract_emails_from_json_value(val: &serde_json::Value, depth: u8, out: &mut Vec<String>) {
+  if depth > 6 {
+    return;
+  }
+  const EMAIL_KEYS: &[&str] = &[
+    "email",
+    "user_email",
+    "userEmail",
+    "contact_email",
+    "contactEmail",
+    "primary_email",
+    "primaryEmail",
+    "email_address",
+    "emailAddress",
+    "billing_email",
+    "billingEmail",
+    "customer_email",
+    "customerEmail",
+    "login_email",
+    "loginEmail",
+    "account_email",
+    "accountEmail",
+    "verified_email",
+    "verifiedEmail",
+    "display_label",
+    "displayLabel",
+    "contact_point",
+    "contactPoint",
+    "sub",
+    "preferred_username",
+    "upn",
+  ];
+  match val {
+    serde_json::Value::Object(map) => {
+      for k in EMAIL_KEYS {
+        if let Some(s) = map.get(*k).and_then(|v| v.as_str()) {
+          push_email_candidates_from_text(s, out);
+        }
+      }
+      for v in map.values() {
+        if v.is_object() || v.is_array() {
+          extract_emails_from_json_value(v, depth + 1, out);
+        }
+      }
+    }
+    serde_json::Value::Array(arr) => {
+      for item in arr.iter().take(20) {
+        extract_emails_from_json_value(item, depth + 1, out);
+      }
+    }
+    _ => {}
+  }
+}
+
+pub fn extract_identity_hint_from_cookies(specs: &[ImportedCookieSpec]) -> Option<String> {
+  let mut candidates = Vec::new();
+  for spec in specs {
+    let decoded = percent_decode_lossy(&spec.value);
+    push_email_candidates_from_text(&spec.value, &mut candidates);
+    if decoded != spec.value {
+      push_email_candidates_from_text(&decoded, &mut candidates);
+    }
+
+    let mut b64_segments: Vec<&str> = Vec::new();
+    let trimmed = decoded.trim();
+    if trimmed.matches('.').count() >= 2 {
+      for seg in trimmed.split('.').skip(1).take(2) {
+        b64_segments.push(seg);
+      }
+    } else if !trimmed.contains('.') {
+      b64_segments.push(trimmed);
+    }
+
+    for seg in b64_segments {
+      if let Some(bytes) = decode_base64_url_loose(seg) {
+        if let Ok(text) = std::str::from_utf8(&bytes) {
+          if let Ok(json) = serde_json::from_str::<serde_json::Value>(text) {
+            extract_emails_from_json_value(&json, 0, &mut candidates);
+          } else if text.contains('@') {
+            push_email_candidates_from_text(text, &mut candidates);
+          }
+        }
+      }
+    }
+  }
+
+  candidates
+    .iter()
+    .find(|e| !is_provider_identity_email(e))
+    .cloned()
+    .or_else(|| candidates.into_iter().next())
+}
+
+#[cfg(desktop)]
+pub fn imported_cookie_to_tauri(
+  spec: &ImportedCookieSpec,
+) -> Result<tauri::webview::Cookie<'static>, String> {
+  let mut template = format!("k=v; Domain={}; Path={}", spec.domain, spec.path);
+  if let Some(max_age) = spec.max_age_secs {
+    template.push_str(&format!("; Max-Age={max_age}"));
+  }
+  if spec.secure {
+    template.push_str("; Secure");
+  }
+  if spec.http_only {
+    template.push_str("; HttpOnly");
+  }
+  if let Some(ss) = spec.same_site.as_deref() {
+    match ss {
+      "lax" => template.push_str("; SameSite=Lax"),
+      "strict" => template.push_str("; SameSite=Strict"),
+      "none" => template.push_str("; SameSite=None"),
+      _ => {}
+    }
+  }
+  let mut cookie =
+    tauri::webview::Cookie::parse(template).map_err(|_| "Cookie 属性无效".to_string())?;
+  cookie.set_name(spec.name.clone());
+  cookie.set_value(spec.value.clone());
+  Ok(cookie)
+}
+
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub fn imported_cookie_to_set_cookie_header(spec: &ImportedCookieSpec) -> String {
+  let mut header = format!("{}={}", spec.name, spec.value);
+  if !spec.name.starts_with("__Host-") {
+    header.push_str(&format!("; Domain={}", spec.domain));
+  }
+  header.push_str(&format!("; Path={}", spec.path));
+  if let Some(max_age) = spec.max_age_secs {
+    header.push_str(&format!("; Max-Age={max_age}"));
+  }
+  if spec.secure {
+    header.push_str("; Secure");
+  }
+  if spec.http_only {
+    header.push_str("; HttpOnly");
+  }
+  if let Some(ss) = spec.same_site.as_deref() {
+    match ss {
+      "lax" => header.push_str("; SameSite=Lax"),
+      "strict" => header.push_str("; SameSite=Strict"),
+      "none" => header.push_str("; SameSite=None"),
+      _ => {}
+    }
+  }
+  header
+}
+
 #[cfg(desktop)]
 pub async fn delete_desktop_profile(
   app: &tauri::AppHandle,
@@ -1422,6 +1991,108 @@ mod tests {
     assert_eq!(
       summarize_cookie_expiry(&noise_only, now),
       CookieExpirySummary::default()
+    );
+  }
+
+  #[test]
+  fn parse_imported_cookies_supports_json_header_netscape_and_filters_domains() {
+    let allowed = vec!["muse.ai".to_string(), "meta.com".to_string()];
+    let now = 1_700_000_000i64;
+
+    assert!(parse_imported_cookies("   ", "muse.ai", &allowed, now).is_err());
+
+    // 1. JSON array with __Host- normalization, expired skip, and unrelated domain skip
+    let json_raw = r#"[
+      {"name":"__Host-sess","value":"tok1","domain":".muse.ai","path":"/app","secure":false,"httpOnly":true,"sameSite":"lax","expirationDate":1700086400},
+      {"name":"expired_ck","value":"dead","domain":"muse.ai","expirationDate":1699999999},
+      {"name":"other_site","value":"bad","domain":"google.com","expirationDate":1700086400}
+    ]"#;
+    let parsed_json = parse_imported_cookies(json_raw, "muse.ai", &allowed, now).unwrap();
+    assert_eq!(parsed_json.len(), 1);
+    assert_eq!(parsed_json[0].name, "__Host-sess");
+    assert_eq!(parsed_json[0].domain, "muse.ai");
+    assert_eq!(parsed_json[0].path, "/");
+    assert!(parsed_json[0].secure);
+    assert!(parsed_json[0].http_only);
+    assert_eq!(parsed_json[0].same_site.as_deref(), Some("lax"));
+    assert_eq!(parsed_json[0].max_age_secs, Some(86_400));
+    let header_line = imported_cookie_to_set_cookie_header(&parsed_json[0]);
+    assert!(header_line.starts_with("__Host-sess=tok1; Path=/"));
+    assert!(!header_line.contains("Domain="));
+
+    // 2. HTTP Cookie header string
+    let hdr = "Cookie: hatch_sess=abc==; pref=dark";
+    let parsed_hdr = parse_imported_cookies(hdr, "muse.ai", &allowed, now).unwrap();
+    assert_eq!(parsed_hdr.len(), 2);
+    assert_eq!(parsed_hdr[0].name, "hatch_sess");
+    assert_eq!(parsed_hdr[0].value, "abc==");
+    assert_eq!(parsed_hdr[1].name, "pref");
+    assert_eq!(parsed_hdr[1].value, "dark");
+
+    // 3. Netscape cookies.txt (including #HttpOnly_ prefix)
+    let netscape = format!(
+      "# Netscape HTTP Cookie File\n#HttpOnly_.muse.ai\tTRUE\t/\tTRUE\t{}\thatch_sess\tval123\n.google.com\tTRUE\t/\tTRUE\t{}\tNID\tignored\n",
+      now + 3600,
+      now + 3600
+    );
+    let parsed_net = parse_imported_cookies(&netscape, "muse.ai", &allowed, now).unwrap();
+    assert_eq!(parsed_net.len(), 1);
+    assert_eq!(parsed_net[0].name, "hatch_sess");
+    assert_eq!(parsed_net[0].value, "val123");
+    assert!(parsed_net[0].http_only);
+
+    // 4. All filtered out -> explicit error
+    assert!(parse_imported_cookies(
+      r#"[{"name":"SID","value":"x","domain":"google.com"}]"#,
+      "muse.ai",
+      &allowed,
+      now
+    )
+    .is_err());
+
+    #[cfg(desktop)]
+    {
+      let tauri_ck = imported_cookie_to_tauri(&parsed_json[0]).unwrap();
+      assert_eq!(tauri_ck.name(), "__Host-sess");
+      assert_eq!(tauri_ck.value(), "tok1");
+    }
+  }
+
+  #[test]
+  fn extract_identity_hint_from_cookies_handles_urlencoded_jwt_and_filters_noise() {
+    let mk = |name: &str, value: &str| ImportedCookieSpec {
+      name: name.to_string(),
+      value: value.to_string(),
+      domain: "muse.ai".to_string(),
+      path: "/".to_string(),
+      secure: true,
+      http_only: true,
+      same_site: Some("lax".to_string()),
+      max_age_secs: Some(3600),
+    };
+
+    assert_eq!(
+      extract_identity_hint_from_cookies(&[
+        mk("sys", "noreply%40muse.ai"),
+        mk("login_hint", "User.Name%40Gmail.com"),
+      ]),
+      Some("user.name@gmail.com".to_string())
+    );
+
+    // Base64URL JWT payload {"email":"alice@example.org","sub":"123"} -> eyJlbWFpbCI6ImFsaWNlQGV4YW1wbGUub3JnIiwic3ViIjoiMTIzIn0
+    let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJlbWFpbCI6ImFsaWNlQGV4YW1wbGUub3JnIiwic3ViIjoiMTIzIn0.sig";
+    assert_eq!(
+      extract_identity_hint_from_cookies(&[mk("id_token", jwt)]),
+      Some("alice@example.org".to_string())
+    );
+
+    // System / placeholder emails only -> None
+    assert_eq!(
+      extract_identity_hint_from_cookies(&[
+        mk("a", "support@muse.ai"),
+        mk("b", "test@example.com"),
+      ]),
+      None
     );
   }
 }

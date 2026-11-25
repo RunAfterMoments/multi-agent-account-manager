@@ -1,11 +1,17 @@
+mod group_transport;
 mod platform;
 mod providers;
 mod session_manager;
+mod site_adapters;
 mod storage;
 mod updater;
 
 use platform::ProxyTestResult;
 use session_manager::{ManagerSnapshot, SessionManager, APP_TITLE};
+use site_adapters::SiteAdaptersSnapshot;
+use storage::{
+  AccountKey, ExternalAgentKind, GroupMemberRole, GroupSharedSkill, GroupWorkflowMode,
+};
 #[cfg(desktop)]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -36,8 +42,17 @@ async fn add_account(
   provider_id: String,
   alias: String,
   proxy_url: Option<String>,
+  raw_cookies: Option<String>,
 ) -> Result<ManagerSnapshot, String> {
-  mgr.add_account(&app, &provider_id, &alias, proxy_url.as_deref()).await
+  mgr
+    .add_account(
+      &app,
+      &provider_id,
+      &alias,
+      proxy_url.as_deref(),
+      raw_cookies.as_deref(),
+    )
+    .await
 }
 
 #[tauri::command]
@@ -66,6 +81,23 @@ async fn copy_account_cookie(
     return Err("仅账号管理页可以复制 Cookie".to_string());
   }
   mgr.copy_account_cookie(&app, &provider_id, &uuid).await
+}
+
+#[tauri::command]
+async fn import_account_cookies(
+  app: AppHandle,
+  mgr: State<'_, Arc<SessionManager>>,
+  webview: tauri::Webview,
+  provider_id: String,
+  uuid: String,
+  raw_cookies: String,
+) -> Result<ManagerSnapshot, String> {
+  if webview.label() != "manager" {
+    return Err("仅账号管理页可以导入 Cookie".to_string());
+  }
+  mgr
+    .import_account_cookies(&app, &provider_id, &uuid, &raw_cookies)
+    .await
 }
 
 #[tauri::command]
@@ -155,50 +187,6 @@ async fn trigger_quota_sync(
 }
 
 #[tauri::command]
-async fn add_custom_provider(
-  app: AppHandle,
-  mgr: State<'_, Arc<SessionManager>>,
-  webview: tauri::Webview,
-  name: String,
-  entry_url: String,
-) -> Result<ManagerSnapshot, String> {
-  if webview.label() != "manager" {
-    return Err("仅账号管理页可以新增服务".to_string());
-  }
-  mgr.add_custom_provider(&app, &name, &entry_url).await
-}
-
-#[tauri::command]
-async fn update_custom_provider(
-  app: AppHandle,
-  mgr: State<'_, Arc<SessionManager>>,
-  webview: tauri::Webview,
-  provider_id: String,
-  name: String,
-  entry_url: String,
-) -> Result<ManagerSnapshot, String> {
-  if webview.label() != "manager" {
-    return Err("仅账号管理页可以修改服务".to_string());
-  }
-  mgr
-    .update_custom_provider(&app, &provider_id, &name, &entry_url)
-    .await
-}
-
-#[tauri::command]
-async fn remove_custom_provider(
-  app: AppHandle,
-  mgr: State<'_, Arc<SessionManager>>,
-  webview: tauri::Webview,
-  provider_id: String,
-) -> Result<ManagerSnapshot, String> {
-  if webview.label() != "manager" {
-    return Err("仅账号管理页可以删除服务".to_string());
-  }
-  mgr.remove_custom_provider(&app, &provider_id).await
-}
-
-#[tauri::command]
 async fn test_account_proxy(
   mgr: State<'_, Arc<SessionManager>>,
   webview: tauri::Webview,
@@ -246,13 +234,254 @@ async fn update_app_settings(
   webview: tauri::Webview,
   minimize_to_tray: bool,
   global_shortcut: String,
+  auto_approve: Option<bool>,
 ) -> Result<ManagerSnapshot, String> {
   if webview.label() != "manager" {
     return Err("仅账号管理页可以修改应用设置".to_string());
   }
   mgr
-    .update_app_settings(&app, minimize_to_tray, &global_shortcut)
+    .update_app_settings(&app, minimize_to_tray, &global_shortcut, auto_approve)
     .await
+}
+
+#[tauri::command]
+async fn select_group_chat(
+  app: AppHandle,
+  mgr: State<'_, Arc<SessionManager>>,
+  webview: tauri::Webview,
+  group_id: Option<String>,
+) -> Result<ManagerSnapshot, String> {
+  if webview.label() != "manager" {
+    return Err("仅账号管理页可以切换群聊".to_string());
+  }
+  mgr.select_group_chat(&app, group_id).await
+}
+
+#[tauri::command]
+async fn create_group_chat(
+  app: AppHandle,
+  mgr: State<'_, Arc<SessionManager>>,
+  webview: tauri::Webview,
+  name: String,
+  members: Vec<AccountKey>,
+) -> Result<ManagerSnapshot, String> {
+  if webview.label() != "manager" {
+    return Err("仅账号管理页可以创建群聊".to_string());
+  }
+  mgr.create_group_chat(&app, name, members).await
+}
+
+#[tauri::command]
+async fn update_group_chat(
+  app: AppHandle,
+  mgr: State<'_, Arc<SessionManager>>,
+  webview: tauri::Webview,
+  group_id: String,
+  name: String,
+  members: Vec<AccountKey>,
+) -> Result<ManagerSnapshot, String> {
+  if webview.label() != "manager" {
+    return Err("仅账号管理页可以编辑群聊".to_string());
+  }
+  mgr.update_group_chat(&app, group_id, name, members).await
+}
+
+#[tauri::command]
+async fn delete_group_chat(
+  app: AppHandle,
+  mgr: State<'_, Arc<SessionManager>>,
+  webview: tauri::Webview,
+  group_id: String,
+) -> Result<ManagerSnapshot, String> {
+  if webview.label() != "manager" {
+    return Err("仅账号管理页可以删除群聊".to_string());
+  }
+  mgr.delete_group_chat(&app, group_id).await
+}
+
+#[tauri::command]
+async fn send_group_message(
+  app: AppHandle,
+  mgr: State<'_, Arc<SessionManager>>,
+  webview: tauri::Webview,
+  group_id: String,
+  content: String,
+  target_members: Option<Vec<AccountKey>>,
+  auto_channels: Option<Vec<String>>,
+) -> Result<ManagerSnapshot, String> {
+  if webview.label() != "manager" {
+    return Err("仅账号管理页可以发送群聊消息".to_string());
+  }
+  mgr
+    .send_group_message(&app, group_id, content, target_members, auto_channels)
+    .await
+}
+
+#[tauri::command]
+async fn retry_group_message(
+  app: AppHandle,
+  mgr: State<'_, Arc<SessionManager>>,
+  webview: tauri::Webview,
+  group_id: String,
+  msg_id: String,
+) -> Result<ManagerSnapshot, String> {
+  if webview.label() != "manager" {
+    return Err("仅账号管理页可以重试群聊消息".to_string());
+  }
+  mgr.retry_group_message(&app, group_id, msg_id).await
+}
+
+#[tauri::command]
+async fn clear_group_messages(
+  mgr: State<'_, Arc<SessionManager>>,
+  webview: tauri::Webview,
+  group_id: String,
+) -> Result<ManagerSnapshot, String> {
+  if webview.label() != "manager" {
+    return Err("仅账号管理页可以清空群聊记录".to_string());
+  }
+  mgr.clear_group_messages(group_id).await
+}
+
+#[tauri::command]
+async fn start_group_new_topic(
+  mgr: State<'_, Arc<SessionManager>>,
+  webview: tauri::Webview,
+  group_id: String,
+  keep_shared_context: bool,
+) -> Result<ManagerSnapshot, String> {
+  if webview.label() != "manager" {
+    return Err("仅账号管理页可以开启新话题".to_string());
+  }
+  mgr.start_group_new_topic(group_id, keep_shared_context).await
+}
+
+#[tauri::command]
+async fn update_group_knowledge(
+  mgr: State<'_, Arc<SessionManager>>,
+  webview: tauri::Webview,
+  group_id: String,
+  shared_context: String,
+  shared_skills: Vec<GroupSharedSkill>,
+  member_roles: Vec<GroupMemberRole>,
+) -> Result<ManagerSnapshot, String> {
+  if webview.label() != "manager" {
+    return Err("仅账号管理页可以保存群聊知识配置".to_string());
+  }
+  mgr
+    .update_group_knowledge(group_id, shared_context, shared_skills, member_roles)
+    .await
+}
+
+#[tauri::command]
+async fn append_group_shared_context(
+  mgr: State<'_, Arc<SessionManager>>,
+  webview: tauri::Webview,
+  group_id: String,
+  snippet: String,
+) -> Result<ManagerSnapshot, String> {
+  if webview.label() != "manager" {
+    return Err("仅账号管理页可以沉淀群聊上下文".to_string());
+  }
+  mgr.append_group_shared_context(group_id, snippet).await
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn upsert_external_agent(
+  mgr: State<'_, Arc<SessionManager>>,
+  webview: tauri::Webview,
+  id: Option<String>,
+  kind: ExternalAgentKind,
+  name: String,
+  base_url: String,
+  api_key: String,
+  model: String,
+  command: String,
+  args: Vec<String>,
+  workdir: Option<String>,
+) -> Result<ManagerSnapshot, String> {
+  if webview.label() != "manager" {
+    return Err("仅账号管理页可以管理 API / CLI 成员".to_string());
+  }
+  mgr
+    .upsert_external_agent(id, kind, name, base_url, api_key, model, command, args, workdir)
+    .await
+}
+
+#[tauri::command]
+async fn delete_external_agent(
+  mgr: State<'_, Arc<SessionManager>>,
+  webview: tauri::Webview,
+  id: String,
+) -> Result<ManagerSnapshot, String> {
+  if webview.label() != "manager" {
+    return Err("仅账号管理页可以删除 API / CLI 成员".to_string());
+  }
+  mgr.delete_external_agent(id).await
+}
+
+#[tauri::command]
+async fn update_group_workflow(
+  mgr: State<'_, Arc<SessionManager>>,
+  webview: tauri::Webview,
+  group_id: String,
+  workflow_mode: GroupWorkflowMode,
+  max_relay_hops: u8,
+) -> Result<ManagerSnapshot, String> {
+  if webview.label() != "manager" {
+    return Err("仅账号管理页可以修改协作模式".to_string());
+  }
+  mgr
+    .update_group_workflow(group_id, workflow_mode, max_relay_hops)
+    .await
+}
+
+#[tauri::command]
+async fn reset_group_thread_binding(
+  mgr: State<'_, Arc<SessionManager>>,
+  webview: tauri::Webview,
+  group_id: String,
+  member: AccountKey,
+) -> Result<ManagerSnapshot, String> {
+  if webview.label() != "manager" {
+    return Err("仅账号管理页可以重置成员绑定会话".to_string());
+  }
+  mgr.reset_group_thread_binding(group_id, member).await
+}
+
+#[tauri::command]
+async fn get_site_adapters(
+  mgr: State<'_, Arc<SessionManager>>,
+  webview: tauri::Webview,
+) -> Result<SiteAdaptersSnapshot, String> {
+  if webview.label() != "manager" {
+    return Err("仅账号管理页可以查看站点适配规则".to_string());
+  }
+  Ok(mgr.get_site_adapters().await)
+}
+
+#[tauri::command]
+async fn save_site_adapter_overrides(
+  mgr: State<'_, Arc<SessionManager>>,
+  webview: tauri::Webview,
+  raw_json: String,
+) -> Result<SiteAdaptersSnapshot, String> {
+  if webview.label() != "manager" {
+    return Err("仅账号管理页可以保存站点适配规则".to_string());
+  }
+  mgr.save_site_adapter_overrides(raw_json).await
+}
+
+#[tauri::command]
+async fn reset_site_adapter_overrides(
+  mgr: State<'_, Arc<SessionManager>>,
+  webview: tauri::Webview,
+) -> Result<SiteAdaptersSnapshot, String> {
+  if webview.label() != "manager" {
+    return Err("仅账号管理页可以重置站点适配规则".to_string());
+  }
+  mgr.reset_site_adapter_overrides().await
 }
 
 #[tauri::command]
@@ -403,13 +632,11 @@ pub fn run() {
     .invoke_handler(tauri::generate_handler![
       get_manager_state,
       select_provider,
-      add_custom_provider,
-      update_custom_provider,
-      remove_custom_provider,
       add_account,
       rename_account,
       test_account_proxy,
       copy_account_cookie,
+      import_account_cookies,
       remove_account,
       reorder_accounts,
       reload_account,
@@ -422,6 +649,23 @@ pub fn run() {
       dismiss_notice,
       trigger_quota_sync,
       update_app_settings,
+      select_group_chat,
+      create_group_chat,
+      update_group_chat,
+      delete_group_chat,
+      send_group_message,
+      retry_group_message,
+      clear_group_messages,
+      start_group_new_topic,
+      update_group_knowledge,
+      append_group_shared_context,
+      upsert_external_agent,
+      delete_external_agent,
+      update_group_workflow,
+      reset_group_thread_binding,
+      get_site_adapters,
+      save_site_adapter_overrides,
+      reset_site_adapter_overrides,
       check_for_updates,
       download_and_install_update,
       open_external_url,

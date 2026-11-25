@@ -1363,6 +1363,10 @@ class AccountWebActivity : AppCompatActivity() {
                 view: WebView,
                 request: WebResourceRequest,
             ): Boolean {
+                val scheme = request.url?.scheme?.lowercase() ?: ""
+                if (scheme !in setOf("http", "https", "about", "blob", "data")) {
+                    return true
+                }
                 if (!request.isForMainFrame) {
                     return false
                 }
@@ -1528,6 +1532,10 @@ class AccountWebActivity : AppCompatActivity() {
                 view: WebView,
                 request: WebResourceRequest,
             ): Boolean {
+                val scheme = request.url?.scheme?.lowercase() ?: ""
+                if (scheme !in setOf("http", "https", "about", "blob", "data")) {
+                    return true
+                }
                 if (!request.isForMainFrame) {
                     return false
                 }
@@ -1882,7 +1890,7 @@ class AccountWebActivity : AppCompatActivity() {
             AccountSessionCoordinator.emitExternalAuthUnavailable(
                 spec.switchSeq,
                 spec.viewInstanceId,
-                "Google OAuth 按政策需使用系统浏览器，当前回跳暂无法绑定至发起账号的独立 Profile，请使用邮箱或手机号登录",
+                "Google OAuth 按政策需使用系统浏览器，请使用邮箱/手机号登录，或在账号设置中通过「导入 Cookie」载入登录态",
             )
             return true
         }
