@@ -88,7 +88,7 @@
    - `UPDATE_SIGNING_PRIVATE_KEY`：minisign 私钥全文（`minisign -G` 生成的 `.sec` 内容，或 base64 编码后存入，CI 内再解码；切勿用明文日志打印）。
    - `UPDATE_SIGNING_PUBLIC_KEY`：对应的公钥（可公开；编译进二进制用，也可存为仓库变量而非 secret，但为成对管理建议同放 secret，由 CI 在构建时注入 `MAAM_UPDATE_PUBLIC_KEY` 环境变量）。
    - （可选）`UPDATE_SIGNING_KEY_ID`：密钥轮换时标识用哪把公钥验证，便于多公钥并存过渡。
-6. **CI 改动点（本次未做）**：`release.yml` 的「Prepare release assets and latest.json」步骤后加签名步骤（`minisign -S -s "$KEY" -m latest.json` 及各安装包），并把 `.minisig` 文件随产物一同上传 Release；构建 job 注入公钥环境变量。签名密钥只在发布 job 可见，沿用现有 `permissions: contents: write` 仅限发布 job 的做法。
+6. **CI 改动点（签名步骤本次仍未做；仓库地址已接通）**：`release.yml` 的「Prepare release assets and latest.json」步骤后加签名步骤（`minisign -S -s "$KEY" -m latest.json` 及各安装包），并把 `.minisig` 文件随产物一同上传 Release；构建 job 注入公钥环境变量。签名密钥只在发布 job 可见，沿用现有 `permissions: contents: write` 仅限发布 job 的做法。**2026-11-26 PR-E 已做**：`release.yml` 顶层 `env` 注入 `MAAM_UPDATE_REPO: ${{ github.repository }}`，desktop/android/iOS 三个构建 job 全部生效——此前发布产物因编译期未配仓库地址，更新检查默认关闭。签名本身仍待用户生成密钥对（`minisign -G`，私钥进 CI secret，公钥随构建注入）后落地。
 
 ## 手工验证步骤
 

@@ -23,7 +23,13 @@ use updater::{InstallUpdateOutcome, InstallUpdateRequest, UpdateCheckResult};
 static QUIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 #[tauri::command]
-async fn get_manager_state(mgr: State<'_, Arc<SessionManager>>) -> Result<ManagerSnapshot, String> {
+async fn get_manager_state(
+  mgr: State<'_, Arc<SessionManager>>,
+  webview: tauri::Webview,
+) -> Result<ManagerSnapshot, String> {
+  if webview.label() != "manager" {
+    return Err("仅账号管理页可以读取管理状态".to_string());
+  }
   Ok(mgr.get_snapshot().await)
 }
 
@@ -31,8 +37,12 @@ async fn get_manager_state(mgr: State<'_, Arc<SessionManager>>) -> Result<Manage
 async fn select_provider(
   app: AppHandle,
   mgr: State<'_, Arc<SessionManager>>,
+  webview: tauri::Webview,
   provider_id: String,
 ) -> Result<ManagerSnapshot, String> {
+  if webview.label() != "manager" {
+    return Err("仅账号管理页可以切换服务".to_string());
+  }
   mgr.select_provider(&app, &provider_id).await
 }
 
@@ -40,12 +50,16 @@ async fn select_provider(
 async fn add_account(
   app: AppHandle,
   mgr: State<'_, Arc<SessionManager>>,
+  webview: tauri::Webview,
   provider_id: String,
   alias: String,
   proxy_url: Option<String>,
   timezone: Option<String>,
   raw_cookies: Option<String>,
 ) -> Result<ManagerSnapshot, String> {
+  if webview.label() != "manager" {
+    return Err("仅账号管理页可以添加账号".to_string());
+  }
   mgr
     .add_account(
       &app,
@@ -62,12 +76,16 @@ async fn add_account(
 async fn rename_account(
   app: AppHandle,
   mgr: State<'_, Arc<SessionManager>>,
+  webview: tauri::Webview,
   provider_id: String,
   uuid: String,
   alias: String,
   proxy_url: Option<String>,
   timezone: Option<String>,
 ) -> Result<ManagerSnapshot, String> {
+  if webview.label() != "manager" {
+    return Err("仅账号管理页可以修改账号设置".to_string());
+  }
   mgr
     .update_account_settings(
       &app,
@@ -115,9 +133,13 @@ async fn import_account_cookies(
 async fn remove_account(
   app: AppHandle,
   mgr: State<'_, Arc<SessionManager>>,
+  webview: tauri::Webview,
   provider_id: String,
   uuid: String,
 ) -> Result<ManagerSnapshot, String> {
+  if webview.label() != "manager" {
+    return Err("仅账号管理页可以删除账号".to_string());
+  }
   mgr.remove_account(&app, &provider_id, &uuid).await
 }
 
@@ -150,9 +172,13 @@ async fn reveal_downloaded_file(
 async fn switch_account(
   app: AppHandle,
   mgr: State<'_, Arc<SessionManager>>,
+  webview: tauri::Webview,
   provider_id: String,
   uuid: String,
 ) -> Result<ManagerSnapshot, String> {
+  if webview.label() != "manager" {
+    return Err("仅账号管理页可以切换账号".to_string());
+  }
   mgr.switch_account(&app, &provider_id, &uuid).await
 }
 
@@ -160,8 +186,12 @@ async fn switch_account(
 async fn set_modal_active(
   app: AppHandle,
   mgr: State<'_, Arc<SessionManager>>,
+  webview: tauri::Webview,
   active: bool,
 ) -> Result<ManagerSnapshot, String> {
+  if webview.label() != "manager" {
+    return Err("仅账号管理页可以设置弹窗状态".to_string());
+  }
   mgr.set_modal_active(&app, active).await
 }
 
@@ -169,36 +199,58 @@ async fn set_modal_active(
 async fn open_official_site(
   app: AppHandle,
   mgr: State<'_, Arc<SessionManager>>,
+  webview: tauri::Webview,
   provider_id: String,
 ) -> Result<ManagerSnapshot, String> {
+  if webview.label() != "manager" {
+    return Err("仅账号管理页可以打开官网".to_string());
+  }
   mgr.open_official_site(&app, &provider_id).await
 }
 
 #[tauri::command]
 async fn resolve_uuid_conflict(
   mgr: State<'_, Arc<SessionManager>>,
+  webview: tauri::Webview,
   keep_provider_id: String,
   uuid: String,
 ) -> Result<ManagerSnapshot, String> {
+  if webview.label() != "manager" {
+    return Err("仅账号管理页可以处理 UUID 冲突".to_string());
+  }
   mgr.resolve_uuid_conflict(&keep_provider_id, &uuid).await
 }
 
 #[tauri::command]
-async fn dismiss_notice(mgr: State<'_, Arc<SessionManager>>) -> Result<ManagerSnapshot, String> {
+async fn dismiss_notice(
+  mgr: State<'_, Arc<SessionManager>>,
+  webview: tauri::Webview,
+) -> Result<ManagerSnapshot, String> {
+  if webview.label() != "manager" {
+    return Err("仅账号管理页可以关闭提示".to_string());
+  }
   Ok(mgr.dismiss_notice().await)
 }
 
 #[tauri::command]
 async fn continue_with_empty_config(
   mgr: State<'_, Arc<SessionManager>>,
+  webview: tauri::Webview,
 ) -> Result<ManagerSnapshot, String> {
+  if webview.label() != "manager" {
+    return Err("仅账号管理页可以继续使用空配置".to_string());
+  }
   mgr.continue_with_empty_config().await
 }
 
 #[tauri::command]
 async fn restore_config_from_backup(
   mgr: State<'_, Arc<SessionManager>>,
+  webview: tauri::Webview,
 ) -> Result<ManagerSnapshot, String> {
+  if webview.label() != "manager" {
+    return Err("仅账号管理页可以从备份恢复配置".to_string());
+  }
   mgr.restore_config_from_backup().await
 }
 
@@ -206,7 +258,11 @@ async fn restore_config_from_backup(
 async fn trigger_quota_sync(
   app: AppHandle,
   mgr: State<'_, Arc<SessionManager>>,
+  webview: tauri::Webview,
 ) -> Result<ManagerSnapshot, String> {
+  if webview.label() != "manager" {
+    return Err("仅账号管理页可以触发额度同步".to_string());
+  }
   mgr.trigger_silent_sync(&app, true).await;
   Ok(mgr.get_snapshot().await)
 }
@@ -576,20 +632,37 @@ async fn reset_site_adapter_overrides(
 }
 
 #[tauri::command]
-async fn check_for_updates(app: AppHandle) -> Result<UpdateCheckResult, String> {
+async fn check_for_updates(
+  app: AppHandle,
+  webview: tauri::Webview,
+) -> Result<UpdateCheckResult, String> {
+  if webview.label() != "manager" {
+    return Err("仅账号管理页可以检查更新".to_string());
+  }
   updater::check_for_updates(&app).await
 }
 
 #[tauri::command]
 async fn download_and_install_update(
   app: AppHandle,
+  webview: tauri::Webview,
   request: InstallUpdateRequest,
 ) -> Result<InstallUpdateOutcome, String> {
+  if webview.label() != "manager" {
+    return Err("仅账号管理页可以下载并安装更新".to_string());
+  }
   updater::download_and_install_update(&app, request).await
 }
 
 #[tauri::command]
-async fn open_external_url(app: AppHandle, url: String) -> Result<(), String> {
+async fn open_external_url(
+  app: AppHandle,
+  webview: tauri::Webview,
+  url: String,
+) -> Result<(), String> {
+  if webview.label() != "manager" {
+    return Err("仅账号管理页可以打开外部链接".to_string());
+  }
   updater::open_external_url(&app, &url).await
 }
 

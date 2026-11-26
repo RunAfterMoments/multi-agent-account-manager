@@ -13,7 +13,7 @@
 use super::{AccountPageError, InnerState, ManagerSnapshot, SessionManager};
 use crate::platform::{self, current_platform_name};
 use crate::providers::{all_provider_infos, resolve_provider, ProviderId};
-use crate::storage::{load_or_migrate_store, AccountsStoreFile, ExternalAgentView};
+use crate::storage::{parse_store_str, save_store_atomic, AccountsStoreFile, ExternalAgentView};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -207,24 +207,28 @@ impl SessionManager {
         "未找到可用的配置备份（accounts.json.bak 或 accounts.json.corrupt-*）".to_string(),
       );
     }
-    // 先校验再覆盖：候选先复制到同目录临时文件并加载验证，通过才原子
-    // rename 到 store_path。之前是先覆盖 store_path 再校验，全部候选
-    // 失败时 store_path 会被最后一个坏候选覆盖掉。
-    let temp_path = store_path.with_file_name("accounts.json.restore-tmp");
+    // 先校验再写回：候选只在内存里解析（parse_store_str 不触盘），
+    // 通过才 save_store_atomic 写回 store_path（自带 0o600 + sync_all
+    // + 原子替换）。之前是复制到同目录临时文件再 load_or_migrate_store，
+    // 坏候选会在临时路径旁留下 accounts.json.restore-tmp.corrupt-* / .bak。
     let mut last_err = String::new();
     for candidate in candidates {
-      if std::fs::copy(&candidate, &temp_path).is_err() {
-        continue;
-      }
-      let loaded = load_or_migrate_store(&temp_path);
-      if loaded.persist_blocked {
-        last_err = loaded.startup_notice.clone().unwrap_or_default();
-        let _ = std::fs::remove_file(&temp_path);
-        continue;
-      }
-      if std::fs::rename(&temp_path, &store_path).is_err() {
-        let _ = std::fs::remove_file(&temp_path);
-        last_err = "备份文件无法写入配置路径".to_string();
+      let raw = match std::fs::read_to_string(&candidate) {
+        Ok(raw) => raw,
+        Err(err) => {
+          last_err = format!("读取备份失败: {err}");
+          continue;
+        }
+      };
+      let loaded = match parse_store_str(&raw) {
+        Ok(loaded) => loaded,
+        Err(err) => {
+          last_err = err;
+          continue;
+        }
+      };
+      if let Err(err) = save_store_atomic(&store_path, &loaded.store) {
+        last_err = err;
         continue;
       }
       let mut locked = self.inner.lock().await;
@@ -242,7 +246,6 @@ impl SessionManager {
         .unwrap_or_else(ProviderId::muse);
       return Ok(Self::snapshot_from_locked(&locked));
     }
-    let _ = std::fs::remove_file(&temp_path);
     if last_err.is_empty() {
       last_err = "备份文件均无法读取".to_string();
     }
@@ -250,7 +253,9 @@ impl SessionManager {
   }
 
   pub(super) fn emit_snapshot(&self, app: &AppHandle, snap: &ManagerSnapshot) {
-    let _ = app.emit("manager-state-changed", snap);
+    // 只发给 manager webview：完整快照含账号列表与配置，账号页
+    //（外站内容）不应收到。capabilities 已限制命令来源，这是纵深防御。
+    let _ = app.emit_to("manager", "manager-state-changed", snap);
   }
 
   pub async fn get_snapshot(&self) -> ManagerSnapshot {

@@ -31,6 +31,9 @@ function makePage(html) {
   };
   window.__maamAutoApprove = true;
   window.__maamAutoApproveAllowCommands = false;
+  // 门控用：生产环境由 Rust 在注册 webview 时注入本站 callback_origins；
+  // 测试页 URL 已是 https://muse.ai/（顶层 frame），与注入值一致。
+  window.__maamAutoApproveOrigins = ["https://muse.ai", "https://www.muse.ai"];
   window.eval(AUTO_APPROVE_JS);
   return { dom, window, document: window.document };
 }

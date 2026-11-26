@@ -11,6 +11,17 @@
 // 60 秒内自动点击超过 10 次即熔断关闭（window.__maamAutoApproveTripped）。
 (() => {
   try {
+  // 门控（P0-3）：只在顶层 frame、本站 HTTPS 页面运行。init script 会
+  // 注入到每个 frame；iframe（验证码/widget）与外站页面一律不运行，
+  // 避免在第三方页面上点按钮。__maamAutoApproveOrigins 由 Rust 侧在
+  // 注册 webview 时注入（本站 callback_origins）；未注入时一律不运行。
+  if (window.top !== window.self) return;
+  if (window.location.protocol !== 'https:') return;
+  const _maamOrigins = window.__maamAutoApproveOrigins;
+  if (!Array.isArray(_maamOrigins) || _maamOrigins.length === 0) return;
+  let _maamOrigin = '';
+  try { _maamOrigin = window.location.origin; } catch (_) {}
+  if (!_maamOrigins.some((o) => typeof o === 'string' && o.toLowerCase() === _maamOrigin.toLowerCase())) return;
 if (!window.__maamAutoApproveWatcher) {
   window.__maamAutoApproveWatcher = true;
   const DANGER_RE = /删除|移除|注销|清空|退出登录|退出账户|确认退出|支付|付款|购买|订阅|充值|转账|密码|更改邮箱|停用|封禁|删除文件|删除数据|清空数据|格式化|恢复出厂|清除数据|密钥|口令|凭证|令牌|私钥|环境变量|\.env\b|id_rsa|id_ed25519|\.pem\b|api[-_ ]?key|access[-_ ]?token|secret|credential|\.ssh\b|\/etc\/passwd|\/etc\/shadow|\bdelete\b|\bremove\b|\berase\b|\bwipe\b|logout|log out|sign out|payment|purchase|billing|checkout|subscribe|charge|transfer|password|deactivate|reset account|factory reset|rm\s+(?:-\w*r\w*|--recursive)|\bsudo\b|\bchmod\b|\bchown\b|\bkill(?:all)?\b|\bpkill\b|\bgit\s+push\b[^|]{0,80}--force|\bgit\s+reset\s+--hard|\bcurl\b[^|]{0,200}\|\s*(?:sh|bash)|\bwget\b[^|]{0,200}\|\s*(?:sh|bash)|\bdrop\s+table|\bdrop\s+database|\bmkfs\b|\bdd\b|\bfdisk\b|\bshutdown\b|\breboot\b/i;

@@ -2604,11 +2604,11 @@ pub(crate) fn build_group_poll_js(adapter: &SiteAdapterConfig, job_id: &str) -> 
     const isIdleOnlyStatus = (s) => /^(?:(?:Muse|Hark|空闲中|已连接|已阅读|消息|Idle|Connected)[….\s]*)+$/i.test((s || '').trim());
     const isTransientStatusText = (s) => {
       const t = (s || '').trim();
-      if (!t) return false;
+      if (!t || t.length > 160) return false;
       if (extraWords.some((w) => t === w || t === ('Muse\n' + w) || t === ('Hark\n' + w))) {
         return true;
       }
-      return /^(?:(?:Muse|Hark)[ \t\r\n]+(?:正在[\u4e00-\u9fa5]{1,10}|[\u4e00-\u9fa5]{1,8}中|已连接|已阅读|消息|Thinking|Warming\s*up|Sending|Working|Searching|Researching|Replying|Retrieving|Loading|Idle|Connected)[….\s]*|(?:Muse|Hark)[ \t\r\n]*|(?:正在预热|预热中|空闲中|已连接|连接中|正在连接|仍在发送中|发送中|努力工作中|工作中|努力思考中|正在思考|思考中|正在搜索|正在搜索网页|正在联网搜索|搜索中|正在检索|检索中|正在回复|回复中|正在分析|分析中|正在查询|查询中|正在处理|处理中|正在生成|生成中|正在准备|准备中|加载中|待命中|已阅读|消息|Thinking|Warming\s*up|Sending|Working|Searching|Researching|Replying|Retrieving|Loading|Idle|Connected)[….\s]*)+$/i.test(t);
+      return t.split(/\r?\n/).every((line) => /^(?:(?:Muse|Hark)[ \t\r\n]+(?:正在[\u4e00-\u9fa5]{1,10}|[\u4e00-\u9fa5]{1,8}中|已连接|已阅读|消息|Thinking|Warming\s*up|Sending|Working|Searching|Researching|Replying|Retrieving|Loading|Idle|Connected)[….\s]*|(?:Muse|Hark)[ \t\r\n]*|(?:正在预热|预热中|空闲中|已连接|连接中|正在连接|仍在发送中|发送中|努力工作中|工作中|努力思考中|正在思考|思考中|正在搜索|正在搜索网页|正在联网搜索|搜索中|正在检索|检索中|正在回复|回复中|正在分析|分析中|正在查询|查询中|正在处理|处理中|正在生成|生成中|正在准备|准备中|加载中|待命中|已阅读|消息|Thinking|Warming\s*up|Sending|Working|Searching|Researching|Replying|Retrieving|Loading|Idle|Connected)[….\s]*)+$/i.test(line.trim()));
     };
     const isTransientProgressOnly = (txt) => {
       const s = (txt || '').trim();
@@ -3306,11 +3306,11 @@ pub(crate) fn build_group_sync_latest_js(
     const isIdleOnlyStatus = (s) => /^(?:(?:Muse|Hark|空闲中|已连接|已阅读|消息|Idle|Connected)[….\s]*)+$/i.test((s || '').trim());
     const isTransientStatusText = (s) => {
       const t = (s || '').trim();
-      if (!t) return false;
+      if (!t || t.length > 160) return false;
       if (extraWords.some((w) => t === w || t === ('Muse\n' + w) || t === ('Hark\n' + w))) {
         return true;
       }
-      return /^(?:(?:Muse|Hark)[ \t\r\n]+(?:正在[\u4e00-\u9fa5]{1,10}|[\u4e00-\u9fa5]{1,8}中|已连接|已阅读|消息|Thinking|Warming\s*up|Sending|Working|Searching|Researching|Replying|Retrieving|Loading|Idle|Connected)[….\s]*|(?:Muse|Hark)[ \t\r\n]*|(?:正在预热|预热中|空闲中|已连接|连接中|正在连接|仍在发送中|发送中|努力工作中|工作中|努力思考中|正在思考|思考中|正在搜索|正在搜索网页|正在联网搜索|搜索中|正在检索|检索中|正在回复|回复中|正在分析|分析中|正在查询|查询中|正在处理|处理中|正在生成|生成中|正在准备|准备中|加载中|待命中|已阅读|消息|Thinking|Warming\s*up|Sending|Working|Searching|Researching|Replying|Retrieving|Loading|Idle|Connected)[….\s]*)+$/i.test(t);
+      return t.split(/\r?\n/).every((line) => /^(?:(?:Muse|Hark)[ \t\r\n]+(?:正在[\u4e00-\u9fa5]{1,10}|[\u4e00-\u9fa5]{1,8}中|已连接|已阅读|消息|Thinking|Warming\s*up|Sending|Working|Searching|Researching|Replying|Retrieving|Loading|Idle|Connected)[….\s]*|(?:Muse|Hark)[ \t\r\n]*|(?:正在预热|预热中|空闲中|已连接|连接中|正在连接|仍在发送中|发送中|努力工作中|工作中|努力思考中|正在思考|思考中|正在搜索|正在搜索网页|正在联网搜索|搜索中|正在检索|检索中|正在回复|回复中|正在分析|分析中|正在查询|查询中|正在处理|处理中|正在生成|生成中|正在准备|准备中|加载中|待命中|已阅读|消息|Thinking|Warming\s*up|Sending|Working|Searching|Researching|Replying|Retrieving|Loading|Idle|Connected)[….\s]*)+$/i.test(line.trim()));
     };
     const isTransientProgressOnly = (txt) => {
       const s = (txt || '').trim();

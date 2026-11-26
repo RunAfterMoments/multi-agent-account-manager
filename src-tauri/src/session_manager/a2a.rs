@@ -12,7 +12,8 @@ use super::{
 };
 use crate::providers::{resolve_provider, ProviderId};
 use crate::storage::{
-  now_ms, AccountKey, AuthState, GroupChatMessage, GroupReplyStatus, GroupWorkflowMode,
+  now_ms, AccountKey, AuthState, ExternalAgentKind, GroupChatMessage, GroupReplyStatus,
+  GroupWorkflowMode,
 };
 use std::sync::Arc;
 use tauri::AppHandle;
@@ -102,8 +103,21 @@ impl SessionManager {
         };
 
         let char_count = full_prev_summary.chars().count();
-        if is_external || char_count <= REVIEW_INLINE_CHAR_LIMIT {
+        // 截断体（外部成员与附件兜底共用）：超长时截到 4500 字并标明已略。
+        let truncated_body: String = full_prev_summary
+          .chars()
+          .take(REVIEW_FALLBACK_CHAR_LIMIT)
+          .collect();
+        let fallback_body = if char_count > REVIEW_FALLBACK_CHAR_LIMIT {
+          format!("{truncated_body}\n...(后续超长内容已略)")
+        } else {
+          truncated_body
+        };
+        if char_count <= REVIEW_INLINE_CHAR_LIMIT {
           (format_with_body(&full_prev_summary), None, None)
+        } else if is_external {
+          // 外部成员读不到附件：不再无上限内联，截断后直接放进正文。
+          (format_with_body(&fallback_body), None, None)
         } else {
           let filename = format!("review-stage-{pos}.md");
           let attachment_note = if is_hark {
@@ -125,15 +139,6 @@ impl SessionManager {
               "请完整阅读附件 `{filename}` 中的前期方案内容，检查其中的漏洞、边界风险与遗漏，并给出具体修正建议。"
             )
           };
-          let truncated_body: String = full_prev_summary
-            .chars()
-            .take(REVIEW_FALLBACK_CHAR_LIMIT)
-            .collect();
-          let fallback_body = if char_count > REVIEW_FALLBACK_CHAR_LIMIT {
-            format!("{truncated_body}\n...(后续超长内容已略)")
-          } else {
-            truncated_body
-          };
           (
             attachment_note,
             Some(format_with_body(&fallback_body)),
@@ -145,6 +150,57 @@ impl SessionManager {
           )
         }
       };
+
+      // 评审管线点名本地 CLI 成员时默认不自动执行：前序阶段的回复是
+      // 模型生成文本，可能含注入内容；本地命令执行需用户确认。
+      // 该阶段以 Error 状态挂起并中止后续阶段，用户点「重试」即确认执行。
+      let is_local_cli = {
+        let locked = self.inner.lock().await;
+        locked
+          .store
+          .external_agents
+          .iter()
+          .any(|e| e.account_key() == *member_key && e.kind == ExternalAgentKind::LocalCli)
+      };
+      if is_local_cli {
+        let alias = {
+          let locked = self.inner.lock().await;
+          Self::resolve_member_alias_locked(&locked, member_key)
+            .unwrap_or_else(|| member_key.uuid.chars().take(6).collect())
+        };
+        {
+          let mut locked = self.inner.lock().await;
+          locked.notice =
+            Some("评审已暂停：有本地 CLI 成员需你确认后点「重试」才会执行本地命令".to_string());
+        }
+        self
+          .update_group_message_state(
+            &app,
+            &group_id,
+            msg_id,
+            GroupReplyStatus::Error,
+            None,
+            Some(Some(format!(
+              "评审点名了本地 CLI 成员「{alias}」，为安全起见未自动执行本地命令。确认无误后点「重试」才会运行。"
+            ))),
+            true,
+          )
+          .await;
+        for (_, _, rem_msg_id, _, _) in &jobs[pos + 1..] {
+          self
+            .update_group_message_state(
+              &app,
+              &group_id,
+              rem_msg_id,
+              GroupReplyStatus::Error,
+              None,
+              Some(Some("前序评审阶段未完成，已中止后续流程".to_string())),
+              true,
+            )
+            .await;
+        }
+        break;
+      }
 
       let reply_opt = self
         .run_group_member_turn_with_failover(
@@ -298,6 +354,22 @@ impl SessionManager {
           &active_visited,
           2,
         );
+        // 跨链去重：并行跑着的两条接力链可能同时点名同一成员；已在
+        // 途中的目标不再重复扇出，回合结束即释放（见下面的 spawn 包装）。
+        let next_targets: Vec<AccountKey> = {
+          let in_flight = locked
+            .a2a_relay_in_flight
+            .entry(group_id.clone())
+            .or_default();
+          let kept: Vec<AccountKey> = next_targets
+            .into_iter()
+            .filter(|k| !in_flight.contains(k))
+            .collect();
+          for k in &kept {
+            in_flight.insert(k.clone());
+          }
+          kept
+        };
         if next_targets.is_empty() {
           return;
         }
@@ -317,10 +389,40 @@ impl SessionManager {
         let snippet: String = reply_text.trim().chars().take(600).collect();
         let relay_prompt = format!("请接力回应上一跳「{speaker_alias}」的协作结果：\n{snippet}");
         let mut spawned = Vec::with_capacity(next_targets.len());
+        let mut held_cli = 0usize;
         for (offset, target_key) in next_targets.into_iter().enumerate() {
           let alias = Self::resolve_member_alias_locked(&locked, &target_key)
             .unwrap_or_else(|| target_key.uuid.chars().take(6).collect());
           let reply_msg_id = Uuid::new_v4().hyphenated().to_string();
+          // A2A 接力点名本地 CLI 成员时默认不自动执行：上一跳的回复是
+          // 模型生成文本，可能含注入的 @标记；本地命令执行需用户确认。
+          // 消息以 Error 状态挂起，用户点「重试」即确认执行（走
+          // retry_group_message，对本轮原始提问重新跑该成员）。
+          let is_local_cli = locked
+            .store
+            .external_agents
+            .iter()
+            .any(|e| e.account_key() == target_key && e.kind == ExternalAgentKind::LocalCli);
+          if is_local_cli {
+            held_cli += 1;
+            locked.store.group_chats[g_idx].messages.push(GroupChatMessage {
+              id: reply_msg_id,
+              role: "assistant".to_string(),
+              sender: Some(target_key.clone()),
+              sender_name: alias.clone(),
+              content: String::new(),
+              created_at_ms: ts + (offset as u64) + 1,
+              status: GroupReplyStatus::Error,
+              targets: Vec::new(),
+              error: Some(format!(
+                "A2A 接力点名了本地 CLI 成员「{alias}」，为安全起见未自动执行本地命令。确认无误后点「重试」才会运行。"
+              )),
+              stage_label: Some(stage_label.clone()),
+              hop_depth: next_hop,
+              auto_routed_channel: None,
+            });
+            continue;
+          }
           locked.store.group_chats[g_idx]
             .messages
             .push(GroupChatMessage {
@@ -344,6 +446,10 @@ impl SessionManager {
             next_visited.clone(),
           ));
         }
+        if held_cli > 0 {
+          locked.notice =
+            Some("A2A 接力已暂停：有本地 CLI 成员需你确认后点「重试」才会执行本地命令".to_string());
+        }
         if Self::persist_locked(&mut locked).await.is_err() {
           return;
         }
@@ -358,16 +464,28 @@ impl SessionManager {
           let app_h = app.clone();
           let gid = group_id.clone();
           let uid = user_msg_id.clone();
-          tauri::async_runtime::spawn(mgr.run_group_a2a_chain(
-            app_h,
-            gid,
-            target_key,
-            new_msg_id,
-            uid,
-            relay_prompt,
-            next_hop,
-            next_visited,
-          ));
+          let mgr_for_cleanup = Arc::clone(&mgr);
+          let gid_for_cleanup = gid.clone();
+          let target_for_cleanup = target_key.clone();
+          tauri::async_runtime::spawn(async move {
+            mgr
+              .run_group_a2a_chain(
+                app_h,
+                gid,
+                target_key,
+                new_msg_id,
+                uid,
+                relay_prompt,
+                next_hop,
+                next_visited,
+              )
+              .await;
+            // 接力回合结束（正常与提前返回均含在内）才释放该目标。
+            let mut locked = mgr_for_cleanup.inner.lock().await;
+            if let Some(set) = locked.a2a_relay_in_flight.get_mut(&gid_for_cleanup) {
+              set.remove(&target_for_cleanup);
+            }
+          });
         }
       }
     })

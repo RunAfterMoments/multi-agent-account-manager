@@ -567,7 +567,9 @@ fn emit_progress(
   percent: Option<u8>,
   message: &str,
 ) {
-  let _ = app.emit(
+  // 只发给 manager webview：账号页不应收到更新进度（可借此探测版本/更新态）。
+  let _ = app.emit_to(
+    "manager",
     "update-progress",
     UpdateProgressEvent {
       stage: stage.to_string(),
@@ -580,6 +582,11 @@ fn emit_progress(
 }
 
 #[cfg(desktop)]
+/// 更新包下载上限（512 MiB）：服务端谎报/不报 Content-Length 时，
+/// 流式循环里按已下载量硬停，避免无限下载撑满磁盘。清单里声明的
+/// size 仅作展示，不作为放行依据。
+const MAX_UPDATE_DOWNLOAD_BYTES: u64 = 512 * 1024 * 1024;
+
 async fn download_to_updates_cache(
   app: &AppHandle,
   url: &str,
@@ -639,6 +646,13 @@ async fn download_to_updates_cache(
   }
 
   let total = resp.content_length().filter(|&n| n > 0);
+  // Content-Length 预检：声明就超过上限直接拒绝，不建临时文件。
+  if total.is_some_and(|t| t > MAX_UPDATE_DOWNLOAD_BYTES) {
+    return Err(format!(
+      "更新包声明大小超过 {} 字节上限，已拒绝下载",
+      MAX_UPDATE_DOWNLOAD_BYTES
+    ));
+  }
   let mut file =
     std::fs::File::create(&part_path).map_err(|e| format!("创建临时更新文件失败: {e}"))?;
   let mut hasher = Sha256::new();
@@ -656,6 +670,16 @@ async fn download_to_updates_cache(
     })?;
     hasher.update(&chunk);
     downloaded = downloaded.saturating_add(chunk.len() as u64);
+    // 流式硬上限：Content-Length 缺失或谎报时按已下载量停，
+    // 删临时文件并报错（sha256 校验在下载完成后，不兜底）。
+    if downloaded > MAX_UPDATE_DOWNLOAD_BYTES {
+      drop(file);
+      let _ = std::fs::remove_file(&part_path);
+      return Err(format!(
+        "更新包超过 {} 字节上限，已停止下载",
+        MAX_UPDATE_DOWNLOAD_BYTES
+      ));
+    }
 
     let pct = total.map(|t| ((downloaded.saturating_mul(100)) / t).min(100) as u8);
     if last_emit.elapsed() >= std::time::Duration::from_millis(150)
@@ -1054,6 +1078,15 @@ pub async fn download_and_install_update(
   let manifest = check_for_updates(app).await?;
   let filename = verify_install_request_against_manifest(&req, &expected_sha, &manifest)?;
   let current_version = app.package_info().version.to_string();
+  // 防降级：清单说没有更新（最新版不高于当前版）时拒绝安装。只靠
+  // verify 核对 req.version == manifest.latest_version 不够——一份
+  // 指向旧版本的清单（过期缓存/被篡改）会让旧版覆盖新版。
+  if !manifest.has_update {
+    return Err(format!(
+      "最新版本 {} 不高于当前版本 {}，拒绝安装（防降级）",
+      manifest.latest_version, current_version
+    ));
+  }
   let user_agent = format!("multi-agent-account-manager/{current_version}");
 
   #[cfg(target_os = "android")]

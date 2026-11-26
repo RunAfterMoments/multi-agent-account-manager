@@ -194,6 +194,11 @@ impl SessionManager {
       if ch != '@' {
         continue;
       }
+      let after = &content[idx + 1..];
+      // 邮箱抑制优先：@ 前是字母数字说明它嵌在邮箱地址里
+      //（如 a.b@all.com、x@全体成员），不是 @指令；广播关键词与成员
+      // 别名都受此保护。真正的 @all / @全体成员是独立词元（@ 前为
+      // 开头、空白或标点），不受影响。
       if idx > 0
         && content[..idx]
           .chars()
@@ -202,7 +207,6 @@ impl SessionManager {
       {
         continue;
       }
-      let after = &content[idx + 1..];
       if after.starts_with("全体成员") || after.starts_with("全体") || after.starts_with("所有人")
       {
         return (true, Vec::new());
@@ -1607,6 +1611,17 @@ impl SessionManager {
           return None;
         };
 
+        // 自动失败切换不得切到本地 CLI：切过去等于在用户不知情时
+        // 自动执行本地命令。从 LocalCli 失败切走不受影响（只拦切入）。
+        if locked
+          .store
+          .external_agents
+          .iter()
+          .any(|e| e.account_key() == next_key && e.kind == ExternalAgentKind::LocalCli)
+        {
+          return None;
+        }
+
         locked
           .account_last_assigned_ms
           .insert(next_key.clone(), now);
@@ -1998,13 +2013,36 @@ impl SessionManager {
     else {
       return;
     };
+    // 审计日志含账号 key 与审批卡片文本：仅所有者可读写。
+    // 每次追加时都设置，之前已存在的 0o644 旧日志也会被收紧。
+    #[cfg(unix)]
+    {
+      use std::os::unix::fs::PermissionsExt;
+      let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+    }
     for entry in entries {
+      // 单条截断：审计文本来自页面上报，恶意页面可用超大文本撑日志；
+      // 卡片文本 1000 字、按钮文本 128 字足够覆盖真实内容。
+      let text: String = entry
+        .get("text")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .chars()
+        .take(1000)
+        .collect();
+      let button: String = entry
+        .get("button")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .chars()
+        .take(128)
+        .collect();
       let line = serde_json::json!({
         "at_ms": entry.get("at").and_then(|v| v.as_u64()).unwrap_or(0),
         "provider_id": key.provider_id.as_str(),
         "uuid": key.uuid,
-        "text": entry.get("text").and_then(|v| v.as_str()).unwrap_or(""),
-        "button": entry.get("button").and_then(|v| v.as_str()).unwrap_or(""),
+        "text": text,
+        "button": button,
       });
       let _ = writeln!(file, "{line}");
     }
@@ -2089,9 +2127,26 @@ impl SessionManager {
         locked.notice = Some(format!("自动审批已熔断关闭，但写盘失败：{err}"));
       }
     }
+    let allow_commands = locked.store.settings.auto_approve_commands;
+    let warm_labels: Vec<String> = locked
+      .warm_pool
+      .values()
+      .map(|e| e.webview_label.clone())
+      .collect();
     let snap = Self::snapshot_from_locked(&locked);
     drop(locked);
     self.emit_snapshot(app, &snap);
+    // 熔断后立即把关闭广播到所有保活 webview：之前只持久化了开关，
+    // 已加载页面里 window.__maamAutoApprove 仍是 true，会继续自动点击
+    // 直到页面重载。只在 tripped 时广播（needsManual 不改开关）。
+    if tripped {
+      let sync_js = Self::auto_approve_sync_js(false, allow_commands);
+      for label in warm_labels {
+        if let Some(wv) = app.get_webview(&label) {
+          let _ = wv.eval(&sync_js);
+        }
+      }
+    }
   }
 
   #[cfg(desktop)]
@@ -2835,10 +2890,6 @@ impl SessionManager {
       sys_sections.push("（请继续遵循本会话已提供的背景资料与输出规范）".to_string());
     }
 
-    if let Some(stage_inst) = stage_clean {
-      sys_sections.push(format!("[阶段要求]\n{stage_inst}"));
-    }
-
     let mut user_sections: Vec<String> = Vec::new();
     if !history_lines.is_empty() {
       user_sections.push(format!("[上文纪要]\n{}", history_lines.join("\n")));
@@ -2857,6 +2908,12 @@ impl SessionManager {
           "[接力标记说明]\n如需补充复核，可在回答末尾附上 @标记（可选：{other_names}）；无需接力则不要写 @。"
         ));
       }
+    }
+
+    // 阶段要求放进 user 段：它含前序成员的回复原文（不可信内容），
+    // 绝不能进 system 段，否则会被模型当作系统指令执行（MAAM-H-01）。
+    if let Some(stage_inst) = stage_clean {
+      user_sections.push(format!("[阶段要求]\n{stage_inst}"));
     }
 
     if sys_sections.is_empty() && user_sections.is_empty() {
@@ -2882,7 +2939,79 @@ impl SessionManager {
     };
     Some((system_section, user_section, full_prompt, fingerprint))
   }
+}
 
+/// 在 Drop 里清理需要 `inner` 锁的记账：优先 try_lock 同步做完；
+/// 抢不到锁时派生异步任务做（运行时存活期间可用；进程退出时记账
+/// 随内存一起消失，无需清理）。供下面的两个 Drop 守卫共用。
+#[cfg(desktop)]
+fn cleanup_inner_on_drop<F>(mgr: &Arc<SessionManager>, f: F)
+where
+  F: FnOnce(&mut InnerState) + Send + 'static,
+{
+  match mgr.inner.try_lock() {
+    Ok(mut locked) => f(&mut *locked),
+    Err(_) => {
+      let mgr = Arc::clone(mgr);
+      tauri::async_runtime::spawn(async move {
+        let mut locked = mgr.inner.lock().await;
+        f(&mut *locked);
+      });
+    }
+  }
+}
+
+/// 回合记账 Drop 守卫：in_flight 计数与 warm-pool 时间戳在回合结束时
+/// 统一扣减/更新。正常路径、提前返回与 panic 都走这里，避免计数泄漏
+/// 导致 warm-pool 永久认为该成员在跑而不回收。
+#[cfg(desktop)]
+struct InFlightGuard {
+  mgr: Arc<SessionManager>,
+  app: AppHandle,
+  key: AccountKey,
+}
+
+#[cfg(desktop)]
+impl Drop for InFlightGuard {
+  fn drop(&mut self) {
+    let app = self.app.clone();
+    let key = self.key.clone();
+    cleanup_inner_on_drop(&self.mgr, move |locked| {
+      if let Some(cnt) = locked.in_flight_group_members.get_mut(&key) {
+        *cnt = cnt.saturating_sub(1);
+        if *cnt == 0 {
+          locked.in_flight_group_members.remove(&key);
+        }
+      }
+      if let Some(entry) = locked.warm_pool.get_mut(&key) {
+        entry.last_used_ms = now_ms();
+      }
+      SessionManager::apply_desktop_layout_locked(&app, locked);
+    });
+  }
+}
+
+/// 外部回合取消令牌 Drop 守卫：登记后无论正常结束、提前返回还是
+/// panic 都注销，避免「停止」按钮把已结束的回合当成还在跑。
+#[cfg(desktop)]
+struct ExternalTurnCancelGuard {
+  mgr: Arc<SessionManager>,
+  group_id: String,
+  msg_id: String,
+}
+
+#[cfg(desktop)]
+impl Drop for ExternalTurnCancelGuard {
+  fn drop(&mut self) {
+    let group_id = self.group_id.clone();
+    let msg_id = self.msg_id.clone();
+    cleanup_inner_on_drop(&self.mgr, move |locked| {
+      locked.external_turn_cancel.remove(&(group_id, msg_id));
+    });
+  }
+}
+
+impl SessionManager {
   #[cfg(desktop)]
   #[allow(clippy::too_many_arguments)]
   pub(super) async fn run_group_member_turn(
@@ -2921,24 +3050,37 @@ impl SessionManager {
       }
     };
 
-    match transport {
+    // 并发锁：同一成员的回合必须串行。之前只有 webview 成员拿了
+    // group_member_locks，外部成员（API/CLI）没拿——两个回合可能
+    // 同时跑同一个本地 CLI，stdin/输出/文件互相交错。锁由
+    // _member_guard（Drop 即释放）持有整个回合；in_flight 计数
+    // 由下面的 InFlightGuard 在函数尾统一扣减（正常、提前返回、
+    // panic 都走守卫）。
+    let member_lock = {
+      let mut locked = self.inner.lock().await;
+      *locked
+        .in_flight_group_members
+        .entry(member_key.clone())
+        .or_insert(0) += 1;
+      Self::apply_desktop_layout_locked(app, &locked);
+      Arc::clone(
+        locked
+          .group_member_locks
+          .entry(member_key.clone())
+          .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+      )
+    };
+    let _member_guard = member_lock.lock_owned().await;
+    // 守卫在 _member_guard 之后声明，先于它释放：下一轮同成员回合
+    // 开始前，计数已扣减。
+    let _in_flight_guard = InFlightGuard {
+      mgr: Arc::clone(self),
+      app: app.clone(),
+      key: member_key.clone(),
+    };
+    let reply = match transport {
       ResolvedMemberTransport::WebView { .. } => {
-        let member_lock = {
-          let mut locked = self.inner.lock().await;
-          *locked
-            .in_flight_group_members
-            .entry(member_key.clone())
-            .or_insert(0) += 1;
-          Self::apply_desktop_layout_locked(app, &locked);
-          Arc::clone(
-            locked
-              .group_member_locks
-              .entry(member_key.clone())
-              .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
-          )
-        };
-        let _member_guard = member_lock.lock_owned().await;
-        let reply = if let Ok(_permit) = Arc::clone(&self.group_worker_semaphore)
+        if let Ok(_permit) = Arc::clone(&self.group_worker_semaphore)
           .acquire_owned()
           .await
         {
@@ -2958,22 +3100,7 @@ impl SessionManager {
             .await
         } else {
           None
-        };
-
-        {
-          let mut locked = self.inner.lock().await;
-          if let Some(cnt) = locked.in_flight_group_members.get_mut(member_key) {
-            *cnt = cnt.saturating_sub(1);
-            if *cnt == 0 {
-              locked.in_flight_group_members.remove(member_key);
-            }
-          }
-          if let Some(entry) = locked.warm_pool.get_mut(member_key) {
-            entry.last_used_ms = now_ms();
-          }
-          Self::apply_desktop_layout_locked(app, &locked);
         }
-        reply
       }
       ResolvedMemberTransport::OpenAiApi { agent }
       | ResolvedMemberTransport::LocalCli { agent } => {
@@ -2991,7 +3118,8 @@ impl SessionManager {
           )
           .await
       }
-    }
+    };
+    reply
   }
 
   #[cfg(desktop)]
@@ -3076,6 +3204,7 @@ impl SessionManager {
     });
 
     // 取消令牌：本轮执行期间登记，结束后注销，供前端「停止」按钮置位。
+    // 注销由守卫接管：函数尾（正常、提前返回、panic）都注销。
     let cancel_flag = Arc::new(AtomicBool::new(false));
     {
       let mut locked = self.inner.lock().await;
@@ -3084,6 +3213,11 @@ impl SessionManager {
         Arc::clone(&cancel_flag),
       );
     }
+    let _cancel_guard = ExternalTurnCancelGuard {
+      mgr: Arc::clone(self),
+      group_id: group_id.to_string(),
+      msg_id: msg_id.to_string(),
+    };
 
     let result = match agent.kind {
       ExternalAgentKind::OpenaiApi => {
@@ -3108,12 +3242,6 @@ impl SessionManager {
 
     drop(prog_tx);
     let _ = fwd_handle.await;
-    {
-      let mut locked = self.inner.lock().await;
-      locked
-        .external_turn_cancel
-        .remove(&(group_id.to_string(), msg_id.to_string()));
-    }
 
     match result {
       Ok(final_text) => {
@@ -3562,8 +3690,14 @@ impl SessionManager {
       let mut last_pushed_is_transient = false;
       let mut poll_eval_misses = 0usize;
       let mut trigger_reload_retry = false;
-      for _ in 0..420 {
+      for poll_round in 0..420 {
         tokio::time::sleep(std::time::Duration::from_millis(450)).await;
+        // 群聊轮询期间定期拉取自动审批上报（约每 9 秒一次）：熔断在
+        // 群聊进行中触发时，不必等保活同步周期才关闭已加载页面的自动点击。
+        // drain 本身只做一次 JS eval，无上报时立即返回，开销可忽略。
+        if poll_round % 20 == 0 {
+          self.drain_auto_approve_report(app, member_key, &wv).await;
+        }
         let res = match Self::eval_json_callback(&wv, &poll_js).await {
           Some(v) => {
             poll_eval_misses = 0;

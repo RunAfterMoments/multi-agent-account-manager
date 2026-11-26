@@ -542,7 +542,7 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
         return
       }
       if scheme == "blob" {
-        if let inner = blobInnerUrl(from: abs), let host = inner.host?.lowercased() {
+        if let inner = blobInnerUrl(from: abs), inner.scheme?.lowercased() == "https", let host = inner.host?.lowercased() {
           // hostMatchesAllowed 只认 https scheme，blob 内层 host 需手动比对白名单。
           let hostAllowed = currentSpec.allowedHosts.contains("*") || currentSpec.allowedHosts.contains { allowed in
             let clean = allowed.lowercased()

@@ -4,7 +4,6 @@ import android.net.Uri
 import app.tauri.plugin.Channel
 import app.tauri.plugin.JSObject
 import java.lang.ref.WeakReference
-import java.util.concurrent.atomic.AtomicLong
 
 data class AndroidAccountSessionSpec(
     val providerId: String,
@@ -23,7 +22,6 @@ data class AndroidAccountSessionSpec(
 
 object AccountSessionCoordinator {
     private val lock = Any()
-    private val localViewBump = AtomicLong(1_000_000L)
 
     @Volatile
     private var pluginInitialized: Boolean = false
@@ -74,15 +72,24 @@ object AccountSessionCoordinator {
             if (!pluginInitialized) {
                 return null
             }
-            val base = committedSpec ?: return null
+            // 已提交的会话优先；提交前重建（加载中旋转屏幕）则用 activeSpec 续跑，
+            // 绑定后仍走 markCommittedAndReveal 提交，提交状态机不变。
+            val base = committedSpec ?: activeSpec ?: return null
             if (latestSwitchSeq != base.switchSeq) {
                 emitRecreateRequestedLocked(latestSwitchSeq)
                 return null
             }
-            val refreshed = base.copy(viewInstanceId = localViewBump.incrementAndGet())
-            activeSpec = refreshed
-            committedSpec = refreshed
-            return refreshed
+            // 关键：恢复时必须沿用原 viewInstanceId，不得新发一个。
+            // Rust 侧 ActiveSessionSlot 只认 open_account_session 时传过去的 id，
+            // Kotlin 侧单方面换 id 会导致之后所有 mobile 事件
+            // （pageCommitVisible / identityDetected 等）校验失败被丢弃，
+            // 页面看似打开、管理器却永远收不到提交，会话卡死。
+            // 旧 Activity 实例的失效不需要靠换 id：它的 WebView 在 onDestroy
+            // 释放、探活循环在 onPause 停止，残留回调另有
+            // activeSessionGeneration 代际号拦截。
+            // 恢复是幂等的：连续两次重建返回同一份 spec。
+            activeSpec = base
+            return base
         }
     }
 

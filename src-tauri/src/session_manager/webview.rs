@@ -437,7 +437,7 @@ impl SessionManager {
     .focused(false)
     .background_throttling(tauri::utils::config::BackgroundThrottlingPolicy::Disabled)
     .initialization_script(&format!(
-      "window.__maamAutoApprove = {}; window.__maamAutoApproveAllowCommands = {};",
+      "window.__maamAutoApprove = {}; window.__maamAutoApproveAllowCommands = {}; window.__maamAutoApproveOrigins = {};",
       if self.auto_approve.load(Ordering::SeqCst) {
         "true"
       } else {
@@ -447,7 +447,10 @@ impl SessionManager {
         "true"
       } else {
         "false"
-      }
+      },
+      // auto_approve.js 的门控用：只在这些本站 origin 下运行。
+      serde_json::to_string(&provider_spec.info.callback_origins)
+        .unwrap_or_else(|_| "[]".to_string())
     ))
     .initialization_script(LOGIN_CAPTURE_INIT_JS)
     .initialization_script(AUTO_APPROVE_INIT_JS)

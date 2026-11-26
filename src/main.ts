@@ -464,6 +464,14 @@ function render(): void {
   }
 
   bindEvents(snapshot, provider);
+  // 密码框不在 innerHTML 里写 value（防 Key 进序列化快照）：每次重绘后
+  // 把草稿值写回输入框，否则 30 秒保活刷新/群聊流式重绘会把已输的 Key
+  // 视觉清空（草稿本身还在，但用户以为丢了）。放在焦点恢复之前，
+  // 避免写 value 把光标顶到末尾。
+  if (modal.kind === "external-agents" && modal.formKind === "openai_api") {
+    const keyInput = document.querySelector<HTMLInputElement>("#ext-agent-key-input");
+    if (keyInput) keyInput.value = modal.apiKeyDraft;
+  }
   if (accountInputSelection) {
     const input = document.querySelector<HTMLInputElement | HTMLTextAreaElement>(
       `#${accountInputSelection.id}`
@@ -2042,6 +2050,10 @@ function bindEvents(state: ManagerSnapshot, provider: ProviderInfo): void {
       // 预设不带 Key：切预设必须清空 Key 草稿，否则之前给别的
       // 成员输的 Key 会跟着保存进这个预设成员里。
       modal.apiKeyDraft = "";
+      // 切预设同时退出编辑态：否则正编辑的旧成员（editingId 已设，
+      // Vault 里有它的 Key）会被改成这个预设的 baseUrl 后保存，
+      // 旧 Key 会被发到新服务上。
+      modal.editingId = null;
       modal.modelDraft = preset.model ?? "";
       modal.commandDraft = preset.command ?? "";
       modal.argsDraft = preset.args ?? "";

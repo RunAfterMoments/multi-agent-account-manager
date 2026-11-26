@@ -1475,6 +1475,37 @@ pub fn load_or_migrate_store(path: &Path) -> LoadedAccountsStore {
   }
 }
 
+/// 仅内存解析候选配置文本（供「从备份恢复」校验用）：不读盘、不写盘、
+/// 不做损坏备份、不做 vault 迁移、不做迁移写回。成功返回可直接写回的
+/// LoadedAccountsStore；失败返回原因。未来版本拒绝恢复（重写会丢
+/// 未知字段）；账号 UUID 冲突的仍可恢复（last_committed 置空，UI 侧处理）。
+pub fn parse_store_str(raw: &str) -> Result<LoadedAccountsStore, String> {
+  let parsed: Value = serde_json::from_str(raw).map_err(|e| format!("配置 JSON 解析失败: {e}"))?;
+  let file_version = parsed
+    .get("version")
+    .and_then(|v| v.as_u64())
+    .map(|v| v as u32)
+    .unwrap_or(1);
+  if file_version > STORE_VERSION {
+    return Err(format!(
+      "配置版本（v{file_version}）高于当前版本（v{STORE_VERSION}），无法恢复"
+    ));
+  }
+  let (mut store, _migrated) =
+    migrate_from_value(parsed).map_err(|reason| format!("解析 accounts.json 失败（{reason}）"))?;
+  let conflicts = detect_conflicts(&store.accounts);
+  if !conflicts.is_empty() {
+    store.last_committed = None;
+  }
+  Ok(LoadedAccountsStore {
+    store,
+    conflicts,
+    startup_notice: None,
+    persist_blocked: false,
+    read_only: false,
+  })
+}
+
 #[cfg(test)]
 mod tests {
   use super::migrate_from_value;

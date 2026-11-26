@@ -207,8 +207,26 @@ pub fn classify_top_level_url(
   allow_blank: bool,
 ) -> NavigationDecision {
   let raw = url.as_str();
-  if raw == "about:srcdoc" || raw.starts_with("blob:https://") || raw.starts_with("blob:null/") {
+  if raw == "about:srcdoc" || raw.starts_with("blob:null/") {
     return NavigationDecision::AllowBlank;
+  }
+  if let Some(inner_raw) = raw.strip_prefix("blob:") {
+    // blob:https:// 剥前缀验内层 host（与 iOS 一致）：内层必须是 https
+    // 且 host 在白名单内；blob:http:// 或内层外站一律拒绝。
+    if let Ok(inner) = Url::parse(inner_raw) {
+      if inner.scheme() == "https" {
+        if let Some(host) = inner.host_str() {
+          if spec
+            .allowed_hosts
+            .iter()
+            .any(|allowed| host_matches(host, allowed))
+          {
+            return NavigationDecision::AllowBlank;
+          }
+        }
+      }
+    }
+    return NavigationDecision::Deny;
   }
   if allow_blank && raw == "about:blank" {
     return NavigationDecision::AllowBlank;
@@ -359,6 +377,17 @@ mod tests {
     assert_eq!(
       classify_top_level_url(&spec, &url, false),
       NavigationDecision::AllowBlank
+    );
+    // 内层外站 / 内层 http 一律拒绝（与 iOS 子帧规则一致）。
+    let url = Url::parse("blob:https://evil.com/1234").unwrap();
+    assert_eq!(
+      classify_top_level_url(&spec, &url, false),
+      NavigationDecision::Deny
+    );
+    let url = Url::parse("blob:http://muse.ai/1234").unwrap();
+    assert_eq!(
+      classify_top_level_url(&spec, &url, false),
+      NavigationDecision::Deny
     );
   }
 

@@ -1,6 +1,7 @@
 # CI：每次 push 与 pull_request 都跑类型检查、格式、clippy 与全部测试。
 # 全部 action 均固定到 commit SHA（非浮动 tag），由 Dependabot 负责更新。
-# 注意：release.yml 保持不动，不在此处改动；见 docs/hardening-notes-ci.md。
+# 注意：release.yml 一般不在此处改动；例外是复审要求的顶层 env 注入
+# MAAM_UPDATE_REPO（见 docs/hardening-notes-updater.md），除此之外仍不动 release.yml。
 name: CI
 
 on:
@@ -19,7 +20,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, windows-2025]
+        os: [ubuntu-24.04, windows-2025, macos-15]
     steps:
       # actions/checkout@v7.0.1
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -45,6 +46,13 @@ jobs:
           sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libssl-dev build-essential pkg-config
       - run: npm ci
       - run: npx tsc --noEmit
+      - run: npm run test:js
       - run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
       - run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
       - run: cargo test --manifest-path src-tauri/Cargo.toml
+      # 依赖审计：cargo-audit 走官方发布锁版安装（不引入第三方 action，免 pin SHA）；
+      # npm 只审生产依赖（随产物发布的部分）。首次跑即见分晓：若依赖树已有已知漏洞，CI 直接变红。
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - run: cargo audit
+      - run: npm audit --omit=dev

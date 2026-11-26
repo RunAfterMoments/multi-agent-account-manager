@@ -1447,6 +1447,10 @@ fn normalize_same_site(raw: Option<&str>) -> Option<String> {
 /// 公共后缀下，发往攻击者控制的同后缀子域。
 const ALLOWED_PARENT_DOMAINS: &[&str] = &["hark.com", "muse.ai"];
 
+/// 单次 Cookie 导入上限：最多 200 条、合计 512 KiB，防超大粘贴撑内存。
+const MAX_IMPORTED_COOKIES: usize = 200;
+const MAX_IMPORTED_COOKIES_BYTES: usize = 512 * 1024;
+
 fn push_validated_imported_cookie(
   out: &mut Vec<ImportedCookieSpec>,
   seen: &mut std::collections::HashMap<(String, String, String), usize>,
@@ -1552,7 +1556,23 @@ fn push_validated_imported_cookie(
     same_site,
     max_age_secs,
   };
+  // 总量上限：替换同名条目不计条数，但计总大小；超限的条目直接丢弃。
+  let new_bytes = spec.name.len() + spec.value.len() + spec.domain.len() + spec.path.len();
   let key = (name.to_string(), domain, path);
+  let old_bytes = seen.get(&key).map(|&i| {
+    let o = &out[i];
+    o.name.len() + o.value.len() + o.domain.len() + o.path.len()
+  });
+  let cur_bytes: usize = out
+    .iter()
+    .map(|s| s.name.len() + s.value.len() + s.domain.len() + s.path.len())
+    .sum();
+  if cur_bytes - old_bytes.unwrap_or(0) + new_bytes > MAX_IMPORTED_COOKIES_BYTES {
+    return;
+  }
+  if old_bytes.is_none() && out.len() >= MAX_IMPORTED_COOKIES {
+    return;
+  }
   if let Some(&idx) = seen.get(&key) {
     out[idx] = spec;
   } else {

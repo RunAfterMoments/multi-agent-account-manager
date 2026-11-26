@@ -650,12 +650,12 @@ export function renderModal(
       eModal.formKind === "openai_api"
         ? `
           <input id="ext-agent-url-input" class="modal-input" maxlength="260" placeholder="Base URL（例如 https://api.deepseek.com/v1 或 http://127.0.0.1:11434/v1）" value="${escapeHtml(eModal.baseUrlDraft)}" ${saving ? "disabled" : ""} />
-          <input id="ext-agent-key-input" class="modal-input" maxlength="512" type="password" placeholder="API Key（编辑时留空表示不修改；本机 Ollama 可留空）" ${saving ? "disabled" : ""} />
+          <input id="ext-agent-key-input" class="modal-input" maxlength="512" type="password" autocomplete="new-password" spellcheck="false" placeholder="API Key（编辑时留空表示不修改；本机 Ollama 可留空）" ${saving ? "disabled" : ""} />
           <input id="ext-agent-model-input" class="modal-input" maxlength="120" placeholder="模型名称（例如 gpt-4o / deepseek-chat / qwen2.5:14b）" value="${escapeHtml(eModal.modelDraft)}" ${saving ? "disabled" : ""} />
         `
         : `
           <input id="ext-agent-cmd-input" class="modal-input" maxlength="260" placeholder="CLI 命令（例如 claude / codex / gemini）" value="${escapeHtml(eModal.commandDraft)}" ${saving ? "disabled" : ""} />
-          <input id="ext-agent-args-input" class="modal-input" maxlength="400" placeholder="命令参数，空格分隔（例如 -p 或 exec {prompt}；无 {prompt} 时走 stdin）" value="${escapeHtml(eModal.argsDraft)}" ${saving ? "disabled" : ""} />
+          <input id="ext-agent-args-input" class="modal-input" maxlength="400" placeholder="命令参数，空格分隔（例如 -p 或 exec；prompt 自动走 stdin，不要写 {prompt}）" value="${escapeHtml(eModal.argsDraft)}" ${saving ? "disabled" : ""} />
           <input id="ext-agent-workdir-input" class="modal-input" maxlength="260" placeholder="工作目录（选填，例如 /Users/name/project）" value="${escapeHtml(eModal.workdirDraft)}" ${saving ? "disabled" : ""} />
         `;
 

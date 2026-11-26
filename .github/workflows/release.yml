@@ -20,6 +20,11 @@ on:
 permissions:
   contents: read
 
+env:
+  # 更新源：编译进二进制（updater.rs 经 option_env!("MAAM_UPDATE_REPO") 读取）。
+  # 未设置时发布产物默认关闭更新检查；github.repository 使 fork 构建自动指向自己的仓库。
+  MAAM_UPDATE_REPO: ${{ github.repository }}
+
 jobs:
   desktop:
     name: ${{ matrix.name }}
@@ -108,6 +113,23 @@ jobs:
           workspaces: ./src-tauri -> target
       - run: npm ci
       - run: npm run tauri -- android init --ci --skip-targets-install
+      # gen/android 由 init 生成且被 .gitignore 排除，无法入库改模板；
+      # 在此打补丁：禁止 Android 自动备份带走账号会话数据（cookie / WebView Profile）。
+      # 若模板已含该属性则改值，若无则插入；grep 校验失败即中断构建。
+      - name: Disable Android auto-backup (allowBackup=false)
+        run: |
+          manifest="src-tauri/gen/android/app/src/main/AndroidManifest.xml"
+          python3 - "$manifest" <<'PY'
+          import re, sys
+          path = sys.argv[1]
+          text = open(path, encoding="utf-8").read()
+          if 'android:allowBackup=' in text:
+              text = re.sub(r'android:allowBackup="[^"]*"', 'android:allowBackup="false"', text, count=1)
+          else:
+              text = text.replace("<application", '<application android:allowBackup="false"', 1)
+          open(path, "w", encoding="utf-8").write(text)
+          PY
+          grep -q 'android:allowBackup="false"' "$manifest" || { echo "allowBackup patch not applied" >&2; exit 1; }
       - name: Build test APK
         if: env.APK_VARIANT == 'debug'
         run: |

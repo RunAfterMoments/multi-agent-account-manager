@@ -188,6 +188,12 @@ struct InnerState {
   group_context_synced: HashMap<(String, AccountKey), (u64, u64)>,
   #[cfg(desktop)]
   group_member_locks: HashMap<AccountKey, Arc<tokio::sync::Mutex<()>>>,
+  /// A2A 接力进行中的目标（group_id -> 目标成员）：并行跑着的两条接力链
+  /// 可能同时点名同一成员；已在途中的目标不再重复扇出（visited 只防
+  /// 同一条链内的重复）。目标回合结束即释放；panic 会残留条目（该成员
+  /// 本轮不再被自动接力，重启后恢复）。
+  #[cfg(desktop)]
+  a2a_relay_in_flight: HashMap<String, HashSet<AccountKey>>,
   #[cfg_attr(not(desktop), allow(dead_code))]
   group_channel_last_account: HashMap<(String, ProviderId), AccountKey>,
   #[cfg_attr(not(desktop), allow(dead_code))]
@@ -286,7 +292,10 @@ impl SessionManager {
         #[cfg(desktop)]
         group_context_synced: HashMap::new(),
         #[cfg(desktop)]
+        #[cfg(desktop)]
         group_member_locks: HashMap::new(),
+        #[cfg(desktop)]
+        a2a_relay_in_flight: HashMap::new(),
         group_channel_last_account: HashMap::new(),
         account_last_assigned_ms: HashMap::new(),
         account_cooldown_until_ms: HashMap::new(),
@@ -1652,15 +1661,7 @@ impl SessionManager {
 
     #[cfg(desktop)]
     {
-      let sync_js = format!(
-        "(() => {{ try {{ window.__maamAutoApprove = {}; window.__maamAutoApproveAllowCommands = {}; if (window.__maamAutoApprove && typeof window.__maamScanAutoApprove === 'function') window.__maamScanAutoApprove(); }} catch (_) {{}} }})()",
-        if next_auto_approve { "true" } else { "false" },
-        if next_auto_approve_commands {
-          "true"
-        } else {
-          "false"
-        }
-      );
+      let sync_js = Self::auto_approve_sync_js(next_auto_approve, next_auto_approve_commands);
       for label in warm_labels {
         if let Some(wv) = app.get_webview(&label) {
           let _ = wv.eval(&sync_js);
@@ -1671,6 +1672,16 @@ impl SessionManager {
     let _ = warm_labels;
 
     Ok(snap)
+  }
+
+  /// 把自动审批开关同步到已加载页面的 JS 变量（设置页切换与熔断共用）。
+  #[cfg(desktop)]
+  fn auto_approve_sync_js(auto_approve: bool, allow_commands: bool) -> String {
+    format!(
+      "(() => {{ try {{ window.__maamAutoApprove = {}; window.__maamAutoApproveAllowCommands = {}; if (window.__maamAutoApprove && typeof window.__maamScanAutoApprove === 'function') window.__maamScanAutoApprove(); }} catch (_) {{}} }})()",
+      if auto_approve { "true" } else { "false" },
+      if allow_commands { "true" } else { "false" }
+    )
   }
 
   pub async fn reveal_downloaded_file(&self, download_id: u64) -> Result<(), String> {
@@ -2334,7 +2345,8 @@ impl SessionManager {
           .entry(url.as_str().to_string())
           .or_default()
           .push_back((download_id, destination.clone()));
-        let _ = app.emit(
+        let _ = app.emit_to(
+          "manager",
           "download-event",
           DownloadNoticeEvent {
             id: download_id,
@@ -2364,7 +2376,8 @@ impl SessionManager {
           if let Some(saved_path) = final_path {
             self.record_recent_download(download_id, saved_path);
           }
-          let _ = app.emit(
+          let _ = app.emit_to(
+            "manager",
             "download-event",
             DownloadNoticeEvent {
               id: download_id,
@@ -2374,7 +2387,8 @@ impl SessionManager {
             },
           );
         } else {
-          let _ = app.emit(
+          let _ = app.emit_to(
+            "manager",
             "download-event",
             DownloadNoticeEvent {
               id: download_id,
@@ -2645,7 +2659,8 @@ impl SessionManager {
         percent,
         message,
       } => {
-        let _ = app.emit(
+        let _ = app.emit_to(
+          "manager",
           "update-progress",
           crate::updater::UpdateProgressEvent {
             stage,
@@ -2994,6 +3009,16 @@ mod tests {
     assert_eq!(
       SessionManager::parse_at_mentions("@all 总结", &members),
       (true, vec![])
+    );
+    // 邮箱抑制优先于广播关键词：嵌在邮箱形文本里的 @all / @全体成员
+    // 不触发（a.b@all.com 明确是个邮箱；真正的 @all 是独立词元）。
+    assert_eq!(
+      SessionManager::parse_at_mentions("联系 a.b@all.com 看一下", &members),
+      (false, vec![])
+    );
+    assert_eq!(
+      SessionManager::parse_at_mentions("抄送 x@全体成员", &members),
+      (false, vec![])
     );
   }
 
@@ -3537,15 +3562,16 @@ mod tests {
     );
 
     // kind 改为 local_cli：vault 里的旧 Key 必须同步清除，不得成孤儿。
+    // 命令须用白名单内的（claude）：PR-D 起非白名单命令保存即拒绝。
     mgr
       .upsert_external_agent(
         Some(agent_id),
         ExternalAgentKind::LocalCli,
-        "DeepSeek-CLI".to_string(),
+        "Claude-CLI".to_string(),
         String::new(),
         String::new(),
         String::new(),
-        "deepseek-cli".to_string(),
+        "claude".to_string(),
         vec![],
         None,
         None,

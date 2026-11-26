@@ -2528,6 +2528,18 @@ class AccountWebActivity : AppCompatActivity() {
 
     private fun openLastDownloadedFile() {
         val uri = lastDownloadedUri ?: return
+        // 禁止一键打开 APK 安装包：下载的 APK 可能是仿冒更新/恶意文件，
+        // 必须由用户到下载目录手动点开安装（系统安装器会再确认一次）。
+        if (lastDownloadedMime == "application/vnd.android.package-archive") {
+            showDownloadStatus(
+                text = "APK 安装包请到下载目录手动打开安装",
+                canOpen = false,
+                showDir = true,
+                isError = false,
+                autoHide = true,
+            )
+            return
+        }
         val intent = Intent(Intent.ACTION_VIEW).apply {
             setDataAndType(uri, lastDownloadedMime)
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)

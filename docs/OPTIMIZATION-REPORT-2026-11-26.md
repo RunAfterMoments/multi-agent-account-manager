@@ -281,3 +281,294 @@ PR-D（A2A/LocalCli 提权与隔离）、PR-E（updater 防降级、CI、Command
    点「继续使用空配置」应继续。
 7. 桌面端：`cargo test --lib` 与 `cargo clippy` 在有依赖的机器上跑通；
    NSIS 安装包在干净 Windows 虚拟机上装一次，确认重装分支不调旧卸载器。
+
+## 八、P0 攻坚 PR-C + PR-D + PR-E（v6，2026-11-26 晚）
+
+### 首次真实编译（前置步骤 0）
+
+经用户批准安装系统库（`libwebkit2gtk-4.1-dev libgtk-3-dev
+libayatana-appindicator3-dev librsvg2-dev libsoup-3.0-dev`）后首次跑通
+`cargo test --lib` 的编译。两处环境坑已踩过并记录：
+`libzstd-dev` 依赖的 `libzstd1` 与镜像自带的 Hatch 钉死版冲突，
+需先 `--allow-downgrades` 降级 `libzstd1` 再装；`/tmp` 是 512M tmpfs，
+cargo 目标目录放里面会撑爆，改用
+`CARGO_TARGET_DIR=$HOME/workspace/multi-agent-optimization/target-maam`。
+首次编译即抓出 PR-C 的一个真 bug（见下 `is_global_ip`）——
+此前所有“验证通过”都只是 rustfmt / tsc / JS 测试，从未编过 Rust。
+
+### PR-C — OpenAI API SSRF / 重定向 / 字节上限 + auto_approve 门控（MAAM-H-04/H-03）
+
+- `src-tauri/src/group_transport.rs`：新增
+  `validate_openai_endpoint_host`，在 `execute_openai_api_turn_inner`
+  开头调用。URL 解析、只认 http(s)、`(host, port).to_socket_addrs()`
+  解析出全部地址逐个判断；IPv4 映射 IPv6（`::ffff:10.0.0.1`）先还原
+  成 IPv4；loopback 放行（本机 Ollama `127.0.0.1:11434` 是文档化合法
+  用法），其余地址必须全局可路由，否则拒绝。
+- **编译 bug 修复**：`IpAddr::is_global()` 在稳定版 Rust 1.100.0 上
+  是不稳定 API（E0658），首次 `cargo test` 编译失败于此。改为手写
+  `is_global_ip`（按 IANA 特殊用途地址表：IPv4 覆盖 0/8、10/8、
+  100.64/10、127/8、169.254/16、172.16/12、192.0.0.0/24、192.0.2/24、
+  192.168/16、198.18/15、198.51.100/24、203.0.113/24、224/4、240/4；
+  IPv6 覆盖 ::/96、fc00::/7、fe80::/10、fec0::/10、ff00::/8、
+  2001:db8::/32、2001::/32、2001:2::/48、100::/64、64:ff9b::/96），
+  宁可误拒、绝不放过。测试随之扩展（0.0.0.0、组播、广播、三段文档地址、
+  ::、2001:db8、ff02 均拒绝；公网 IPv6 `2606:4700:4700::1111` 放行）。
+  残留：解析时检查与 reqwest 连接时再次解析之间存在 TOCTOU，
+  彻底的固定需连接时钉死已解析 IP，本轮未做。
+- 客户端构造：`.redirect(Policy::none())`（禁重定向跟随）；
+  `read_timeout` 从写死 60 秒改为
+  `agent.idle_timeout_secs.clamp(10, 600)`（默认 60，与 CLI 路径的
+  idle-timeout 语义一致）。
+- 字节上限：`MAX_API_SSE_LINE_BYTES = 1MB`（单行超限直接报错）、
+  `MAX_API_RESPONSE_BYTES = 8MB`（累计超限截断并附“超过…字节上限”说明，
+  与超时行为一致）、非流式体经 `read_response_body_capped` 读
+  （8MB 超限报错）、错误体上限 64KB。`raw_fallback` 本来已有 16KB 上限。
+- `src-tauri/src/js/auto_approve.js`：IIFE 的 try 块开头加三道门——
+  非顶层 frame 直接返回、非 https 直接返回、origin 不在
+  `window.__maamAutoApproveOrigins` 里（缺失/为空也拒绝）直接返回。
+  `src-tauri/src/session_manager/webview.rs` 在初始化脚本里注入该列表
+  （取 provider 的 `callback_origins`：muse 为 muse.ai / www.muse.ai，
+  hark 为 app.hark.com / hark.com）。弹窗 webview 从未注入过
+  AUTO_APPROVE_INIT_JS，只有 LOGIN_CAPTURE_INIT_JS，所以 fail-closed 安全。
+- 熔断广播：`session_manager.rs` 新增 `auto_approve_sync_js` 辅助
+  （设置开关也改用它）；`group_chat.rs` 的 `drain_auto_approve_report`
+  在熔断时除持久化与快照外，向**全部** warm_pool webview 下发
+  `(false, allow_commands)` 同步脚本——此前已加载页面里的
+  `__maamAutoApprove = true` 会残留并继续自动点击。
+- 审计日志 0o600：`append_auto_approve_audit` 每次 open 后都
+  `set_permissions(0o600)`（unix），连带收紧此前 0o644 的旧日志。
+- 测试：`openai_endpoint_host_filter_blocks_private_and_allows_loopback`
+  （见上）；Node 门控 harness 6/6 通过（本站、www 子域、iframe 拦截、
+  http 拦截、facebook.com 拦截、未注入 origins 拦截）；
+  `tests/auto_approve.test.mjs` 的 `makePage` 补注 origins 后
+  `npm run test:js` 恢复 15/15（此前因门控新增一度报
+  `__maamScanAutoApprove is not a function`）。
+
+### PR-D — A2A / LocalCli 提权与隔离（MAAM-H-01/M-09）
+
+- `src-tauri/src/group_transport.rs`：`build_turn_prompt_for_member`
+  里含其他成员完整回复的 `[阶段要求]` 段，从 `sys_sections` 移到
+  `user_sections`（置于 A2A 接力说明之后、`[当前问题]` 之前）。
+  系统提示只保留角色偏好、用户配置的共享上下文与技能。
+- `src-tauri/src/session_manager/a2a.rs`：`run_group_a2a_chain` 里，
+  接力目标是 LocalCli 成员（`external_agents` 查 `kind`）时不执行，
+  其消息以 `Error` 状态入列并写明“为安全起见未自动执行本地命令，
+  确认无误后点「重试」才会运行”，同时置 `locked.notice`。
+  注意：重试跑的是原始用户问题（往回找最近的 role==user），
+  不是接力片段。用户直接 @ LocalCli 成员不受影响。
+- 可执行文件白名单：`LOCAL_CLI_ALLOWED_COMMANDS =
+  ["claude", "codex", "gemini", "qwen", "opencode"]`，
+  `validate_local_cli_command` 按 `Path::file_stem` 小写比对；
+  在 `normalize_external_agent_input`（LocalCli 分支）与
+  `execute_local_cli_turn` 开头两处强制执行（后者兜住旧记录）。
+  拒绝 sh/bash/powershell/python3/node/rm/curl 与 `"claude --flag"` 式
+  flag 走私。
+- argv 里彻底去掉 `{prompt}`：`build_cli_args_and_stdin` 改为返回
+  `Result`，任何含 `{prompt}` 的参数（裸写或嵌入）都拒绝并说明
+  prompt 自动走 stdin（argv 会出现在进程列表里；首字符 `-` 即 flag
+  注入）；`check_batch_prompt_conflict` 随之删除；
+  `resolve_cli_executable`（Windows）简化为只返回 `PathBuf`。
+  前端：state.ts 的 codex 预设 `args: "exec {prompt}"` 改为 `"exec"`；
+  modals.ts 参数占位文案改为“prompt 自动走 stdin，不要写 {prompt}”。
+  行为变化：已保存的含 `{prompt}` 成员会在执行时明确报错，
+  需用户手动删掉 `{prompt}` 一次，未做静默存储迁移。
+  codex 走 stdin 可行，有 docs/hardening-notes-cli.md 的手工测试为证。
+- 最小 env：新增 `apply_minimal_cli_env`——`env_clear()` 后只补 PATH
+  （`build_augmented_path()`，无则沿用父进程 PATH），unix 仅透传
+  HOME、TMPDIR、LANG、LC_ALL、USER，Windows 仅透传 SystemRoot、
+  USERPROFILE、TEMP、TMP。走代理的 CLI 需在各自配置文件里配代理。
+- Job Object（仅 Windows）：创建 job 后调
+  `SetInformationJobObject(..., JobObjectExtendedLimitInformation, ...)`
+  置 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`，失败则 guard 保持 None
+  （走 taskkill 兜底），维持“guard 存在 ⟹ 标志已置”的不变式。
+  watcher 线程在发完 `Finished(Ok)` 后阻塞等 `job_done_rx` 再返回
+  （释放 job 句柄）；`_job_done_tx` 是 `execute_local_cli_turn` 里的
+  普通局部变量，所有返回路径（含超时提前返回与 panic）都会 drop 它。
+  500ms 管道排空（给还握着 stdout 的孙进程）保留。
+  **该段为 `#[cfg(windows)]`，本机 Linux 编译不到，需 Windows 编译 +
+  手工测试。**
+- stdout 2MB 上限：`MAX_CLI_STDOUT_BYTES`，累计超限即 `kill_tx` +
+  Err（“本地 CLI 输出超过 2097152 字节上限，已终止”）。
+  stderr 接收侧本来已截断 2048 字符。
+- 非零退出码一律报错：此前仅“非零且输出为空”才报错，改为任何
+  `code != 0` 都 Err，并附 stderr 摘要（≤240 字符）与/或部分 stdout
+  （≤500 字符）。信号终止（code 为 None）行为不变。
+- 并发锁：`run_group_member_turn` 里 per-member 锁与
+  `in_flight_group_members` 计数移到 transport match 之前，
+  OpenAiApi/LocalCli 回合也按成员串行（此前只有 WebView 回合拿锁，
+  两个回合能并发跑同一个本地 CLI）；`_member_guard`（tokio
+  `lock_owned`，Drop 释放）横跨整轮；计数递减 / warm-pool
+  `last_used_ms` / 布局块在 match 后统一跑一次。
+  `group_worker_semaphore` 仍只限 WebView 分支。
+- `parse_at_mentions`：广播词（全体成员/全体/所有人、不区分大小写的
+  all）先于邮箱抑制规则检查，成员别名仍走抑制。
+  `a.b@all.com` → 触发全体，`test@m1.com` 仍不触发。
+- 测试：新增/替换 `cli_args_reject_prompt_placeholder_and_always_use_stdin`、
+  `local_cli_command_allowlist_rejects_shells_and_unknown_binaries`、
+  `cli_turn_nonzero_exit_is_error_even_with_output`、
+  `cli_turn_stdout_cap_kills_runaway_output`（3MB 零字节流，
+  断言报错含 2097152 且 30 秒内返回）；`test_cli_agent` 改用
+  `fake_cli_command()`（`$TMPDIR/maam-test-fake-claude/claude`，
+  `#!/bin/sh` + `exec /bin/sh "$@"`，0o755），因执行时白名单
+  不再接受字面 `sh`。
+- 验证：4 个 Rust 文件 rustfmt 干净；`npm run build` 通过；
+  `npm run test:js` 15/15。`cargo test` 待首次编译结果（见下）。
+
+### PR-E — updater 防降级、CI、Command 校验、Android（MAAM-H-05/M-02/M-04）
+
+已完成（Kotlin + 工作流 + 文档）：
+- Android `AccountSessionCoordinator.kt` 的
+  `recoverSpecOnActivityRecreate`：此前每次重建都
+  `localViewBump.incrementAndGet()` 发一个新 `viewInstanceId` 并
+  覆盖 activeSpec/committedSpec；Rust 侧 `ActiveSessionSlot` 只认
+  `open_account_session` 时传过去的 id，Kotlin 单方面换 id 后，
+  重建 Activity 发出的全部 mobile 事件（pageCommitVisible /
+  identityDetected 等）在 `commit_mobile_session` /
+  `apply_detected_metadata` 的 id 校验里被丢弃——页面看似打开、
+  管理器永远收不到提交，会话卡死。改为沿用原 id（恢复幂等，
+  连续两次重建返回同一份 spec）；提交前重建（加载中旋转屏幕）
+  增加 `activeSpec` 兜底，绑定后仍走 `markCommittedAndReveal` 提交。
+  旧实例失效不需要换 id：WebView 在 onDestroy 释放、探活循环在
+  onPause 停止，残留回调另有 `activeSessionGeneration` 代际号拦截。
+  `localViewBump` 字段与 `AtomicLong` import 一并删除。
+  Kotlin 无工具链，本机只做了括号平衡与无残留引用检查，
+  未编译——需 Android 真机/CI 验证。
+- `release.yml`：顶层 `env` 注入
+  `MAAM_UPDATE_REPO: ${{ github.repository }}`，desktop/android/iOS
+  三个构建 job 全部生效——此前发布产物因编译期未配仓库地址，
+  更新检查默认关闭。离线 Ed25519 签名方案此前已在
+  `docs/hardening-notes-updater.md`“长期更新签名方案”一节成文
+  （minisign、清单与安装包双签、公钥编译进二进制、密钥轮换发新版），
+  本轮只更新该节第 6 点：仓库地址已接通，签名本身仍待用户生成密钥对
+  （`minisign -G`，私钥进 CI secret，公钥随构建注入）后落地。
+  另：`release.yml` 改动违反了 `docs/hardening-notes-ci.md`
+  “release.yml 保持不动”的约定，复审要求优先，`ci.yml` 头注释
+  已同步注明该例外。
+- `release.yml` Android job：`android init` 之后加
+  allowBackup 打补丁步骤。`src-tauri/gen/android` 由 init 生成且被
+  `.gitignore` 排除，无法入库改模板，故在工作流里用 python 处理
+  `AndroidManifest.xml`：已有该属性则改值、没有则插入，
+  随后 grep 校验失败即中断构建。两种情形（有/无属性）均已本地实测。
+  目的：禁止 Android 自动备份带走账号会话数据（cookie / WebView Profile）。
+- `ci.yml`：矩阵加 `macos-15`；加 `npm run test:js` 步骤；
+  加 `cargo audit`（`cargo install cargo-audit --locked` 安装，
+  不引入第三方 action、免 pin SHA）与 `npm audit --omit=dev`
+  （只审随产物发布的生产依赖）。两处 YAML 均已解析校验。
+  注意：`npm audit` 在本机因代理拦截 registry 审计端点未能实测，
+  `cargo-audit` 本机未安装，CI 首次跑即见分晓——若依赖树已有
+  已知漏洞，CI 直接变红，届时再定修复或放行。
+
+以上四项已全部完成，见第九节。
+
+## 九、P0 对齐 + v5 尾项 + PR-E Rust（v6，2026-11-26 晚）
+
+复审给 v5 打 6.8/10，要求 PR-C/D/E + 一次真编译才 GO。本轮三项全部
+做完，并首次跑通全量 Rust 测试（104 通过、0 失败）。v6 相对 v5：
+24 文件，约 +1400/-230（含报告）。
+
+### PR-C 对齐（复审 vs 初版的差）
+- **DNS 钉死**：`validate_openai_endpoint_host` 改返回
+  `(host, addrs)`，`execute_openai_api_turn_inner` 经
+  `resolve_to_addrs` 把地址钉进 reqwest 客户端；IP 字面量跳过钉死。
+  附带修了一个 PR-C 的真 bug：url crate 的 `host_str()` 对 IPv6 带
+  方括号（`"[::1]"`），`to_socket_addrs` 认不出——首轮全量测试即抓出
+  （`::1` 断言失败）。现 IP 字面量先解析再用、域名才走 DNS。
+- **字节上限收紧**：SSE 单行 1MB→256KiB；SSE 累计 8MB→2MiB（新常量
+  `MAX_API_SSE_ACCUMULATED_BYTES`）；非流式 JSON 8MB→4MiB（新常量
+  `MAX_API_JSON_BODY_BYTES`）；错误体 64KB→16KiB。
+- **ReDoS**：`isTransientStatusText` 两处（scripts.rs:2605/3307）加
+  160 字符上限 + 按行匹配。抽函数实测：12 组用例全过、对抗串 0ms、
+  1000 次 159 字符 3ms；“正在思考中”判 false 与原正则一致（非回归）。
+- **审计单条截断**：`append_auto_approve_audit` 里 text 截 1000 字、
+  button 截 128 字。
+- **熔断轮询同步**：群聊轮询循环（`for poll_round in 0..420`）每 20 轮
+  （约 9 秒）调一次 `drain_auto_approve_report`，不必等保活同步周期。
+- **auto_approve.js 门**：保留初版的 origins 白名单（callback_origins
+  注入），等价或严于复审的 https + top + isPrimaryHost 形式。
+
+### PR-D 对齐
+- **`parse_at_mentions` 改回邮箱抑制优先**：@ 前是字母数字即跳过，
+  广播词与别名都受保护；两条测试翻转为 `(false, [])`；独立的
+  @all / @全体成员不受影响。
+- **外部成员长度豁免取消**：超长时外部成员改截断后直接内联
+  （4500 字 + 已略标记），不再无上限；webview 仍走附件 + 截断兜底。
+  注意：`execute_external_member_turn` 根本不收 fallback/attachment，
+  复审字面做法（删豁免）会让外部成员收到“请读附件”的空指令——本轮
+  按“截断内联”实现，等价达成上限。
+- **Review 管线点名 LocalCli 挂起**：与 A2A 接力相同的 hold
+  （Error 状态 + 中止后续阶段 + notice，点「重试」确认后跑）。
+- **自动失败切换禁切入 LocalCli**：
+  `run_group_member_turn_with_failover` 里选出 next_key 后查 kind，
+  LocalCli 直接不切；从 LocalCli 切走不受影响。
+- **workdir**：保存时 canonicalize + is_dir 校验（normalize），执行时
+  再 canonicalize 一次并用真实路径 `current_dir`；存的仍是用户原样输入。
+- **CLI stdout 通道改为有界 `mpsc::channel(128)`**，读线程用
+  `blocking_send`（管道顶满即反压子进程）；配合已有的 2MiB 累计上限。
+- **Drop 守卫**：`InFlightGuard`（in_flight 计数 + warm-pool 时间戳 +
+  布局）与 `ExternalTurnCancelGuard`（取消令牌注销），try_lock 快路径
+  + 抢不到锁时派生异步清理；两处手动扣减/注销块已删，改为守卫接管。
+- **A2A 跨链去重**：InnerState 新增 `a2a_relay_in_flight`（group_id →
+  在途目标集），选目标时过滤已在途并登记；子链 spawn 包一层，回合
+  结束释放（panic 残留会致该成员本轮不再被自动接力，重启恢复）。
+- **已核查无需改**：Review 前序回复已在 role: user + `[阶段要求]`
+  定界符 + 每稿 `###` 标题，满足复审要求。
+
+### v5 的 4 个小尾项
+- `main.ts` 预设点击补 `modal.editingId = null`。另核查：
+  `[data-ext-kind]` 切类型不改 editingId 是安全的——跨 kind 时旧 Key
+  不会进新服务（kind 变了）；只有同 kind 换 baseUrl 的预设会漏。
+- `render()` 末尾把 `apiKeyDraft` 写回 `#ext-agent-key-input`（放在
+  焦点恢复之前，避免光标跳末尾）；输入框加
+  `autocomplete="new-password" spellcheck="false"`。
+- `store.rs` 恢复改内存校验：新增 `storage::parse_store_str`（只解析
+  不触盘、不做损坏备份、不做 vault 迁移；未来版本拒绝），通过后
+  `save_store_atomic` 写回（0o600 + sync_all + 原子替换）；删临时文件
+  路径与 restore-tmp 垃圾来源。
+- blob/cookie/APK：桌面 `providers.rs` 的 `blob:https://` 剥前缀验内层
+  host（https + 白名单），`blob:http://` 与内层外站拒绝，测试补两条；
+  iOS 子帧 blob 分支加 `inner.scheme == "https"`；`platform.rs` Cookie
+  导入上限 200 条 / 合计 512 KiB；Android `openLastDownloadedFile`
+  拒绝打开 `application/vnd.android.package-archive`（提示去下载目录
+  手动安装）。
+
+### PR-E Rust
+- `updater.rs`：`download_and_install_update` 在 verify 之后、安装之前
+  加 `has_update` 防降级检查；`download_to_updates_cache` 加 512MiB
+  上限（Content-Length 预检 + 流式循环硬停，删 .part 后报错；清单
+  声明 size 仅作展示）。Android APK 下载走 Kotlin 插件桥
+  （`downloadAndInstallApk`），本轮未加 cap——见残留。
+- `lib.rs`：16 条命令全部补 `webview: tauri::Webview` 参数 + label
+  校验。脚本初版误把 `get_manager_state` 与 `check_for_updates` 的参数
+  写进相邻函数（单行签名锚点失效），cargo test 首轮即抓出
+  （E0415/E0425），已手工纠正；现 43 条命令逐一核查均为 1 参数 +
+  1 校验。
+- `emit_to("manager", …)`：6 处——`store.rs` 的 `emit_snapshot`、
+  `updater.rs` 的 `emit_progress`、`session_manager.rs` 的 3 处
+  download-event 与 1 处移动端 UpdateProgress 中继；
+  `src-tauri/src` 内已无 `app.emit(` 广播。
+- 删 3 个过期权限文件（`add/remove/update_custom_provider.toml`）：
+  对应命令已不存在，capabilities 与 tauri.conf.json 均无引用。
+
+### 验证（本机首次全量通过）
+- `cargo test --lib`：**104 通过、0 失败**（首轮 102 通过 2 失败：
+  `::1` 方括号 bug 与 `deepseek-cli` 旧测试撞白名单，均已修——见上；
+  另仅 2 条 pre-existing 的 `proxy` 未使用变量警告）。
+- `rustfmt --check`：全部改动文件干净。
+- `npm run build`（tsc + vite）通过；`npm run test:js` 15/15。
+- `isTransientStatusText` 抽函数实测全过（见 PR-C）。
+- 仍未验证：Windows-only Rust（Job Object）与 Kotlin/Swift 未编译；
+  `cargo audit` / `npm audit` 未在本机跑通（CI 首跑见分晓）。CI yml
+  已备好（macos-15/test:js/两处 audit）。复审 step 1“先推 v5 跑 CI”
+  已被本机全量编译 + 测试覆盖——同一棵树已编过且测过，不必为 v5
+  单独跑一轮。
+
+### 残留与下一步
+- **PR-F（单独做）**：key_vault Windows DPAPI / 移动端 Keystore &
+  Keychain + `Zeroizing<String>`。
+- **Step 2 预发布项**：lock-across-await 解锁、流式 delta + 局部 DOM 更新。
+- Android APK 下载上限在 Kotlin 插件侧，未加。
+- Ed25519 更新签名仍待用户生成密钥对（`release.yml` 已注入
+  `MAAM_UPDATE_REPO`，发布产物现已开启更新检查，但只有 sha256
+  校验、无签名——被攻破的 release 可推坏更新；缓解是文档里的签名方案）。
+- 无已知 GitHub 远端（源码来自 zip），CI 需用户推到自己的仓库后跑。
+
