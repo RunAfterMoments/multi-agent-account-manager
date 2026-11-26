@@ -184,6 +184,7 @@ const MAX_API_ERROR_BYTES: usize = 16 * 1024;
 /// 稳定 Rust 上 `IpAddr::is_global()` 仍是不稳定 API（E0658，见 #27709），
 /// 这里按 IANA 特殊用途地址表手写等价判断：凡属以下任一范围即非公网。
 /// 宁可误拒一段公网地址（安全侧），也不放过一段特殊地址。
+#[cfg(desktop)]
 fn is_global_ip(ip: &IpAddr) -> bool {
   match ip {
     IpAddr::V4(v4) => {
@@ -212,8 +213,10 @@ fn is_global_ip(ip: &IpAddr) -> bool {
         && !(s[0] == 0x2001 && s[1] == 0x0000) // Teredo 2001::/32
         && !(s[0] == 0x2001 && s[1] == 0x0002) // 基准测试 2001:2::/48
         && !(s[0] == 0x0100 && s[1] == 0 && s[2] == 0 && s[3] == 0) // 丢弃 100::/64
-        && !(s[0] == 0x0064 && s[1] == 0xff9b && s[2] == 0 && s[3] == 0 && s[4] == 0 && s[5] == 0)
-      // NAT64 知名前缀 64:ff9b::/96（内嵌 IPv4，可借此触及内网）
+        && !(s[0] == 0x2002) // 6to4 2002::/16（内嵌 IPv4，可借此触及内网）
+        && !(s[0] == 0x0064 && s[1] == 0xff9b)
+      // NAT64 前缀 64:ff9b::/32：含知名 64:ff9b::/96 与本地用 64:ff9b:1::/48
+      //（内嵌 IPv4，可借此触及内网）
     }
   }
 }
@@ -804,13 +807,35 @@ fn apply_minimal_cli_env(cmd: &mut std::process::Command) {
     }
   }
   #[cfg(unix)]
-  for key in ["HOME", "TMPDIR", "LANG", "LC_ALL", "USER"] {
+  for key in [
+    "HOME",
+    "TMPDIR",
+    "LANG",
+    "LC_ALL",
+    "USER",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+  ] {
     if let Ok(v) = std::env::var(key) {
       cmd.env(key, v);
     }
   }
   #[cfg(windows)]
-  for key in ["SystemRoot", "USERPROFILE", "TEMP", "TMP"] {
+  for key in [
+    "SystemRoot",
+    "USERPROFILE",
+    "TEMP",
+    "TMP",
+    // .cmd 垫片（npm 全局装的 codex/gemini/claude）与凭据读取所需：
+    // ComSpec/PATHEXT 决定 .cmd 能否被解析执行，APPDATA/LOCALAPPDATA
+    // 是 CLI 找登录态的常规位置，SystemDrive 是其衍生路径的根。
+    // 均不含第三方 API Key。
+    "ComSpec",
+    "PATHEXT",
+    "SystemDrive",
+    "APPDATA",
+    "LOCALAPPDATA",
+  ] {
     if let Ok(v) = std::env::var(key) {
       cmd.env(key, v);
     }
@@ -1403,6 +1428,8 @@ mod tests {
       "https://[::]/v1/chat/completions",
       "https://[2001:db8::1]/v1/chat/completions",
       "https://[ff02::1]/v1/chat/completions",
+      "https://[2002:0808:0808::1]/v1/chat/completions",
+      "https://[64:ff9b:1::c000:201]/v1/chat/completions",
     ] {
       assert!(
         super::validate_openai_endpoint_host(bad).is_err(),
@@ -1417,6 +1444,7 @@ mod tests {
   /// 测试用假 CLI：temp 目录下一个名为 `claude` 的可执行脚本，
   /// 内容是把参数原样转给 /bin/sh。白名单只放行 claude 等名字，
   /// 直接拿 `sh` 跑测试会被执行时校验挡住，所以用这个垫片。
+  #[cfg(unix)]
   fn fake_cli_command() -> String {
     use std::sync::OnceLock;
     static FAKE: OnceLock<String> = OnceLock::new();
@@ -1440,6 +1468,7 @@ mod tests {
       .clone()
   }
 
+  #[cfg(unix)]
   fn test_cli_agent(
     command_args: &str,
     timeout_secs: u64,
@@ -1466,6 +1495,7 @@ mod tests {
     std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false))
   }
 
+  #[cfg(unix)]
   #[tokio::test]
   async fn cli_turn_returns_after_process_exit_despite_inherited_pipe() {
     // 子进程退出后，继承了 stdout 的后台孙进程仍占着管道：
@@ -1483,6 +1513,7 @@ mod tests {
     );
   }
 
+  #[cfg(unix)]
   #[tokio::test]
   async fn cli_turn_total_timeout_keeps_partial_output() {
     // 旧实现超时直接丢弃已收集输出；新实现超时错误里附带部分输出。
@@ -1503,6 +1534,7 @@ mod tests {
     );
   }
 
+  #[cfg(unix)]
   #[tokio::test]
   async fn cli_turn_idle_timeout_fires_without_output() {
     // 输出一行后 2 秒无输出：应判空闲超时，而不是等到 60 秒总超时。
@@ -1523,6 +1555,7 @@ mod tests {
     );
   }
 
+  #[cfg(unix)]
   #[tokio::test]
   async fn cli_turn_cancel_flag_kills_tree_and_returns_partial() {
     // 前端「停止」按钮置位取消令牌后，应杀掉整棵树并返回已有输出。
@@ -1666,6 +1699,8 @@ mod tests {
     .expect("localhost http should succeed");
     assert_eq!(local_ok.base_url, "http://127.0.0.1:11434/v1");
 
+    // Windows 上 /tmp 不存在，workdir 校验会 canonicalize 失败：用系统临时目录。
+    let tmp_workdir = std::env::temp_dir().to_string_lossy().into_owned();
     let cli_ok = normalize_external_agent_input(
       None,
       ExternalAgentKind::LocalCli,
@@ -1675,7 +1710,7 @@ mod tests {
       "",
       "claude",
       vec!["-p".into()],
-      Some("/tmp"),
+      Some(tmp_workdir.as_str()),
       None,
       None,
       None,
@@ -1861,6 +1896,7 @@ mod tests {
     assert!(bad_args.is_err());
   }
 
+  #[cfg(unix)]
   #[tokio::test]
   async fn cli_turn_nonzero_exit_is_error_even_with_output() {
     // 非零退出即使有输出也必须报错，不能当成正常回复发进群聊。
@@ -1875,6 +1911,7 @@ mod tests {
     );
   }
 
+  #[cfg(unix)]
   #[tokio::test]
   async fn cli_turn_stdout_cap_kills_runaway_output() {
     let agent = test_cli_agent("head -c 3000000 /dev/zero", 600, 60);

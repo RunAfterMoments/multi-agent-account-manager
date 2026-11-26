@@ -16,14 +16,23 @@ on:
         type: boolean
         default: false
         required: false
+      maam_update_repo:
+        description: "更新源仓库（owner/repo，仅内部自测用；留空则更新检查关闭）"
+        type: string
+        default: ""
+        required: false
 
 permissions:
   contents: read
 
 env:
   # 更新源：编译进二进制（updater.rs 经 option_env!("MAAM_UPDATE_REPO") 读取）。
-  # 未设置时发布产物默认关闭更新检查；github.repository 使 fork 构建自动指向自己的仓库。
-  MAAM_UPDATE_REPO: ${{ github.repository }}
+  # 默认留空（更新检查关闭）：Ed25519 验签未落地前，带着已启用更新源发公开版
+  # 是不安全的——已装上的无验签版本不会验签后续更新，仓库或 Release 出事
+  # 就能向存量版本推恶意更新。验签落地后，在仓库 Settings > Variables 里
+  # 设 MAAM_UPDATE_REPO=<owner/repo> 再发版；内部自测可直接在 workflow_dispatch
+  # 输入里覆盖（见上面的 inputs.maam_update_repo）。
+  MAAM_UPDATE_REPO: ${{ inputs.maam_update_repo || vars.MAAM_UPDATE_REPO }}
 
 jobs:
   desktop:

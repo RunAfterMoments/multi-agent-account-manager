@@ -420,8 +420,9 @@ impl SessionManager {
     let key_for_load = key;
     let handle_page_load = !cfg!(windows) || proxy_url.is_none();
 
-    let pending_downloads: Arc<std::sync::Mutex<HashMap<String, VecDeque<(u64, PathBuf)>>>> =
-      Arc::new(std::sync::Mutex::new(HashMap::new()));
+    // 待下载队列：别名只为压住 clippy::type_complexity。
+    type PendingDownloads = Arc<std::sync::Mutex<HashMap<String, VecDeque<(u64, PathBuf)>>>>;
+    let pending_downloads: PendingDownloads = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let mgr_for_dl = Arc::clone(self);
     let app_for_dl = app.clone();
     let pending_for_dl = Arc::clone(&pending_downloads);
@@ -436,7 +437,7 @@ impl SessionManager {
     )
     .focused(false)
     .background_throttling(tauri::utils::config::BackgroundThrottlingPolicy::Disabled)
-    .initialization_script(&format!(
+    .initialization_script(format!(
       "window.__maamAutoApprove = {}; window.__maamAutoApproveAllowCommands = {}; window.__maamAutoApproveOrigins = {};",
       if self.auto_approve.load(Ordering::SeqCst) {
         "true"
@@ -731,6 +732,9 @@ impl SessionManager {
     #[cfg(windows)]
     let retry_until = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
 
+    // Windows 上旧 WebView2 会话未退出时会重试（见下面 windows 分支）；
+    // Linux/macOS 上循环体恒定 return，clippy 在当前目标上会报 never_loop。
+    #[allow(clippy::never_loop)]
     loop {
       let (proxy_url, timezone, provider_spec) = {
         let locked = self.inner.lock().await;

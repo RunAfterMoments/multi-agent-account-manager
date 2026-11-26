@@ -101,6 +101,7 @@ class AccountWebActivity : AppCompatActivity() {
     private var downloadBannerHideRunnable: Runnable? = null
     private var lastDownloadedUri: Uri? = null
     private var lastDownloadedMime: String = "*/*"
+    private var lastDownloadedFilename: String = ""
     private var lastDownloadedFallbackDir: File? = null
 
     private data class BlobInitMeta(
@@ -2468,11 +2469,13 @@ class AccountWebActivity : AppCompatActivity() {
             if (isFinishing || isDestroyed || sessionGen != activeSessionGeneration.get()) return@post
             lastDownloadedUri = saved.openUri
             lastDownloadedMime = saved.mimeType
+            lastDownloadedFilename = saved.filename
             lastDownloadedFallbackDir = saved.fallbackDir
             val prefix = if (saved.publicDownloads) "已保存到「下载」" else "已保存（应用下载目录）"
             showDownloadStatus(
                 text = "$prefix：${saved.filename}",
-                canOpen = saved.openUri != null,
+                // APK 不给一键打开：即使 MIME 被谎报，isApkDownload 也会按文件名拦住。
+                canOpen = saved.openUri != null && !isApkDownload(),
                 showDir = saved.publicDownloads,
                 isError = false,
                 autoHide = true,
@@ -2484,6 +2487,7 @@ class AccountWebActivity : AppCompatActivity() {
         uiHandler.post {
             if (isFinishing || isDestroyed || sessionGen != activeSessionGeneration.get()) return@post
             lastDownloadedUri = null
+            lastDownloadedFilename = ""
             showDownloadStatus(
                 text = "下载失败：$reason",
                 canOpen = false,
@@ -2526,11 +2530,21 @@ class AccountWebActivity : AppCompatActivity() {
         downloadBannerRoot.visibility = View.GONE
     }
 
+    // 是否 APK 安装包：MIME 可能被服务端谎报（octet-stream、大小写、
+    // 带 ; 参数），只比精确 MIME 会被绕过；同时看文件名扩展名。
+    private fun isApkDownload(): Boolean {
+        val mime = lastDownloadedMime.substringBefore(';').trim().lowercase()
+        if (mime == "application/vnd.android.package-archive") return true
+        val name = lastDownloadedFilename.lowercase()
+        return name.endsWith(".apk") || name.endsWith(".apks") ||
+            name.endsWith(".xapk") || name.endsWith(".aab")
+    }
+
     private fun openLastDownloadedFile() {
         val uri = lastDownloadedUri ?: return
         // 禁止一键打开 APK 安装包：下载的 APK 可能是仿冒更新/恶意文件，
         // 必须由用户到下载目录手动点开安装（系统安装器会再确认一次）。
-        if (lastDownloadedMime == "application/vnd.android.package-archive") {
+        if (isApkDownload()) {
             showDownloadStatus(
                 text = "APK 安装包请到下载目录手动打开安装",
                 canOpen = false,
@@ -2582,7 +2596,7 @@ class AccountWebActivity : AppCompatActivity() {
             val hint = lastDownloadedFallbackDir?.absolutePath ?: "系统「文件管理 -> 下载」"
             showDownloadStatus(
                 text = "请前往 $hint 查看已下载文件",
-                canOpen = lastDownloadedUri != null,
+                canOpen = lastDownloadedUri != null && !isApkDownload(),
                 showDir = false,
                 isError = false,
                 autoHide = true,

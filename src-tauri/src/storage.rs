@@ -1421,27 +1421,12 @@ pub fn load_or_migrate_store(path: &Path) -> LoadedAccountsStore {
     };
   }
 
-  // P1-7：API Key vault 迁移（仅成功加载路径）。
-  // 含旧明文的成员写入 vault；含 apiKeyRef 的成员从 vault 取回内存 Key。
-  // vault 写入失败时不写盘（明文保留在原文件里，下次启动重试），避免丢 Key。
-  let vault = crate::key_vault::ApiKeyVault::new(
-    path
-      .parent()
-      .map(|p| p.to_path_buf())
-      .unwrap_or_else(|| PathBuf::from(".")),
-  );
-  let mut key_migration_failed = false;
-  for agent in &mut store.external_agents {
-    if let Some(key_ref) = agent.api_key_ref.clone() {
-      if !agent.api_key.is_empty() {
-        if vault.store_key(&key_ref, &agent.api_key).is_err() {
-          key_migration_failed = true;
-        }
-      } else {
-        agent.api_key = vault.load_key(&key_ref).unwrap_or_default();
-      }
-    }
-  }
+  // P1-7：API Key vault 迁移（仅成功加载路径）。见 migrate_agent_keys_to_vault。
+  let vault_dir = path
+    .parent()
+    .map(|p| p.to_path_buf())
+    .unwrap_or_else(|| PathBuf::from("."));
+  let key_migration_failed = !migrate_agent_keys_to_vault(&mut store, &vault_dir);
   if key_migration_failed {
     return LoadedAccountsStore {
       store,
@@ -1473,6 +1458,28 @@ pub fn load_or_migrate_store(path: &Path) -> LoadedAccountsStore {
     persist_blocked: false,
     read_only: false,
   }
+}
+
+/// 外部成员 API Key 的 vault 迁移/回填（load 与「从备份恢复」共用）：
+/// 含 apiKeyRef 且内存有明文 Key（旧备份）→ 写入 vault；含 apiKeyRef
+/// 但内存为空（v5/v6 备份，Key 只在 vault 里）→ 从 vault 取回内存。
+/// 返回 false 表示有写入失败：调用方不要把剥离了 Key 的配置写盘，
+/// 否则明文 Key 永久丢失（api_key 标了 skip_serializing，写盘即丢）。
+pub fn migrate_agent_keys_to_vault(store: &mut AccountsStoreFile, vault_dir: &Path) -> bool {
+  let vault = crate::key_vault::ApiKeyVault::new(vault_dir.to_path_buf());
+  let mut ok = true;
+  for agent in &mut store.external_agents {
+    if let Some(key_ref) = agent.api_key_ref.clone() {
+      if !agent.api_key.is_empty() {
+        if vault.store_key(&key_ref, &agent.api_key).is_err() {
+          ok = false;
+        }
+      } else {
+        agent.api_key = vault.load_key(&key_ref).unwrap_or_default();
+      }
+    }
+  }
+  ok
 }
 
 /// 仅内存解析候选配置文本（供「从备份恢复」校验用）：不读盘、不写盘、

@@ -587,6 +587,7 @@ fn emit_progress(
 /// size 仅作展示，不作为放行依据。
 const MAX_UPDATE_DOWNLOAD_BYTES: u64 = 512 * 1024 * 1024;
 
+#[cfg(desktop)]
 async fn download_to_updates_cache(
   app: &AppHandle,
   url: &str,

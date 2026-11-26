@@ -131,7 +131,7 @@ impl SessionManager {
     #[cfg(not(windows))]
     let _ = has_win_cookies;
 
-    let Ok(proxy) = platform::parse_account_proxy(&proxy_raw) else {
+    let Ok(_proxy) = platform::parse_account_proxy(&proxy_raw) else {
       return;
     };
     let Some(window) = app.get_window("main") else {
@@ -162,7 +162,6 @@ impl SessionManager {
 
     #[cfg(target_os = "macos")]
     {
-      let _ = &proxy;
       builder = builder
         .data_store_identifier(*parsed_uuid.as_bytes())
         .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15");
@@ -174,7 +173,7 @@ impl SessionManager {
     #[cfg(windows)]
     {
       let Ok(b) =
-        platform::with_windows_account_proxy(builder, proxy.as_ref(), &app.config().identifier)
+        platform::with_windows_account_proxy(builder, _proxy.as_ref(), &app.config().identifier)
       else {
         return;
       };
@@ -755,7 +754,6 @@ impl SessionManager {
     #[cfg(not(any(target_os = "macos", windows)))]
     {
       let _ = (app, key, force, now, COOKIE_CHECK_COOLDOWN_MS);
-      return;
     }
 
     #[cfg(any(target_os = "macos", windows))]

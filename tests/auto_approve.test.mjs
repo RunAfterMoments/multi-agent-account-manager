@@ -17,10 +17,12 @@ const AUTO_APPROVE_JS = readFileSync(
 
 // jsdom 的 getBoundingClientRect 默认返回全 0，会被 isElVisible 判定为不可见，
 // 这里按真实浏览器行为打桩为可见尺寸。
-function makePage(html) {
+// 门控用例需要改 URL / origins：url 换 http 或外站、origins 传 null
+// 表示未注入、传 [] 表示注入空列表。
+function makePage(html, opts = {}) {
   const dom = new JSDOM(
     `<!DOCTYPE html><html><head></head><body>${html}</body></html>`,
-    { runScripts: "dangerously", url: "https://muse.ai/" },
+    { runScripts: "dangerously", url: opts.url ?? "https://muse.ai/" },
   );
   const { window } = dom;
   window.HTMLElement.prototype.getBoundingClientRect = function () {
@@ -33,7 +35,12 @@ function makePage(html) {
   window.__maamAutoApproveAllowCommands = false;
   // 门控用：生产环境由 Rust 在注册 webview 时注入本站 callback_origins；
   // 测试页 URL 已是 https://muse.ai/（顶层 frame），与注入值一致。
-  window.__maamAutoApproveOrigins = ["https://muse.ai", "https://www.muse.ai"];
+  if (opts.origins !== null) {
+    window.__maamAutoApproveOrigins = opts.origins ?? [
+      "https://muse.ai",
+      "https://www.muse.ai",
+    ];
+  }
   window.eval(AUTO_APPROVE_JS);
   return { dom, window, document: window.document };
 }
@@ -222,4 +229,63 @@ test("auto-approve: 同一页面 60 秒内自动点击超过 10 次即熔断关�
   assert.equal(clicks.length, 10);
   assert.equal(window.__maamAutoApprove, false);
   assert.equal(window.__maamAutoApproveTripped, true);
+});
+
+// 门控：四道门任一不满足，脚本直接 return，__maamScanAutoApprove
+// 不定义、不点击。门控在碰 document 之前就 return，所以这些用例
+// 只断言"没定义 + 没点击"。
+const GATE_HTML = approvalCard({
+  text: "Muse wants to access your files. Allow this tool to read files?",
+  buttons: ["Allow once", "Deny"],
+});
+
+test("auto-approve: 门控 http 页面不运行", (t) => {
+  const { dom, window, document } = makePage(GATE_HTML, {
+    url: "http://muse.ai/",
+  });
+  t.after(() => dom.window.close());
+  const clicks = clickedLabels(document);
+  assert.equal(window.__maamScanAutoApprove, undefined);
+  assert.deepEqual(clicks, []);
+});
+
+test("auto-approve: 门控外站页面不运行", (t) => {
+  const { dom, window, document } = makePage(GATE_HTML, {
+    url: "https://evil.com/",
+  });
+  t.after(() => dom.window.close());
+  const clicks = clickedLabels(document);
+  assert.equal(window.__maamScanAutoApprove, undefined);
+  assert.deepEqual(clicks, []);
+});
+
+test("auto-approve: 门控未注入 origins 不运行", (t) => {
+  const { dom, window, document } = makePage(GATE_HTML, { origins: null });
+  t.after(() => dom.window.close());
+  const clicks = clickedLabels(document);
+  assert.equal(window.__maamScanAutoApprove, undefined);
+  assert.deepEqual(clicks, []);
+});
+
+test("auto-approve: 门控注入空 origins 不运行", (t) => {
+  const { dom, window, document } = makePage(GATE_HTML, { origins: [] });
+  t.after(() => dom.window.close());
+  const clicks = clickedLabels(document);
+  assert.equal(window.__maamScanAutoApprove, undefined);
+  assert.deepEqual(clicks, []);
+});
+
+test("auto-approve: 门控 iframe（top !== self）不运行", (t) => {
+  // jsdom 的 window.top 不可重定义：用 new Function 把脚本跑在一个
+  // top !== self 的假 window 上；门控在碰 document 之前就 return。
+  const fakeSelf = {};
+  const fakeWindow = {
+    top: {},
+    self: fakeSelf,
+    location: { protocol: "https:", origin: "https://muse.ai" },
+    __maamAutoApproveOrigins: ["https://muse.ai", "https://www.muse.ai"],
+  };
+  const run = new Function("window", AUTO_APPROVE_JS);
+  run(fakeWindow);
+  assert.equal(fakeWindow.__maamScanAutoApprove, undefined);
 });

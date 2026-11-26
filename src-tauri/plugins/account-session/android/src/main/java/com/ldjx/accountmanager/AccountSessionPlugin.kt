@@ -423,6 +423,12 @@ class AccountSessionPlugin(private val activity: Activity) : Plugin(activity) {
                         throw IllegalStateException("下载更新包失败（HTTP $status）")
                     }
                     val totalBytes = conn.contentLengthLong.takeIf { it > 0L }
+                    // 下载上限 512 MiB（与桌面 updater.rs 的 MAX_UPDATE_DOWNLOAD_BYTES
+                    // 一致）：服务端谎报/不报 Content-Length 时，流式循环里按已下载量硬停。
+                    val maxApkBytes = 512L * 1024L * 1024L
+                    if (totalBytes != null && totalBytes > maxApkBytes) {
+                        throw IllegalStateException("更新包超过 512 MiB 上限，拒绝下载")
+                    }
                     val digest = MessageDigest.getInstance("SHA-256")
                     var downloaded = 0L
                     var lastEmitTime = 0L
@@ -440,6 +446,9 @@ class AccountSessionPlugin(private val activity: Activity) : Plugin(activity) {
                                 output.write(buf, 0, n)
                                 digest.update(buf, 0, n)
                                 downloaded += n
+                                if (downloaded > maxApkBytes) {
+                                    throw IllegalStateException("更新包超过 512 MiB 上限，拒绝下载")
+                                }
                                 val pct = totalBytes?.let { ((downloaded * 100L) / it).toInt().coerceIn(0, 100) }
                                 val now = System.currentTimeMillis()
                                 if (now - lastEmitTime >= 150L || (pct != null && pct != lastEmitPercent)) {

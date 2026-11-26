@@ -1,7 +1,8 @@
 # CI：每次 push 与 pull_request 都跑类型检查、格式、clippy 与全部测试。
 # 全部 action 均固定到 commit SHA（非浮动 tag），由 Dependabot 负责更新。
 # 注意：release.yml 一般不在此处改动；例外是复审要求的顶层 env 注入
-# MAAM_UPDATE_REPO（见 docs/hardening-notes-updater.md），除此之外仍不动 release.yml。
+# MAAM_UPDATE_REPO（vars 形式，默认空，见 docs/hardening-notes-updater.md），
+# 除此之外仍不动 release.yml。
 name: CI
 
 on:
@@ -50,9 +51,32 @@ jobs:
       - run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
       - run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
       - run: cargo test --manifest-path src-tauri/Cargo.toml
-      # 依赖审计：cargo-audit 走官方发布锁版安装（不引入第三方 action，免 pin SHA）；
+
+  # 依赖审计单独放一个 Linux job：三个 OS 各装一次 cargo-audit 太慢，
+  # 且 Cargo.lock 在 src-tauri/Cargo.lock（仓库根目录没有），
+  # 直接在根目录跑 `cargo audit` 会报 couldn't load Cargo.lock。
+  audit:
+    name: audit (ubuntu-24.04)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      # actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      # actions/setup-node@v6.5.0
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: 22
+          cache: npm
+      # dtolnay/rust-toolchain@stable（2026-11-26 的 stable 分支头提交）
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca
+        with:
+          toolchain: stable
+      - run: npm ci
+      # cargo-audit 走官方发布锁版安装（不引入第三方 action，免 pin SHA）；
       # npm 只审生产依赖（随产物发布的部分）。首次跑即见分晓：若依赖树已有已知漏洞，CI 直接变红。
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
-      - run: cargo audit
+      - run: cargo audit --file src-tauri/Cargo.lock
       - run: npm audit --omit=dev

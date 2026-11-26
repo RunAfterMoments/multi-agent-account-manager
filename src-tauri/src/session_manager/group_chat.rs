@@ -1582,14 +1582,11 @@ impl SessionManager {
         .account_cooldown_until_ms
         .insert(member_key.clone(), now + AUTO_ROUTE_COOLDOWN_MS);
       if let Some(channel_pid) = auto_channel {
-        let Some(g_idx) = locked
+        let g_idx = locked
           .store
           .group_chats
           .iter()
-          .position(|g| g.id == group_id)
-        else {
-          return None;
-        };
+          .position(|g| g.id == group_id)?;
         let can_failover = locked.store.group_chats[g_idx]
           .messages
           .iter()
@@ -2150,6 +2147,7 @@ impl SessionManager {
   }
 
   #[cfg(desktop)]
+  #[allow(clippy::too_many_arguments)]
   pub(super) async fn update_group_message_state(
     &self,
     app: &AppHandle,
@@ -2308,6 +2306,8 @@ impl SessionManager {
   }
 
   #[cfg(desktop)]
+  // edition 2021 不允许 let-chain，两个嵌套 if（if-let + if-bool）无法合并，保留嵌套。
+  #[allow(clippy::collapsible_if)]
   pub(super) async fn prepare_group_member_thread(
     &self,
     group_id: &str,
@@ -2714,6 +2714,7 @@ impl SessionManager {
   }
 
   #[cfg(desktop)]
+  #[allow(clippy::too_many_arguments)]
   pub(super) async fn build_turn_prompt_for_member(
     &self,
     group_id: &str,
@@ -2945,17 +2946,17 @@ impl SessionManager {
 /// 抢不到锁时派生异步任务做（运行时存活期间可用；进程退出时记账
 /// 随内存一起消失，无需清理）。供下面的两个 Drop 守卫共用。
 #[cfg(desktop)]
-fn cleanup_inner_on_drop<F>(mgr: &Arc<SessionManager>, f: F)
+pub(super) fn cleanup_inner_on_drop<F>(mgr: &Arc<SessionManager>, f: F)
 where
   F: FnOnce(&mut InnerState) + Send + 'static,
 {
   match mgr.inner.try_lock() {
-    Ok(mut locked) => f(&mut *locked),
+    Ok(mut locked) => f(&mut locked),
     Err(_) => {
       let mgr = Arc::clone(mgr);
       tauri::async_runtime::spawn(async move {
         let mut locked = mgr.inner.lock().await;
-        f(&mut *locked);
+        f(&mut locked);
       });
     }
   }
@@ -3070,14 +3071,17 @@ impl SessionManager {
           .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
       )
     };
-    let _member_guard = member_lock.lock_owned().await;
-    // 守卫在 _member_guard 之后声明，先于它释放：下一轮同成员回合
-    // 开始前，计数已扣减。
+    // InFlightGuard 在等锁之前构造：上面刚 +1 的计数，若等锁期间任务
+    // 被取消，仍由守卫的 Drop 扣减，不泄漏。声明顺序上它先于
+    // _member_guard（后声明的先释放），即成员锁先放、计数后扣——新回合
+    // 只能在旧回合 Future 完全结束（全部局部守卫已释放）后才开始，
+    // 瞬时计数多 1 不影响正确性。
     let _in_flight_guard = InFlightGuard {
       mgr: Arc::clone(self),
       app: app.clone(),
       key: member_key.clone(),
     };
+    let _member_guard = member_lock.lock_owned().await;
     let reply = match transport {
       ResolvedMemberTransport::WebView { .. } => {
         if let Ok(_permit) = Arc::clone(&self.group_worker_semaphore)
@@ -3151,7 +3155,7 @@ impl SessionManager {
       return None;
     }
 
-    let Some((system_section, user_section, full_prompt, _fingerprint)) = self
+    let (system_section, user_section, full_prompt, _fingerprint) = self
       .build_turn_prompt_for_member(
         group_id,
         member_key,
@@ -3162,10 +3166,7 @@ impl SessionManager {
         stage_instruction,
         hop_depth,
       )
-      .await
-    else {
-      return None;
-    };
+      .await?;
 
     if !self
       .update_group_message_state(
@@ -3417,9 +3418,7 @@ impl SessionManager {
     if best_expanded.chars().count() <= card_preview.chars().count() + 24 {
       return preview_text.to_string();
     }
-    if intro_prefix.is_empty() {
-      best_expanded
-    } else if best_expanded.starts_with(&intro_prefix) {
+    if intro_prefix.is_empty() || best_expanded.starts_with(&intro_prefix) {
       best_expanded
     } else {
       format!("{intro_prefix}\n\n{best_expanded}")
@@ -3484,7 +3483,7 @@ impl SessionManager {
     for retry_round in 0..2usize {
       Self::wake_and_settle_group_webview(&wv).await;
 
-      let Some((_, _, prompt_text, fingerprint)) = self
+      let (_, _, prompt_text, fingerprint) = self
         .build_turn_prompt_for_member(
           group_id,
           member_key,
@@ -3495,10 +3494,7 @@ impl SessionManager {
           stage_instruction,
           hop_depth,
         )
-        .await
-      else {
-        return None;
-      };
+        .await?;
 
       let (adapter, pre_send_norm) = {
         let locked = self.inner.lock().await;

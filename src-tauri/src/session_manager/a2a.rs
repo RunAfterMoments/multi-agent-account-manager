@@ -19,6 +19,39 @@ use std::sync::Arc;
 use tauri::AppHandle;
 use uuid::Uuid;
 
+/// A2A 接力在途登记 Drop 守卫：子链结束（正常、提前返回、panic）
+/// 都从 `a2a_relay_in_flight` 释放该目标。复用 group_chat 的
+/// `cleanup_inner_on_drop`（try_lock 快路径，抢不到锁时派生异步清理）。
+#[cfg(desktop)]
+struct A2aInFlightGuard {
+  mgr: Arc<SessionManager>,
+  group_id: String,
+  target: AccountKey,
+}
+
+#[cfg(desktop)]
+impl Drop for A2aInFlightGuard {
+  fn drop(&mut self) {
+    let group_id = self.group_id.clone();
+    let target = self.target.clone();
+    super::group_chat::cleanup_inner_on_drop(&self.mgr, move |locked| {
+      if let Some(set) = locked.a2a_relay_in_flight.get_mut(&group_id) {
+        set.remove(&target);
+      }
+    });
+  }
+}
+
+/// 评审管线一个阶段的任务：(阶段序号, 成员, 消息 id, 阶段名, 自动通道)。
+/// 别名只为压住 clippy::type_complexity（元组本身不复杂到值得拆 struct）。
+pub(super) type ReviewJob = (
+  usize,
+  AccountKey,
+  String,
+  Option<String>,
+  Option<ProviderId>,
+);
+
 impl SessionManager {
   #[cfg_attr(not(desktop), allow(dead_code))]
   pub(super) fn select_a2a_relay_targets(
@@ -48,13 +81,7 @@ impl SessionManager {
     group_id: String,
     user_msg_id: String,
     raw_user_content: String,
-    jobs: Vec<(
-      usize,
-      AccountKey,
-      String,
-      Option<String>,
-      Option<ProviderId>,
-    )>,
+    jobs: Vec<ReviewJob>,
   ) {
     let mut completed: Vec<(String, String)> = Vec::new();
     for (pos, (idx, member_key, msg_id, stage_label, auto_ch)) in jobs.iter().enumerate() {
@@ -154,6 +181,8 @@ impl SessionManager {
       // 评审管线点名本地 CLI 成员时默认不自动执行：前序阶段的回复是
       // 模型生成文本，可能含注入内容；本地命令执行需用户确认。
       // 该阶段以 Error 状态挂起并中止后续阶段，用户点「重试」即确认执行。
+      // 第 0 阶段（方案初稿）除外：输入完全是用户自己写的，没有前序
+      // AI 输出可供注入，用户把 LocalCli 排第一棒时不应整条评审报错。
       let is_local_cli = {
         let locked = self.inner.lock().await;
         locked
@@ -162,7 +191,7 @@ impl SessionManager {
           .iter()
           .any(|e| e.account_key() == *member_key && e.kind == ExternalAgentKind::LocalCli)
       };
-      if is_local_cli {
+      if *idx > 0 && is_local_cli {
         let alias = {
           let locked = self.inner.lock().await;
           Self::resolve_member_alias_locked(&locked, member_key)
@@ -355,20 +384,19 @@ impl SessionManager {
           2,
         );
         // 跨链去重：并行跑着的两条接力链可能同时点名同一成员；已在
-        // 途中的目标不再重复扇出，回合结束即释放（见下面的 spawn 包装）。
+        // 途中的目标不再重复扇出。这里只过滤、不登记——登记放在
+        // persist 成功之后，且只登记真正进入 spawned 的非 LocalCli
+        // 目标（LocalCli 在下面 continue 掉、未进 spawned；写盘失败
+        // 时提前返回，提前登记也会泄漏）。
         let next_targets: Vec<AccountKey> = {
           let in_flight = locked
             .a2a_relay_in_flight
             .entry(group_id.clone())
             .or_default();
-          let kept: Vec<AccountKey> = next_targets
+          next_targets
             .into_iter()
             .filter(|k| !in_flight.contains(k))
-            .collect();
-          for k in &kept {
-            in_flight.insert(k.clone());
-          }
-          kept
+            .collect()
         };
         if next_targets.is_empty() {
           return;
@@ -453,6 +481,18 @@ impl SessionManager {
         if Self::persist_locked(&mut locked).await.is_err() {
           return;
         }
+        // 登记在途目标：只登记真正进入 spawned 的（LocalCli 已在
+        // 上面 continue 掉），且在 persist 成功之后——写盘失败时
+        // 提前返回，提前登记的目标永远等不到释放。
+        {
+          let in_flight = locked
+            .a2a_relay_in_flight
+            .entry(group_id.clone())
+            .or_default();
+          for (target_key, _, _, _) in &spawned {
+            in_flight.insert(target_key.clone());
+          }
+        }
         let snap = Self::snapshot_from_locked(&locked);
         Some((snap, spawned, next_hop))
       };
@@ -464,10 +504,14 @@ impl SessionManager {
           let app_h = app.clone();
           let gid = group_id.clone();
           let uid = user_msg_id.clone();
-          let mgr_for_cleanup = Arc::clone(&mgr);
-          let gid_for_cleanup = gid.clone();
-          let target_for_cleanup = target_key.clone();
           tauri::async_runtime::spawn(async move {
+            // Drop 守卫：回合结束（正常返回、提前返回与 panic）都释放
+            // 该目标，避免在途登记泄漏导致该成员之后不再被接力点名。
+            let _in_flight_guard = A2aInFlightGuard {
+              mgr: Arc::clone(&mgr),
+              group_id: gid.clone(),
+              target: target_key.clone(),
+            };
             mgr
               .run_group_a2a_chain(
                 app_h,
@@ -480,11 +524,6 @@ impl SessionManager {
                 next_visited,
               )
               .await;
-            // 接力回合结束（正常与提前返回均含在内）才释放该目标。
-            let mut locked = mgr_for_cleanup.inner.lock().await;
-            if let Some(set) = locked.a2a_relay_in_flight.get_mut(&gid_for_cleanup) {
-              set.remove(&target_for_cleanup);
-            }
           });
         }
       }

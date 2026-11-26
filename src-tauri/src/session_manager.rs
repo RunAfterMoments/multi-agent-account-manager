@@ -292,7 +292,6 @@ impl SessionManager {
         #[cfg(desktop)]
         group_context_synced: HashMap::new(),
         #[cfg(desktop)]
-        #[cfg(desktop)]
         group_member_locks: HashMap::new(),
         #[cfg(desktop)]
         a2a_relay_in_flight: HashMap::new(),
@@ -1018,7 +1017,7 @@ impl SessionManager {
       let (wv, created_temp) = match existing_wv {
         Some(wv) => (wv, false),
         None => {
-          let proxy = platform::parse_account_proxy(proxy_raw)?;
+          let _proxy = platform::parse_account_proxy(proxy_raw)?;
           let window = app
             .get_window("main")
             .ok_or_else(|| "主窗口不存在".to_string())?;
@@ -1032,7 +1031,6 @@ impl SessionManager {
           .focused(false);
           #[cfg(target_os = "macos")]
           {
-            let _ = &proxy;
             builder = builder
               .data_store_identifier(*parsed_uuid.as_bytes())
               .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15");
@@ -1045,7 +1043,7 @@ impl SessionManager {
           {
             builder = platform::with_windows_account_proxy(
               builder,
-              proxy.as_ref(),
+              _proxy.as_ref(),
               &app.config().identifier,
             )?;
           }
@@ -1399,7 +1397,7 @@ impl SessionManager {
     }
 
     let previous = locked.store.accounts.clone();
-    for (slot_idx, record) in slot_indices.into_iter().zip(reordered.into_iter()) {
+    for (slot_idx, record) in slot_indices.into_iter().zip(reordered) {
       locked.store.accounts[slot_idx] = record;
     }
     if let Err(err) = Self::persist_locked(&mut locked).await {
@@ -3373,7 +3371,7 @@ mod tests {
       "我先给出初稿，请 @DeepSeek-API 自查无意义，请 @ClaudeCLI 复核，也可问 @Muse-C",
       &api_key,
       &members,
-      &[api_key.clone()],
+      std::slice::from_ref(&api_key),
       2,
     );
     assert_eq!(picked, vec![cli_key.clone(), k3.clone()]);

@@ -572,3 +572,151 @@ cargo 目标目录放里面会撑爆，改用
   校验、无签名——被攻破的 release 可推坏更新；缓解是文档里的签名方案）。
 - 无已知 GitHub 远端（源码来自 zip），CI 需用户推到自己的仓库后跑。
 
+## 十、v6.1 复审补丁（2026-11-26 晚）
+
+背景：用户逐行复审 v6（2,793 行 diff），评分 **7.6/10**（v1 5.3 → v3 6.0 → v5 6.8 → v6 7.6），
+判定**暂不 GO**，先打 v6.1 补丁、不要直接开 PR-F / Step 2。以下 10 点逐项在本机核实均为真，已全修。
+
+### 5 个 CI 硬伤
+
+1. `updater.rs`：新增 `const MAX_UPDATE_DOWNLOAD_BYTES` 抢走了修饰
+   `download_to_updates_cache` 的 `#[cfg(desktop)]`，移动端会无条件编译该函数并报错——
+   已在函数前补回 `#[cfg(desktop)]`。
+2. `group_transport.rs`：`fn is_global_ip` 漏了 `#[cfg(desktop)]`，而它的
+   `use std::net::{IpAddr, ToSocketAddrs}` 带了该属性，移动端报 `E0412`——已补。
+3. Windows：`normalize_external_agent_validates_api_and_cli` 用 `Some("/tmp")`，
+   v6 起做 `canonicalize`，Windows 上 `/tmp` 不存在必 panic——改用
+   `std::env::temp_dir()`；6 个 `cli_turn_*` 测试 + 辅助 `fake_cli_command` /
+   `test_cli_agent` 加 `#[cfg(unix)]`（跑 POSIX `sh -c` / `/dev/zero`）；
+   `Cargo.toml` 的 `windows` features 补 `"Win32_System_Threading"`
+   （`JOBOBJECT_EXTENDED_LIMIT_INFORMATION` 的 `IoInfo: IO_COUNTERS` 需要它；
+   windows crate 未 vendored 到本机，该点以复审的 docs.rs 核查 + 构造方式为准，未本地编译验证）。
+4. `ci.yml`：`cargo audit` 在仓库根目录跑，但 `Cargo.lock` 在 `src-tauri/`——
+   audit 步骤移入独立的 Linux-only `audit` job，用
+   `cargo audit --file src-tauri/Cargo.lock` + `npm audit --omit=dev`。
+5. Clippy：删 `session_manager.rs` 重复的 `#[cfg(desktop)]`；2 处既有的 `proxy`
+   未使用变量警告——绑定改名 `_proxy`（proxy 只在 `#[cfg(windows)]` 下使用，
+   macOS 的 `let _ = &proxy;` 已删）。
+
+### 5 个逻辑 / 安全 Bug
+
+1. `a2a_relay_in_flight` 泄漏（`a2a.rs`）：目标在循环前就登记进在途集合，
+   LocalCli 目标 `continue` 跳过 spawn、写盘失败直接 `return` 都会永久泄漏——
+   改为只在 `persist_locked` 成功后、仅对真正进入 `spawned` 的目标登记；
+   spawn 包装新增 `A2aInFlightGuard`（Drop，复用 `cleanup_inner_on_drop`，该函数
+   改为 `pub(super)`），panic 也不残留。
+2. `restore_config_from_backup` 丢 Key（`store.rs` / `storage.rs`）：`api_key` 是
+   `#[serde(default, skip_serializing)]`，v5/v6 备份恢复后内存 Key 为空（401 直到重启），
+   旧版明文备份恢复后写盘剥离 Key 且未入 vault（永久丢失）——把加载路径的迁移循环
+   抽成 `migrate_agent_keys_to_vault(store, vault_dir)`（`storage.rs` 公共函数，
+   加载与恢复共用），恢复在 `parse_store_str` 校验通过后、`save_store_atomic` 之前执行；
+   vault 写失败时跳过该候选、不写剥离后的 store。
+   （`migrate_from_value` 已给旧版明文 Key 赋 `api_key_ref`，两类备份同一循环覆盖。）
+3. `isTransientStatusText` 回溯 + 空行回归（`scripts.rs` 两处同构点）：旧正则在
+   `'Muse 消息 '.repeat(19) + '!'`（153 字）上单次 `test()` 实测 **559 ms**
+   （复审测得 249 ms），且 `"Muse\n\n思考中"` 误判 `false`——重写为确定性 O(N)
+   逐行 token 化（无回溯）：`TRANSIENT_TOKENS` 字面表最长优先匹配；泛型
+   （`正在`+1–10 汉字贪心最长；1–8 汉字+`中`在首个 `中` 处最短优先）仅允许紧跟
+   brand（Muse/Hark）之后，与旧正则分支结构一致；分隔符沿用原字符类 `[….\s]`
+   （不含 `。`）；空行过滤。`isIdleOnlyStatus` 两处同加 160 字上限。
+   与旧正则（取自 `git show HEAD:`）差分测试 60+ 用例，仅 3 处有意差异：
+   两个空行用例（复审要求的修复）与 `"Muse..."` → true（旧正则 brand 单独分支
+   缺 `[….\s]*` 尾巴，语义上应为 true）。保留的怪癖已验证：
+   `"正在思考中"` → false、`"正在生成中"` → false、`"Muse 正在思考中"` → true。
+   修复后同对抗输入单次调用 **0.13 ms**。
+4. `apply_minimal_cli_env` 过窄（`group_transport.rs`）：Windows 白名单补
+   `ComSpec` / `PATHEXT` / `SystemDrive` / `APPDATA` / `LOCALAPPDATA`
+   （npm `.cmd` shim 与凭据查找需要，均不含 API Key）；Unix 补
+   `XDG_CONFIG_HOME` / `XDG_DATA_HOME`。
+5. Android `openLastDownloadedFile` APK 绕过：精确 MIME 比对改为
+   `isApkDownload()`（MIME 去 `;` 参数后小写比对，或文件名以
+   `.apk/.apks/.xapk/.aab` 结尾）；新增 `lastDownloadedFilename` 字段，
+   `onDownloadCompleted` 对 APK 直接置 `canOpen=false`，`onDownloadFailed` 清空。
+
+### 小尾项
+
+- `InFlightGuard` 挪到 `member_lock.lock_owned().await` 之前构造
+  （等锁期间取消不再泄漏 +1 计数；drop 顺序安全：新 turn 只能在旧 future
+  完全结束后开始）。
+- Review 管线第 0 阶段豁免：`if *idx > 0 && is_local_cli`（第 0 阶段输入全是用户
+  自己写的，LocalCli 排第一棒不再整条评审报错）。
+- 移动端 `manager` 导航锁：`lib.rs` 的 `#[cfg(mobile)]` 分支补与桌面相同的
+  `on_navigation` 限制（`WebviewWindowBuilder::on_navigation` 在 vendored
+  tauri 2.12.6 中存在）。
+- `tests/auto_approve.test.mjs` 补 5 条门控用例（http / 外站 / 缺 origins /
+  空 origins / iframe；iframe 用例用 `new Function` + 假 window，
+  因 jsdom 的 `window.top` 不可配置；门控在触 `document` 前返回）。
+- Android APK 下载上限（`AccountSessionPlugin.kt`）：512MiB
+  `contentLengthLong` 预检 + 流式硬停（外层 catch 已删 partFile）。
+- `is_global_ip` 边角：补 6to4 `s[0] == 0x2002` 拒绝；NAT64 从 /96 放宽为
+  `s[0] == 0x0064 && s[1] == 0xff9b`（覆盖 `64:ff9b:1::/48`）；补 2 个测试用例。
+
+### release.yml：更新默认关闭
+
+`MAAM_UPDATE_REPO: ${{ github.repository }}` → `${{ inputs.maam_update_repo || vars.MAAM_UPDATE_REPO }}`
+（新增可选 `workflow_dispatch` 输入）。理由：带更新开启、无 Ed25519 签名的公开版
+一旦装机，后续即使加上签名、老版本也不会验签，仓库或 Release 出事仍能向存量版本推恶意更新。
+内部自测可填 input；正式发版前先落地签名，再在仓库 Variables 里打开。
+`ci.yml` 头注释与 `docs/hardening-notes-updater.md` 第 6 点已同步。
+
+### Clippy 首次全量清理（本机此前从未跑过 clippy）
+
+首次 `cargo clippy --all-targets -- -D warnings` 报 21 项：1 个 sidebar 测试硬错误
+（`ProviderId::muse` 是关联函数，需 `ProviderId::muse()`，已修）+ 20 个既有 lint。
+处理方式：`#[allow(clippy::too_many_arguments)]`（platform.rs 12 参函数、
+group_chat.rs 两处、lib.rs `add_account`/`rename_account`）；`ReviewJob` 类型别名；
+3 处 let-else 改 `?`；auto-deref；相同块合并；`quota_sync.rs` 去多余 `return;`；
+webview.rs `PendingDownloads` 别名 + `format!` 去引用 + `never_loop` allow；
+`slot_indices.into_iter().zip(reordered)`（仅第二处 `into_iter()` 是多余的，
+`Vec` 本身没有 `.zip`）；测试里 `&[api_key.clone()]` → `std::slice::from_ref`。
+
+两次教训（已记入过程，未藏进代码）：
+- 本 crate 是 **edition 2021，let-chain 不可用**——两处嵌套 if（2346 的 if-let 套 if-let、
+  2385 的 if-let 套 if-bool）无法合并，恢复 v6 原样并在
+  `prepare_group_member_thread` 上加 `#[allow(clippy::collapsible_if)]`
+  （附注释说明原因）；2385 的重构草稿曾引用不存在的 `adapter_spec`，
+  已按 `git show HEAD:` 恢复为使用作用域内 `spec` 的原 form。
+- clippy 修复脚本的 `old = """...("""` 赋值行与 `s.replace(old, """...""")`
+  调用行结尾易混（前者无 `)`、后者有），曾致两次 SyntaxError，改手写 edit 后解决。
+
+另：clippy 在 Linux 下报一条 cargo manifest 警告（`tauri-plugin-account-session`
+疑似未使用）——误报，该依赖在 `platform.rs:2302` 以 `pub use ... as mobile`
+在 `#[cfg(mobile)]` 下使用；不删，`-D warnings` 也不因此失败。
+
+### 验证（v6.1 + 侧边栏，全部通过）
+
+- `cargo fmt --check`：干净。
+- `cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings`：**0 错误**。
+- `cargo test --lib`：**105 通过、0 失败**（v6 的 104 + 新增 sidebar 测试 1）。
+- `npm run build`（tsc + vite）通过；`npm run test:js`：**20/20**（15 既有 + 5 门控新增）。
+- 两份 workflow YAML 解析通过；Kotlin 两文件括号计数与 HEAD 的 naive 计数完全一致
+  （同为计数 artifact，diff 仅 +17/-3 / +9/-0），无 Kotlin 工具链、未编译。
+- 环境备注：本次验证前虚拟机已被替换过一次，Tauri Linux 开发库丢失导致测试链接失败
+  （缺 `-lgtk-3 -lwebkit2gtk-4.1` 等）；按 v6 的老办法重装——先
+  `apt-get install --allow-downgrades libzstd1=1.5.5+dfsg2-2build1.1`
+  （镜像钉死的 `+hatch2` 版与 `libzstd-dev` 冲突），再装 `libgtk-3-dev`
+  `libwebkit2gtk-4.1-dev` `libgdk-pixbuf-2.0-dev` `libayatana-appindicator3-dev`
+  `librsvg2-dev`；`CARGO_TARGET_DIR` 仍用工作区内目录，绝不放 512M 的 `/tmp`。
+
+## 十二、残留（v6.1 后，未变）
+
+- Windows-only Rust（Job Object `SetInformationJobObject` 路径）与 Kotlin/Swift
+  仍未在本机编译验证；首次真检查是用户推到 GitHub 后跑 CI
+  （`ci.yml` 已有 ubuntu-24.04 / windows-2025 / macos-15 + audit job）。
+- `cargo audit` / `npm audit` 未在本机跑通（cargo-audit 未装；npm audit 端点被代理拦）——
+  CI 的 audit job 是首次真跑，现有依赖的高危漏洞可能让它变红。
+- Ed25519/minisign 更新签名**未实现**；`release.yml` 现默认更新关闭（vars 为空），
+  需用户生成密钥对（`minisign -G`，私钥进 CI secret，公钥编进程序）并设仓库变量后开启。
+- **PR-F 与 Step 2 明确延后**（按 v6 复审路线）：PR-F（key_vault DPAPI / Keystore /
+  Keychain + `Zeroizing<String>`，去静默明文回退）；Step 2（`self.inner.lock().await`
+  跨 `.await` 持锁拆解、流式 delta + 局部 DOM 更新）。等用户复审 v6.1 后再定。
+- 早期路线“明确未做的项”仍在：P1-8 增量写入、WiX `UninstallString` 强化 /
+  WebView2 bootstrapper 哈希、Android FileProvider、时区脚本主框化、iOS 下载缺口、
+  审计报告 5 项真机测试；Android 第三方 Cookie 关闭可能影响 Meta SSO /
+  Turnstile 人机验证（需真机手动测）。
+- 下一步（按 v6 复审路线）：① 用户把 v6.1 推到自己的 GitHub 跑首轮真 CI
+  （看三 OS 全绿 + audit 报告；手动跑一次 `release.yml` workflow_dispatch，
+  `publish_release: false`，首次真实验证 Windows Job Object、Android Kotlin、iOS Swift）；
+  ② Ed25519 签名 + PR-F；③ Step 2 + 真机验收（Windows `.cmd` CLI + Job Object 杀树 +
+  NSIS 重装；Android 旋转恢复会话 + APK 拦截）。
+

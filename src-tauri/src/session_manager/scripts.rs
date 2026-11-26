@@ -2601,14 +2601,107 @@ pub(crate) fn build_group_poll_js(adapter: &SiteAdapterConfig, job_id: &str) -> 
     const extraIdleRe = /^(?:空闲中|已连接|已阅读|消息|Idle|Connected|Hark|Muse)$/i;
     let statusBusy = false;
     let progressText = '';
-    const isIdleOnlyStatus = (s) => /^(?:(?:Muse|Hark|空闲中|已连接|已阅读|消息|Idle|Connected)[….\s]*)+$/i.test((s || '').trim());
+    const isIdleOnlyStatus = (s) => {
+      const t = (s || '').trim();
+      if (!t || t.length > 160) return false;
+      return /^(?:(?:Muse|Hark|空闲中|已连接|已阅读|消息|Idle|Connected)[….\s]*)+$/i.test(t);
+    };
+    // 瞬时状态词（最长优先：短词是长词前缀时先试长词，如 正在搜索网页 vs 正在搜索）。
+    const TRANSIENT_TOKENS = [
+      '正在搜索网页', '正在联网搜索', '仍在发送中', '努力工作中', '努力思考中',
+      '正在预热', '正在连接', '正在思考', '正在搜索', '正在检索', '正在回复',
+      '正在分析', '正在查询', '正在处理', '正在生成', '正在准备',
+      '预热中', '空闲中', '已连接', '连接中', '发送中', '工作中',
+      '思考中', '搜索中', '检索中', '回复中', '分析中', '查询中',
+      '处理中', '生成中', '准备中', '加载中', '待命中', '已阅读',
+      '消息', 'Thinking', 'Sending', 'Working', 'Searching',
+      'Researching', 'Replying', 'Retrieving', 'Loading', 'Idle', 'Connected',
+    ];
+    // 单行确定性分词：每步至少消耗 1 个字符、绝不回溯，O(N)。
+    // 原实现是嵌套量词正则 (...)+，分支重叠（Muse|Hark 既单列又与状态词
+    // 拼合），'Muse 消息 '.repeat(19) + '!'（153 字）单次 test 要 250-550ms，
+    // 群聊轮询每 450ms 扫多个节点时会卡死。空行不过滤还会把 "Muse\n\n思考中"
+    // 从 true 打成 false（本轮顺手修掉）。
+    const isTransientLine = (line) => {
+      let i = 0;
+      const n = line.length;
+      let saw = false;
+      const skipSep = () => {
+        while (i < n && /[…\s.]/.test(line[i])) i++;
+      };
+      // 在 i 处匹配一个状态词，返回长度，匹配不上返回 0。
+      // generics=true 只用于品牌词后的一轮：正在 + 1-10 汉字（取最长），
+      // 或 1-8 汉字 + 中（取首个 中，最短匹配）；无品牌时只认字面词，
+      // 与原正则的分支 3 一致（"正在思考中" 无品牌仍判 false）。
+      const matchToken = (generics) => {
+        if (generics && line.startsWith('正在', i)) {
+          let j = i + 2;
+          let cjk = 0;
+          while (j < n && cjk < 10 && /[\u4e00-\u9fa5]/.test(line[j])) { j++; cjk++; }
+          if (cjk >= 1) return j - i;
+        }
+        if (generics) {
+          let j = i;
+          let cjk = 0;
+          while (j < n && cjk <= 8 && /[\u4e00-\u9fa5]/.test(line[j])) {
+            if (line[j] === '中') return j + 1 - i;
+            j++;
+            cjk++;
+          }
+        }
+        const warming = /^Warming\s*up/i.exec(line.slice(i));
+        if (warming) return warming[0].length;
+        for (const tok of TRANSIENT_TOKENS) {
+          if (line.slice(i, i + tok.length).toLowerCase() === tok.toLowerCase()) {
+            return tok.length;
+          }
+        }
+        return 0;
+      };
+      while (i < n) {
+        skipSep();
+        if (i >= n) break;
+        // 品牌词开头的一轮：品牌 + 可选状态词；无状态词时品牌本身即一轮。
+        let brandLen = 0;
+        for (const b of ['Muse', 'Hark']) {
+          if (line.slice(i, i + b.length).toLowerCase() === b.toLowerCase()) {
+            brandLen = b.length;
+            break;
+          }
+        }
+        if (brandLen > 0) {
+          i += brandLen;
+          saw = true;
+          const save = i;
+          while (i < n && /[ \t]/.test(line[i])) i++;
+          const len = matchToken(true);
+          if (len > 0) {
+            i += len;
+            continue;
+          }
+          i = save;
+          continue;
+        }
+        const len = matchToken(false);
+        if (len > 0) {
+          i += len;
+          saw = true;
+          continue;
+        }
+        return false;
+      }
+      return saw;
+    };
     const isTransientStatusText = (s) => {
       const t = (s || '').trim();
       if (!t || t.length > 160) return false;
       if (extraWords.some((w) => t === w || t === ('Muse\n' + w) || t === ('Hark\n' + w))) {
         return true;
       }
-      return t.split(/\r?\n/).every((line) => /^(?:(?:Muse|Hark)[ \t\r\n]+(?:正在[\u4e00-\u9fa5]{1,10}|[\u4e00-\u9fa5]{1,8}中|已连接|已阅读|消息|Thinking|Warming\s*up|Sending|Working|Searching|Researching|Replying|Retrieving|Loading|Idle|Connected)[….\s]*|(?:Muse|Hark)[ \t\r\n]*|(?:正在预热|预热中|空闲中|已连接|连接中|正在连接|仍在发送中|发送中|努力工作中|工作中|努力思考中|正在思考|思考中|正在搜索|正在搜索网页|正在联网搜索|搜索中|正在检索|检索中|正在回复|回复中|正在分析|分析中|正在查询|查询中|正在处理|处理中|正在生成|生成中|正在准备|准备中|加载中|待命中|已阅读|消息|Thinking|Warming\s*up|Sending|Working|Searching|Researching|Replying|Retrieving|Loading|Idle|Connected)[….\s]*)+$/i.test(line.trim()));
+      // 空行过滤掉（原实现没过滤，"Muse\n\n思考中" 会被空行判 false）。
+      const lines = t.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+      if (lines.length === 0) return false;
+      return lines.every(isTransientLine);
     };
     const isTransientProgressOnly = (txt) => {
       const s = (txt || '').trim();
@@ -3303,14 +3396,107 @@ pub(crate) fn build_group_sync_latest_js(
     const extraWords = Array.isArray(adapter.transientStatusWords)
       ? adapter.transientStatusWords.map((w) => String(w || '').trim()).filter(Boolean)
       : [];
-    const isIdleOnlyStatus = (s) => /^(?:(?:Muse|Hark|空闲中|已连接|已阅读|消息|Idle|Connected)[….\s]*)+$/i.test((s || '').trim());
+    const isIdleOnlyStatus = (s) => {
+      const t = (s || '').trim();
+      if (!t || t.length > 160) return false;
+      return /^(?:(?:Muse|Hark|空闲中|已连接|已阅读|消息|Idle|Connected)[….\s]*)+$/i.test(t);
+    };
+    // 瞬时状态词（最长优先：短词是长词前缀时先试长词，如 正在搜索网页 vs 正在搜索）。
+    const TRANSIENT_TOKENS = [
+      '正在搜索网页', '正在联网搜索', '仍在发送中', '努力工作中', '努力思考中',
+      '正在预热', '正在连接', '正在思考', '正在搜索', '正在检索', '正在回复',
+      '正在分析', '正在查询', '正在处理', '正在生成', '正在准备',
+      '预热中', '空闲中', '已连接', '连接中', '发送中', '工作中',
+      '思考中', '搜索中', '检索中', '回复中', '分析中', '查询中',
+      '处理中', '生成中', '准备中', '加载中', '待命中', '已阅读',
+      '消息', 'Thinking', 'Sending', 'Working', 'Searching',
+      'Researching', 'Replying', 'Retrieving', 'Loading', 'Idle', 'Connected',
+    ];
+    // 单行确定性分词：每步至少消耗 1 个字符、绝不回溯，O(N)。
+    // 原实现是嵌套量词正则 (...)+，分支重叠（Muse|Hark 既单列又与状态词
+    // 拼合），'Muse 消息 '.repeat(19) + '!'（153 字）单次 test 要 250-550ms，
+    // 群聊轮询每 450ms 扫多个节点时会卡死。空行不过滤还会把 "Muse\n\n思考中"
+    // 从 true 打成 false（本轮顺手修掉）。
+    const isTransientLine = (line) => {
+      let i = 0;
+      const n = line.length;
+      let saw = false;
+      const skipSep = () => {
+        while (i < n && /[…\s.]/.test(line[i])) i++;
+      };
+      // 在 i 处匹配一个状态词，返回长度，匹配不上返回 0。
+      // generics=true 只用于品牌词后的一轮：正在 + 1-10 汉字（取最长），
+      // 或 1-8 汉字 + 中（取首个 中，最短匹配）；无品牌时只认字面词，
+      // 与原正则的分支 3 一致（"正在思考中" 无品牌仍判 false）。
+      const matchToken = (generics) => {
+        if (generics && line.startsWith('正在', i)) {
+          let j = i + 2;
+          let cjk = 0;
+          while (j < n && cjk < 10 && /[\u4e00-\u9fa5]/.test(line[j])) { j++; cjk++; }
+          if (cjk >= 1) return j - i;
+        }
+        if (generics) {
+          let j = i;
+          let cjk = 0;
+          while (j < n && cjk <= 8 && /[\u4e00-\u9fa5]/.test(line[j])) {
+            if (line[j] === '中') return j + 1 - i;
+            j++;
+            cjk++;
+          }
+        }
+        const warming = /^Warming\s*up/i.exec(line.slice(i));
+        if (warming) return warming[0].length;
+        for (const tok of TRANSIENT_TOKENS) {
+          if (line.slice(i, i + tok.length).toLowerCase() === tok.toLowerCase()) {
+            return tok.length;
+          }
+        }
+        return 0;
+      };
+      while (i < n) {
+        skipSep();
+        if (i >= n) break;
+        // 品牌词开头的一轮：品牌 + 可选状态词；无状态词时品牌本身即一轮。
+        let brandLen = 0;
+        for (const b of ['Muse', 'Hark']) {
+          if (line.slice(i, i + b.length).toLowerCase() === b.toLowerCase()) {
+            brandLen = b.length;
+            break;
+          }
+        }
+        if (brandLen > 0) {
+          i += brandLen;
+          saw = true;
+          const save = i;
+          while (i < n && /[ \t]/.test(line[i])) i++;
+          const len = matchToken(true);
+          if (len > 0) {
+            i += len;
+            continue;
+          }
+          i = save;
+          continue;
+        }
+        const len = matchToken(false);
+        if (len > 0) {
+          i += len;
+          saw = true;
+          continue;
+        }
+        return false;
+      }
+      return saw;
+    };
     const isTransientStatusText = (s) => {
       const t = (s || '').trim();
       if (!t || t.length > 160) return false;
       if (extraWords.some((w) => t === w || t === ('Muse\n' + w) || t === ('Hark\n' + w))) {
         return true;
       }
-      return t.split(/\r?\n/).every((line) => /^(?:(?:Muse|Hark)[ \t\r\n]+(?:正在[\u4e00-\u9fa5]{1,10}|[\u4e00-\u9fa5]{1,8}中|已连接|已阅读|消息|Thinking|Warming\s*up|Sending|Working|Searching|Researching|Replying|Retrieving|Loading|Idle|Connected)[….\s]*|(?:Muse|Hark)[ \t\r\n]*|(?:正在预热|预热中|空闲中|已连接|连接中|正在连接|仍在发送中|发送中|努力工作中|工作中|努力思考中|正在思考|思考中|正在搜索|正在搜索网页|正在联网搜索|搜索中|正在检索|检索中|正在回复|回复中|正在分析|分析中|正在查询|查询中|正在处理|处理中|正在生成|生成中|正在准备|准备中|加载中|待命中|已阅读|消息|Thinking|Warming\s*up|Sending|Working|Searching|Researching|Replying|Retrieving|Loading|Idle|Connected)[….\s]*)+$/i.test(line.trim()));
+      // 空行过滤掉（原实现没过滤，"Muse\n\n思考中" 会被空行判 false）。
+      const lines = t.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+      if (lines.length === 0) return false;
+      return lines.every(isTransientLine);
     };
     const isTransientProgressOnly = (txt) => {
       const s = (txt || '').trim();

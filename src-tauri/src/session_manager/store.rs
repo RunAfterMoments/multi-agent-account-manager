@@ -13,7 +13,10 @@
 use super::{AccountPageError, InnerState, ManagerSnapshot, SessionManager};
 use crate::platform::{self, current_platform_name};
 use crate::providers::{all_provider_infos, resolve_provider, ProviderId};
-use crate::storage::{parse_store_str, save_store_atomic, AccountsStoreFile, ExternalAgentView};
+use crate::storage::{
+  migrate_agent_keys_to_vault, parse_store_str, save_store_atomic, AccountsStoreFile,
+  ExternalAgentView,
+};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -220,13 +223,25 @@ impl SessionManager {
           continue;
         }
       };
-      let loaded = match parse_store_str(&raw) {
+      let mut loaded = match parse_store_str(&raw) {
         Ok(loaded) => loaded,
         Err(err) => {
           last_err = err;
           continue;
         }
       };
+      // vault 迁移/回填（与启动加载一致）：v5/v6 备份的 Key 只在 vault
+      // 里，须先取回内存，否则恢复后重启前全部 401；旧备份的明文 Key
+      // 须先写入 vault，否则 save_store_atomic 剥离 api_key 后永久丢失。
+      // 写入失败时不写盘，换下一个候选。
+      let vault_dir = store_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+      if !migrate_agent_keys_to_vault(&mut loaded.store, &vault_dir) {
+        last_err = "API Key 写入系统凭据库失败，已停止恢复该备份（原备份未动）".to_string();
+        continue;
+      }
       if let Err(err) = save_store_atomic(&store_path, &loaded.store) {
         last_err = err;
         continue;

@@ -1451,6 +1451,7 @@ const ALLOWED_PARENT_DOMAINS: &[&str] = &["hark.com", "muse.ai"];
 const MAX_IMPORTED_COOKIES: usize = 200;
 const MAX_IMPORTED_COOKIES_BYTES: usize = 512 * 1024;
 
+#[allow(clippy::too_many_arguments)]
 fn push_validated_imported_cookie(
   out: &mut Vec<ImportedCookieSpec>,
   seen: &mut std::collections::HashMap<(String, String, String), usize>,
@@ -1772,7 +1773,7 @@ fn is_valid_identity_email_str(s: &str) -> bool {
     return false;
   }
   let mut parts = domain.split('.');
-  let Some(last) = parts.clone().last() else {
+  let Some(last) = parts.clone().next_back() else {
     return false;
   };
   if last.len() < 2 || !last.bytes().all(|b| b.is_ascii_alphabetic()) {

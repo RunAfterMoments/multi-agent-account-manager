@@ -46,6 +46,7 @@ async fn select_provider(
   mgr.select_provider(&app, &provider_id).await
 }
 
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 async fn add_account(
   app: AppHandle,
@@ -72,6 +73,7 @@ async fn add_account(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 async fn rename_account(
   app: AppHandle,
@@ -765,12 +767,13 @@ pub fn run() {
               mgr_inner.trigger_silent_sync(&app_inner, false).await;
             });
           }
-          tauri::WindowEvent::CloseRequested { api, .. } => {
-            if !QUIT_REQUESTED.load(Ordering::SeqCst) && mgr_for_resize.minimize_to_tray_enabled() {
-              api.prevent_close();
-              if let Some(win) = app_for_resize.get_window("main") {
-                let _ = win.hide();
-              }
+          tauri::WindowEvent::CloseRequested { api, .. }
+            if !QUIT_REQUESTED.load(Ordering::SeqCst)
+              && mgr_for_resize.minimize_to_tray_enabled() =>
+          {
+            api.prevent_close();
+            if let Some(win) = app_for_resize.get_window("main") {
+              let _ = win.hide();
             }
           }
           _ => {}
@@ -785,6 +788,13 @@ pub fn run() {
           "manager",
           tauri::WebviewUrl::App("index.html".into()),
         )
+        // 与桌面端同款导航锁：manager 只允许加载应用自身页面，
+        // 外站链接一律不许在 manager 内打开（走 open_external_url）。
+        .on_navigation(|url| {
+          url.scheme() == "tauri"
+            || url.domain() == Some("tauri.localhost")
+            || (cfg!(dev) && url.host_str() == Some("localhost"))
+        })
         .build()?;
       }
 
