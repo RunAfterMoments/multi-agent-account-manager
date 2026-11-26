@@ -42,6 +42,7 @@ const AUTO_ROUTE_COOLDOWN_MS: u64 = 120_000;
 #[cfg(desktop)]
 const LEFT_PANE_WIDTH: f64 = 380.0;
 /// 收起态左栏宽：只留服务栏（68px，与 styles.css 的 .service-rail 一致）。
+#[cfg(desktop)]
 const SERVICE_RAIL_WIDTH: f64 = 68.0;
 #[cfg(desktop)]
 const MAX_WARM_DESKTOP_VIEWS: usize = 10;

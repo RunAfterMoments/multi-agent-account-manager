@@ -739,23 +739,108 @@ webview.rs `PendingDownloads` 别名 + `format!` 去引用 + `never_loop` allow�
 - 细节：代码里的反斜杠经字节数核实正确（keydown 行 2 个反斜杠 = 单个 `\` 字符串；
   title 行每处 2 个）；工具输出显示会转义反斜杠，以字节数为准，别凭显示改。
 
-## 十二、残留（v6.1 后，未变）
+## 十三、v6.1.1 移动端导入修复（2026-11-26 晚，小 commit）
 
-- Windows-only Rust（Job Object `SetInformationJobObject` 路径）与 Kotlin/Swift
-  仍未在本机编译验证；首次真检查是用户推到 GitHub 后跑 CI
-  （`ci.yml` 已有 ubuntu-24.04 / windows-2025 / macos-15 + audit job）。
+背景：用户复审 v6.1 + 侧边栏（1,822 行 diff），评分 **8.1/10**
+（5.3 → 6.0 → 6.8 → 7.6 → 8.1），判定桌面端 CI 已就绪；推 `release.yml`
+验 Android/iOS 前先修 1 处移动端 `#[cfg(desktop)]` 导入坑，另 2 处小边角顺手改。
+
+### 移动端导入（4 处，逐项核实均为真）
+
+根因：P2-11 拆文件时留下的无条件 `use super::{...}` 引入了父模块里
+`#[cfg(desktop)]` 的符号，Android/iOS 构建报 `E0432: unresolved import`。
+修法一律是把 desktop 专用符号拆进 `#[cfg(desktop)] use super::{...};`：
+
+- `webview.rs`：9 个 desktop 符号（`WarmDesktopEntry`、5 个 `*_INIT_JS`、
+  `GROUP_IDLE_RECLAIM_MS`、`LEFT_PANE_WIDTH`、`MAX_CONCURRENT_PREWARMS`、
+  `MAX_WARM_DESKTOP_VIEWS`）+ `SERVICE_RAIL_WIDTH`（在 `session_manager.rs`
+  补 `#[cfg(desktop)]`，只在 desktop 布局函数里用）；其余 5 个
+  （`ActiveSessionSlot`、`InnerState`、`ManagerSnapshot`、`SessionManager`、
+  `APP_TITLE`）无 cfg，留在无条件导入。
+- `a2a.rs`：`GroupAttachment`、`REVIEW_FALLBACK_CHAR_LIMIT`、
+  `REVIEW_INLINE_CHAR_LIMIT` 移入 desktop 块；`type ReviewJob` 加
+  `#[cfg(desktop)]`（唯一使用点是 `#[cfg(desktop)]` 的
+  `run_group_review_pipeline` 的 `jobs: Vec<ReviewJob>` 参数）。
+- `group_chat.rs`：9 个 `build_*_js` + `GroupAttachment` 移入 desktop 块
+  （9 个构建函数与 5 个 `*_INIT_JS` 同属父模块的 `#[cfg(desktop)]
+  pub(crate) use scripts::{...}` 重导出）；`evaluate_account_quota` /
+  `AccountQuotaEval`（`quota.rs` 无 desktop cfg，重导出也无 cfg）留在无条件导入。
+- `quota_sync.rs`：`DesktopProbeResult`（定义在 `session_manager.rs:2803`
+  带 `#[cfg(desktop)]`，唯一使用点是同为 desktop 的 `eval_identity_probe`）
+  并入已有的 `#[cfg(desktop)] use super::{IDENTITY_PROBE_JS};`。
+
+### 本机首次 Android 检查：顺手多抓 1 处
+
+为验证上述修复，用 `rustup target add aarch64-linux-android` 后跑
+`cargo check --target aarch64-linux-android --lib`（`cfg(desktop)` 由
+tauri-build 按 target_os 发放，Android 目标上即为 false，正好模拟移动端面）。
+首轮剩唯一错误：`group_transport.rs:959` 的 `cli_timeout_error` 用了
+`Duration`，但 `use std::time::{Duration, Instant}` 是 `#[cfg(desktop)]`——
+该函数只被 `#[cfg(desktop)]` 的 `execute_local_cli_turn` 调用，
+连同只被它调用的 `format_timeout_partial` 一起加 `#[cfg(desktop)]`。
+修复后 Android check **0 错误**（首次在本机跑通移动端 Rust 检查）。
+残留 44 条 mobile 警告多为 desktop 专用 import 在移动端未使用——警告不阻断
+`cargo build`；`clippy -D warnings` 只在 `ci.yml` 的桌面三 OS 上跑，
+Android job 只做 `tauri android build`，故不影响 CI。
+
+### isTransientLine 两处边界（复审 §2.1，逐项对旧正则核实）
+
+- `matchToken` 的泛型 `X+中` 分支在 `cjk === 0` 时（行首就是 `中`）直接返回 1，
+  `"Muse 中"` 误判 true；旧正则 `{1,8}中` 要求至少 1 个前置汉字——
+  改成 `if (cjk >= 1 && line[j] === '中')`。
+- 品牌词后未判 `i > save`：无空格紧连时也走了 `matchToken(true)`，
+  `"Muse正在瞎编中"`（泛型、非字面词）误判 true；旧正则品牌后泛型分支要求
+  `[ \t\r\n]+`，而 branch 2（品牌单独）+ branch 3（字面词）拼不出泛型——
+  改成 `const len = i > save ? matchToken(true) : 0;`。
+  两处均在 `scripts.rs` 的两个同构点改（已确认两点改后文本完全一致）。
+- 差分验证：从改后文件原样抽出 tokenizer（含 `TRANSIENT_TOKENS` /
+  `extraWords` / `isTransientStatusText`），对旧正则（v6，`git show c08bbd4^`）
+  跑 36 个用例——**全部一致**，除 2 处已知的有意差异（`"Muse..."`、
+  `"Muse\n\n思考中"`，v6.1 报告已记）；对抗输入 0.28ms。
+  注意 `"Muse思考中"` 仍判 true（旧正则同样 true：branch 2 品牌单独 +
+  branch 3 字面词 `思考中`），`i > save` 只影响泛型分支。
+
+### 侧边栏按钮小边角（复审 §2.2）
+
+收起态点「设置」临时展开时，`#toggle-sidebar-btn` 显示「收起」但因
+`modal_active` 强制展开、点它视觉上没反应——弹窗打开期间按钮置
+`disabled`（title 改为“关闭弹窗后可切换侧边栏”），点击处理里再守一道
+`modal.kind !== "none"` 直接返回（不关弹窗，避免误关未保存的设置表单）；
+tooltip 按平台显示：macOS `⌘\`，其余 `Ctrl+\`（`IS_MAC`，
+与 `render.ts` 同款 `navigator.userAgent.includes("Mac")` 判定）；
+补 `.rail-util-btn:disabled` 样式（半透明 + `not-allowed`）。
+`Ctrl+\` 快捷键早已有 modal 守卫，不受影响。
+
+### 验证（v6.1.1）
+
+- `cargo fmt --check`：干净。
+- `cargo clippy --all-targets -- -D warnings`：0 错误。
+- `cargo test --lib`：**105/105**；`npm run build` 通过；`npm run test:js`：**20/20**。
+- `cargo check --target aarch64-linux-android --lib`：**0 错误**。
+- 环境备注：本次验证中虚拟机又被替换了一次，Tauri Linux 开发库再次丢失
+  （`cargo test` 链接失败缺 `-lgtk-3` 等），按老办法重装
+  （先降级 `libzstd1` 再装 5 个 `-dev` 包）；这是本机验证的环境税，
+  不影响仓库代码。
+
+## 十二、残留（v6.1.1 后）
+
+- Android Rust 已在本机 `cargo check --target aarch64-linux-android` 0 错误
+  （仅检查未链接、未编 APK）；仍未验证：Windows-only Rust（Job Object
+  `SetInformationJobObject` 路径）、Kotlin/Swift 编译、iOS Rust 检查。
+  首次真检查是用户推到 GitHub 后跑 CI（`ci.yml` 已有 ubuntu-24.04 /
+  windows-2025 / macos-15 + audit job）与 `release.yml`。
 - `cargo audit` / `npm audit` 未在本机跑通（cargo-audit 未装；npm audit 端点被代理拦）——
   CI 的 audit job 是首次真跑，现有依赖的高危漏洞可能让它变红。
 - Ed25519/minisign 更新签名**未实现**；`release.yml` 现默认更新关闭（vars 为空），
   需用户生成密钥对（`minisign -G`，私钥进 CI secret，公钥编进程序）并设仓库变量后开启。
 - **PR-F 与 Step 2 明确延后**（按 v6 复审路线）：PR-F（key_vault DPAPI / Keystore /
   Keychain + `Zeroizing<String>`，去静默明文回退）；Step 2（`self.inner.lock().await`
-  跨 `.await` 持锁拆解、流式 delta + 局部 DOM 更新）。等用户复审 v6.1 后再定。
+  跨 `.await` 持锁拆解、流式 delta + 局部 DOM 更新）。等用户复审 v6.1.1 后再定。
 - 早期路线“明确未做的项”仍在：P1-8 增量写入、WiX `UninstallString` 强化 /
   WebView2 bootstrapper 哈希、Android FileProvider、时区脚本主框化、iOS 下载缺口、
   审计报告 5 项真机测试；Android 第三方 Cookie 关闭可能影响 Meta SSO /
   Turnstile 人机验证（需真机手动测）。
-- 下一步（按 v6 复审路线）：① 用户把 v6.1 推到自己的 GitHub 跑首轮真 CI
+- 下一步（按 v6 复审路线）：① 用户把 v6.1.1 推到自己的 GitHub 跑首轮真 CI
   （看三 OS 全绿 + audit 报告；手动跑一次 `release.yml` workflow_dispatch，
   `publish_release: false`，首次真实验证 Windows Job Object、Android Kotlin、iOS Swift）；
   ② Ed25519 签名 + PR-F；③ Step 2 + 真机验收（Windows `.cmd` CLI + Job Object 杀树 +

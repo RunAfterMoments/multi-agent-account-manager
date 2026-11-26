@@ -7,9 +7,9 @@
 //! are `pub(super)` so the parent module (group-chat engine) keeps calling
 //! them via `Self::` / `self.` — methods belong to the type, not the file.
 
-use super::{
-  GroupAttachment, SessionManager, REVIEW_FALLBACK_CHAR_LIMIT, REVIEW_INLINE_CHAR_LIMIT,
-};
+use super::SessionManager;
+#[cfg(desktop)]
+use super::{GroupAttachment, REVIEW_FALLBACK_CHAR_LIMIT, REVIEW_INLINE_CHAR_LIMIT};
 use crate::providers::{resolve_provider, ProviderId};
 use crate::storage::{
   now_ms, AccountKey, AuthState, ExternalAgentKind, GroupChatMessage, GroupReplyStatus,
@@ -44,6 +44,8 @@ impl Drop for A2aInFlightGuard {
 
 /// 评审管线一个阶段的任务：(阶段序号, 成员, 消息 id, 阶段名, 自动通道)。
 /// 别名只为压住 clippy::type_complexity（元组本身不复杂到值得拆 struct）。
+/// 仅桌面评审管线使用（run_group_review_pipeline 是 #[cfg(desktop)]）。
+#[cfg(desktop)]
 pub(super) type ReviewJob = (
   usize,
   AccountKey,

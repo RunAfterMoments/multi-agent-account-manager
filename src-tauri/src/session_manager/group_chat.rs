@@ -11,12 +11,16 @@
 //! lifecycle (`apply_desktop_layout_locked`, `close_warm_entry`,
 //! `hide_foreground_slot`) and the A2A module resolve through the type.
 
+#[cfg(desktop)]
 use super::{
   build_group_attach_file_js, build_group_check_attached_js, build_group_poll_js,
   build_group_send_js, build_group_sync_latest_js, build_hark_click_preview_card_js,
   build_hark_close_expanded_js, build_hark_read_expanded_js, build_new_chat_click_js,
-  evaluate_account_quota, AccountQuotaEval, GroupAttachment, InnerState, ManagerSnapshot,
-  SessionManager, APP_TITLE, AUTO_ROUTE_COOLDOWN_MS, MAX_GROUP_MEMBERS,
+  GroupAttachment,
+};
+use super::{
+  evaluate_account_quota, AccountQuotaEval, InnerState, ManagerSnapshot, SessionManager, APP_TITLE,
+  AUTO_ROUTE_COOLDOWN_MS, MAX_GROUP_MEMBERS,
 };
 use crate::group_transport;
 #[cfg(desktop)]

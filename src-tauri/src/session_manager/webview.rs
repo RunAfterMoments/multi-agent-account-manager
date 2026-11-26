@@ -17,11 +17,12 @@
 //! identity watcher (`spawn_desktop_identity_watcher`) still lives in the
 //! parent and calls into this module.
 
+use super::{ActiveSessionSlot, InnerState, ManagerSnapshot, SessionManager, APP_TITLE};
+#[cfg(desktop)]
 use super::{
-  ActiveSessionSlot, InnerState, ManagerSnapshot, SessionManager, WarmDesktopEntry, APP_TITLE,
-  AUTO_APPROVE_INIT_JS, BACKGROUND_RAF_INIT_JS, DOM_PAINT_READY_JS, GROUP_IDLE_RECLAIM_MS,
-  LEFT_PANE_WIDTH, LOGIN_CAPTURE_INIT_JS, MAX_CONCURRENT_PREWARMS, MAX_WARM_DESKTOP_VIEWS,
-  SERVICE_RAIL_WIDTH,
+  WarmDesktopEntry, AUTO_APPROVE_INIT_JS, BACKGROUND_RAF_INIT_JS, DOM_PAINT_READY_JS,
+  GROUP_IDLE_RECLAIM_MS, LEFT_PANE_WIDTH, LOGIN_CAPTURE_INIT_JS, MAX_CONCURRENT_PREWARMS,
+  MAX_WARM_DESKTOP_VIEWS, SERVICE_RAIL_WIDTH,
 };
 use crate::platform;
 #[cfg(desktop)]

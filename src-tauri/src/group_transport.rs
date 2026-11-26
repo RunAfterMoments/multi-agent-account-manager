@@ -942,6 +942,8 @@ impl Drop for CliJobGuard {
 unsafe impl Send for CliJobGuard {}
 
 /// 超时/取消错误里附带的部分输出：最多取前 500 字，避免错误消息过长。
+/// 仅桌面 LocalCli 路径使用（execute_local_cli_turn 是 #[cfg(desktop)]）。
+#[cfg(desktop)]
 fn format_timeout_partial(text: &str) -> String {
   let trimmed = text.trim();
   if trimmed.is_empty() {
@@ -956,6 +958,7 @@ fn format_timeout_partial(text: &str) -> String {
 }
 
 /// 超时错误：附带已收集的部分输出，不再丢弃。
+#[cfg(desktop)]
 fn cli_timeout_error(partial: &str, limit: Duration, idle: bool) -> String {
   let secs = limit.as_secs();
   let collected = format_timeout_partial(partial);

@@ -105,6 +105,8 @@ systemDarkQuery.addEventListener("change", () => {
 
 let snapshot: ManagerSnapshot | null = null;
 let modal: ModalMode = { kind: "none" };
+// macOS 的快捷键提示用 ⌘，其余平台用 Ctrl（与 render.ts 的做法一致）。
+const IS_MAC = navigator.userAgent.includes("Mac");
 let optimisticSwitching: AccountKey | null = null;
 let busy = false;
 let viewMode: "provider" | "groups" = "provider";
@@ -429,7 +431,8 @@ function render(): void {
             <button
               id="toggle-sidebar-btn"
               class="rail-util-btn"
-              title="${snapshot.effectiveSidebarCollapsed ? "展开账号栏 (Ctrl+\\)" : "收起账号栏 (Ctrl+\\)"}"
+              ${modal.kind !== "none" ? "disabled" : ""}
+              title="${modal.kind !== "none" ? "关闭弹窗后可切换侧边栏" : `${snapshot.effectiveSidebarCollapsed ? "展开账号栏" : "收起账号栏"} (${IS_MAC ? "⌘" : "Ctrl"}+\\)`}"
               type="button"
             >
               ${snapshot.effectiveSidebarCollapsed ? ICON_CHEVRON_RIGHT : ICON_CHEVRON_LEFT}
@@ -1214,6 +1217,9 @@ function bindEvents(state: ManagerSnapshot, provider: ProviderInfo): void {
   });
 
   document.querySelector("#toggle-sidebar-btn")?.addEventListener("click", async () => {
+    // 弹窗打开时按钮本身已 disabled；这里再守一道，避免弹窗临时展开态下
+    // 点“收起”看起来没反应（modal_active 会强制 effective 保持展开）。
+    if (modal.kind !== "none") return;
     await setSidebarCollapsed(!state.effectiveSidebarCollapsed);
   });
 

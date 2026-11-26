@@ -2644,7 +2644,7 @@ pub(crate) fn build_group_poll_js(adapter: &SiteAdapterConfig, job_id: &str) -> 
           let j = i;
           let cjk = 0;
           while (j < n && cjk <= 8 && /[\u4e00-\u9fa5]/.test(line[j])) {
-            if (line[j] === '中') return j + 1 - i;
+            if (cjk >= 1 && line[j] === '中') return j + 1 - i;
             j++;
             cjk++;
           }
@@ -2674,7 +2674,7 @@ pub(crate) fn build_group_poll_js(adapter: &SiteAdapterConfig, job_id: &str) -> 
           saw = true;
           const save = i;
           while (i < n && /[ \t]/.test(line[i])) i++;
-          const len = matchToken(true);
+          const len = i > save ? matchToken(true) : 0;
           if (len > 0) {
             i += len;
             continue;
@@ -3439,7 +3439,7 @@ pub(crate) fn build_group_sync_latest_js(
           let j = i;
           let cjk = 0;
           while (j < n && cjk <= 8 && /[\u4e00-\u9fa5]/.test(line[j])) {
-            if (line[j] === '中') return j + 1 - i;
+            if (cjk >= 1 && line[j] === '中') return j + 1 - i;
             j++;
             cjk++;
           }
@@ -3469,7 +3469,7 @@ pub(crate) fn build_group_sync_latest_js(
           saw = true;
           const save = i;
           while (i < n && /[ \t]/.test(line[i])) i++;
-          const len = matchToken(true);
+          const len = i > save ? matchToken(true) : 0;
           if (len > 0) {
             i += len;
             continue;

@@ -13,8 +13,8 @@
 //! evaluation helpers live in `quota.rs`; this module is the sync/probe side.
 
 #[cfg(desktop)]
-use super::IDENTITY_PROBE_JS;
-use super::{DesktopProbeResult, InnerState, ManagerSnapshot, PendingExternalAuth, SessionManager};
+use super::{DesktopProbeResult, IDENTITY_PROBE_JS};
+use super::{InnerState, ManagerSnapshot, PendingExternalAuth, SessionManager};
 use crate::platform;
 use crate::providers::{is_verified_callback_origin, resolve_provider};
 use crate::storage::{now_ms, AccountKey, AuthState, QuotaDetail};
