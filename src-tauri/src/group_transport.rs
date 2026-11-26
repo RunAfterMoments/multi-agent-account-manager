@@ -639,6 +639,12 @@ impl Drop for CliJobGuard {
   }
 }
 
+// SAFETY: CliJobGuard 独占 Job Object 句柄（Drop 时唯一一次 CloseHandle），
+// 从不同时被两个线程持有，只会被 move 进唯一一个监视线程，因此可以 Send。
+// （windows 0.62 起 HANDLE 内部是 *mut c_void，本身不是 Send，需手动声明。）
+#[cfg(all(desktop, windows))]
+unsafe impl Send for CliJobGuard {}
+
 /// 超时/取消错误里附带的部分输出：最多取前 500 字，避免错误消息过长。
 fn format_timeout_partial(text: &str) -> String {
   let trimmed = text.trim();
@@ -821,7 +827,8 @@ where
     use windows::Win32::Foundation::HANDLE;
     use windows::Win32::System::JobObjects::{AssignProcessToJobObject, CreateJobObjectW};
     let job = unsafe { CreateJobObjectW(None, windows::core::PCWSTR::null()) }.ok()?;
-    let proc = HANDLE(child.as_raw_handle() as isize);
+    // windows 0.62 起 HANDLE 的内部类型是 *mut c_void，as_raw_handle() 本身就是该类型，直接包起来即可。
+    let proc = HANDLE(child.as_raw_handle());
     match unsafe { AssignProcessToJobObject(job, proc) } {
       Ok(()) => Some(CliJobGuard(job)),
       Err(_) => {
