@@ -1723,7 +1723,9 @@ mod tests {
     assert_eq!(cli_ok.account_key().provider_id.as_str(), "cli");
   }
 
+  // 只在 unix 下编译：merge_augmented_path 本身是 #[cfg(unix)]，且用例全是 unix 风格路径。
   #[test]
+  #[cfg(unix)]
   fn merge_augmented_path_prefers_login_shell_and_dedups() {
     let merged = super::merge_augmented_path(
       "/usr/bin:/bin:/opt/homebrew/bin",
@@ -1745,7 +1747,9 @@ mod tests {
     assert!(parts.contains(&"/Users/li/.claude/local/bin"));
   }
 
+  // 只在 unix 下编译：merge_augmented_path 本身是 #[cfg(unix)]，且用例全是 unix 风格路径。
   #[test]
+  #[cfg(unix)]
   fn merge_augmented_path_without_shell_path_keeps_old_behavior() {
     let merged = super::merge_augmented_path("/usr/bin", "/home/u", None);
     assert!(merged.starts_with("/usr/bin:"));

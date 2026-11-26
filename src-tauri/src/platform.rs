@@ -1381,9 +1381,11 @@ pub async fn write_cookie_clipboard(app: &tauri::AppHandle, header: String) -> R
       let _ = sender.send(result.map_err(|_| "无法写入系统剪贴板，请重试".to_string()));
     })
     .map_err(|_| "无法写入系统剪贴板，请重试".to_string())?;
+  // 内外两层 Result 都要处理：接收中断和写入失败都直接返回，写失败时不启动清理任务。
+  // 之前只写了一个 `?`，内层 Result 被丢弃（-D warnings 下报错），且写失败仍会启动清理任务。
   receiver
     .await
-    .map_err(|_| "写入系统剪贴板中断".to_string())?;
+    .map_err(|_| "写入系统剪贴板中断".to_string())??;
   // 剪贴板 60 秒后自动清理：Cookie 长时间留在剪贴板里会被其他应用读到。
   // 只在剪贴板内容仍是本次写入的 Cookie 时才清空，用户中途复制了别的内容则不动。
   // 写失败时不启动清理任务；清理本身尽力而为，任何错误都静默忽略。
