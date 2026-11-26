@@ -23,6 +23,8 @@ export interface AppSettings {
   minimizeToTray: boolean;
   globalShortcut: string;
   autoApprove: boolean;
+  disableAutoUpdateCheck: boolean;
+  autoApproveCommands: boolean;
 }
 
 export interface ProxyTestResult {
@@ -98,16 +100,20 @@ export interface GroupThreadBinding {
 
 export type ExternalAgentKind = "openai_api" | "local_cli";
 
-export interface ExternalAgentRecord {
+/// 下发给前端的外部成员视图：不含明文 Key，只给 hasApiKey。
+/// 编辑时 Key 输入框恒为空，留空表示不修改。
+export interface ExternalAgentView {
   id: string;
   kind: ExternalAgentKind;
   name: string;
   baseUrl: string;
-  apiKey: string;
+  hasApiKey: boolean;
   model: string;
   command: string;
   args: string[];
   workdir: string | null;
+  timeoutSecs: number;
+  idleTimeoutSecs: number;
   createdAtMs: number;
 }
 
@@ -189,7 +195,7 @@ export interface ManagerSnapshot {
   globalShortcutError: string | null;
   groupChats: GroupChatRecord[];
   activeGroupId: string | null;
-  externalAgents: ExternalAgentRecord[];
+  externalAgents: ExternalAgentView[];
   accountErrors?: AccountPageError[];
 }
 
@@ -204,6 +210,7 @@ export interface UpdateCheckResult {
   filename: string | null;
   size: number | null;
   releasePageUrl: string;
+  updatesDisabled: boolean;
 }
 
 export interface UpdateProgressEvent {
@@ -225,3 +232,76 @@ export interface DownloadNoticeEvent {
   status: "started" | "completed" | "failed";
   error?: string | null;
 }
+
+// Moved from main.ts (P2-11 split).
+export type AccountDraft = {
+  draft: string;
+  proxyDraft: string;
+  timezoneDraft: string;
+  cookieDraft?: string;
+  cookieImporting?: boolean;
+  error?: string;
+  saving?: boolean;
+  proxyTesting?: boolean;
+  proxyTestResult?: ProxyTestResult | null;
+  confirmClear?: boolean;
+};
+export type ModalMode =
+  | { kind: "none" }
+  | ({ kind: "add"; providerId: ProviderId } & AccountDraft)
+  | ({ kind: "rename"; account: AccountRecord } & AccountDraft)
+  | { kind: "remove"; account: AccountRecord }
+  | {
+      kind: "group";
+      group?: GroupChatRecord;
+      nameDraft: string;
+      selectedMembers: AccountKey[];
+      error?: string;
+      saving?: boolean;
+    }
+  | {
+      kind: "group-knowledge";
+      group: GroupChatRecord;
+      tab: "context" | "skills" | "roles" | "adapters";
+      contextDraft: string;
+      skillsDraft: GroupSharedSkill[];
+      rolesDraft: GroupMemberRole[];
+      skillNameDraft: string;
+      skillDescDraft: string;
+      skillContentDraft: string;
+      editingSkillId: string | null;
+      adaptersSnap?: SiteAdaptersSnapshot | null;
+      adaptersJsonDraft: string;
+      adaptersLoaded?: boolean;
+      error?: string;
+      saving?: boolean;
+    }
+  | {
+      kind: "external-agents";
+      editingId: string | null;
+      formKind: ExternalAgentKind;
+      nameDraft: string;
+      baseUrlDraft: string;
+      apiKeyDraft: string;
+      modelDraft: string;
+      commandDraft: string;
+      argsDraft: string;
+      workdirDraft: string;
+      timeoutSecsDraft: string;
+      idleTimeoutSecsDraft: string;
+      error?: string;
+      saving?: boolean;
+    }
+  | { kind: "delete-group"; group: GroupChatRecord }
+  | {
+      kind: "settings";
+      minimizeToTray: boolean;
+      globalShortcut: string;
+      autoApprove: boolean;
+      disableAutoUpdateCheck: boolean;
+      autoApproveCommands: boolean;
+      error?: string;
+      saving?: boolean;
+    }
+  | { kind: "update" };
+export type ProviderLogoSpec = { src: string; fullBleed: boolean; monoDark?: boolean };
