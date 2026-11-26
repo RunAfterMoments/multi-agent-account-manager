@@ -86,9 +86,7 @@ pub enum MobileSessionEvent {
     reason: String,
   },
   #[serde(rename_all = "camelCase")]
-  RecreateRequested {
-    previous_switch_seq: u64,
-  },
+  RecreateRequested { previous_switch_seq: u64 },
   #[serde(rename_all = "camelCase")]
   UpdateProgress {
     stage: String,

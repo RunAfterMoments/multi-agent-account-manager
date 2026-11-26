@@ -43,9 +43,8 @@ pub fn parse_account_timezone(raw: &str) -> Result<Option<String>, String> {
   if trimmed.is_empty() {
     return Ok(None);
   }
-  let invalid = || {
-    "时区格式无效，请使用 IANA 时区名称（例如 America/New_York、Asia/Tokyo）".to_string()
-  };
+  let invalid =
+    || "时区格式无效，请使用 IANA 时区名称（例如 America/New_York、Asia/Tokyo）".to_string();
   if trimmed.len() > 64
     || !trimmed
       .bytes()
@@ -333,7 +332,9 @@ pub fn parse_account_proxy(raw: &str) -> Result<Option<url::Url>, String> {
     return Err("当前平台不支持账号代理".to_string());
   }
   let invalid = || "请输入无认证的 HTTP CONNECT 代理地址（http://主机:端口）".to_string();
-  if !raw.get(..7).is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
+  if !raw
+    .get(..7)
+    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
     || raw.bytes().any(|byte| byte.is_ascii_whitespace())
   {
     return Err(invalid());
@@ -376,7 +377,9 @@ pub fn parse_account_proxy(raw: &str) -> Result<Option<url::Url>, String> {
 #[allow(dead_code)]
 pub fn format_account_proxy(proxy: &url::Url) -> String {
   let host = proxy.host_str().expect("validated HTTP proxy host");
-  let port = proxy.port_or_known_default().expect("validated HTTP proxy port");
+  let port = proxy
+    .port_or_known_default()
+    .expect("validated HTTP proxy port");
   format!("http://{host}:{port}")
 }
 
@@ -409,7 +412,9 @@ pub fn with_windows_account_proxy(
 #[cfg(windows)]
 fn windows_browser_switch(arg: &str) -> Option<(&str, &str)> {
   let arg = arg.trim();
-  let switch = arg.strip_prefix("--").or_else(|| arg.strip_prefix(['-', '/']))?;
+  let switch = arg
+    .strip_prefix("--")
+    .or_else(|| arg.strip_prefix(['-', '/']))?;
   Some(switch.split_once('=').unwrap_or((switch, "")))
 }
 
@@ -426,7 +431,9 @@ fn check_windows_proxy_arguments(args: &str, source: &str) -> Result<(), String>
   let mut count = 0;
   let argv = unsafe { CommandLineToArgvW(&command, &mut count) };
   if argv.is_null() {
-    return Err(format!("无法核对 Windows WebView2 启动参数（{source}），已阻止打开账号"));
+    return Err(format!(
+      "无法核对 Windows WebView2 启动参数（{source}），已阻止打开账号"
+    ));
   }
   let conflicts = unsafe { std::slice::from_raw_parts(argv, count as usize) }
     .iter()
@@ -475,15 +482,25 @@ fn check_windows_proxy_overrides(app_id: &str) -> Result<(), String> {
   }
 
   let exe = std::env::current_exe().map_err(|err| format!("无法核对 Windows 应用名称: {err}"))?;
-  let exe_name = exe.file_name().ok_or_else(|| "无法核对 Windows 应用名称".to_string())?;
+  let exe_name = exe
+    .file_name()
+    .ok_or_else(|| "无法核对 Windows 应用名称".to_string())?;
   let explicit_id = unsafe { GetCurrentProcessExplicitAppUserModelID() }
     .ok()
     .map(|id| HSTRING::from(webview2_com::take_pwstr(id)));
-  let names = [HSTRING::from(app_id), HSTRING::from(exe_name), HSTRING::from("*")];
+  let names = [
+    HSTRING::from(app_id),
+    HSTRING::from(exe_name),
+    HSTRING::from("*"),
+  ];
   let policy_key = HSTRING::from(POLICY_KEY);
   let mut buffer = vec![0u16; 32_768];
   for (root, hive) in [(HKEY_LOCAL_MACHINE, "HKLM"), (HKEY_CURRENT_USER, "HKCU")] {
-    for name in explicit_id.iter().chain(names.iter()).filter(|name| !name.is_empty()) {
+    for name in explicit_id
+      .iter()
+      .chain(names.iter())
+      .filter(|name| !name.is_empty())
+    {
       let mut size = (buffer.len() * size_of::<u16>()) as u32;
       let result = unsafe {
         RegGetValueW(
@@ -569,7 +586,8 @@ pub async fn on_windows_navigation_completed(
             }
           } else if !matches!(
             status,
-            COREWEBVIEW2_WEB_ERROR_STATUS_UNKNOWN | COREWEBVIEW2_WEB_ERROR_STATUS_OPERATION_CANCELED
+            COREWEBVIEW2_WEB_ERROR_STATUS_UNKNOWN
+              | COREWEBVIEW2_WEB_ERROR_STATUS_OPERATION_CANCELED
           ) {
             on_completed(Err(()));
           }
@@ -853,8 +871,11 @@ fn create_http_connect_proxy(
   unsafe {
     let endpoint = Retained::from_raw(nw_endpoint_create_host(host.as_ptr(), port.as_ptr()))
       .ok_or_else(|| "无法创建代理端点".to_string())?;
-    let proxy = Retained::from_raw(nw_proxy_config_create_http_connect(&*endpoint, std::ptr::null()))
-      .ok_or_else(|| "无法创建 HTTP CONNECT 代理配置".to_string())?;
+    let proxy = Retained::from_raw(nw_proxy_config_create_http_connect(
+      &*endpoint,
+      std::ptr::null(),
+    ))
+    .ok_or_else(|| "无法创建 HTTP CONNECT 代理配置".to_string())?;
     nw_proxy_config_set_failover_allowed(&*proxy, false);
     Ok(proxy)
   }
@@ -870,31 +891,29 @@ pub fn verify_desktop_profile_binding(
   {
     let _ = expected_dir;
     let (tx, rx) = tokio::sync::oneshot::channel();
-    let res = webview
-      .with_webview(move |platform_wv| unsafe {
-        let wk: &objc2_web_kit::WKWebView = &*platform_wv.inner().cast();
-        let store = wk.configuration().websiteDataStore();
-        let check = match store.identifier() {
-          Some(ns_uuid) => {
-            let actual = ns_uuid.UUIDString().to_string();
-            let expected = expected_uuid.hyphenated().to_string();
-            if actual.eq_ignore_ascii_case(&expected) {
-              Ok(())
-            } else {
-              Err(format!(
-                "WKWebsiteDataStore 标识不匹配（期望 {expected}，实际 {actual}）"
-              ))
-            }
+    let res = webview.with_webview(move |platform_wv| unsafe {
+      let wk: &objc2_web_kit::WKWebView = &*platform_wv.inner().cast();
+      let store = wk.configuration().websiteDataStore();
+      let check = match store.identifier() {
+        Some(ns_uuid) => {
+          let actual = ns_uuid.UUIDString().to_string();
+          let expected = expected_uuid.hyphenated().to_string();
+          if actual.eq_ignore_ascii_case(&expected) {
+            Ok(())
+          } else {
+            Err(format!(
+              "WKWebsiteDataStore 标识不匹配（期望 {expected}，实际 {actual}）"
+            ))
           }
-          None => Err("WKWebsiteDataStore 未绑定独立 UUID（落入默认资料），已阻止加载".to_string()),
-        };
-        let _ = tx.send(check);
-      });
+        }
+        None => Err("WKWebsiteDataStore 未绑定独立 UUID（落入默认资料），已阻止加载".to_string()),
+      };
+      let _ = tx.send(check);
+    });
 
     async move {
       res.map_err(|e| format!("访问 macOS WebView 失败: {e}"))?;
-      rx
-        .await
+      rx.await
         .map_err(|_| "核对 macOS WKWebsiteDataStore 超时或中断".to_string())?
     }
   }
@@ -904,53 +923,51 @@ pub fn verify_desktop_profile_binding(
     let _ = expected_uuid;
     let expected_owned = expected_dir.to_path_buf();
     let (tx, rx) = tokio::sync::oneshot::channel();
-    let res = webview
-      .with_webview(move |platform_wv| unsafe {
-        use webview2_com::Microsoft::Web::WebView2::Win32::{
-          ICoreWebView2Environment7, ICoreWebView2_2,
-        };
-        use windows::core::Interface;
+    let res = webview.with_webview(move |platform_wv| unsafe {
+      use webview2_com::Microsoft::Web::WebView2::Win32::{
+        ICoreWebView2Environment7, ICoreWebView2_2,
+      };
+      use windows::core::Interface;
 
-        let check = (|| -> Result<(), String> {
-          let core = platform_wv
-            .controller()
-            .CoreWebView2()
-            .map_err(|e| format!("获取 CoreWebView2 失败: {e}"))?;
-          let core2: ICoreWebView2_2 = core
-            .cast()
-            .map_err(|e| format!("转换 ICoreWebView2_2 失败: {e}"))?;
-          let env = core2
-            .Environment()
-            .map_err(|e| format!("获取 WebView2 Environment 失败: {e}"))?;
-          let env7: ICoreWebView2Environment7 = env
-            .cast()
-            .map_err(|e| format!("转换 ICoreWebView2Environment7 失败: {e}"))?;
-          let mut raw_folder = windows::core::PWSTR::null();
-          env7
-            .UserDataFolder(&mut raw_folder)
-            .map_err(|e| format!("读取 WebView2 UserDataFolder 失败: {e}"))?;
-          let actual_str = raw_folder
-            .to_string()
-            .map_err(|e| format!("解析 UserDataFolder 失败: {e}"))?;
-          windows::Win32::System::Com::CoTaskMemFree(Some(raw_folder.0 as *const _));
+      let check = (|| -> Result<(), String> {
+        let core = platform_wv
+          .controller()
+          .CoreWebView2()
+          .map_err(|e| format!("获取 CoreWebView2 失败: {e}"))?;
+        let core2: ICoreWebView2_2 = core
+          .cast()
+          .map_err(|e| format!("转换 ICoreWebView2_2 失败: {e}"))?;
+        let env = core2
+          .Environment()
+          .map_err(|e| format!("获取 WebView2 Environment 失败: {e}"))?;
+        let env7: ICoreWebView2Environment7 = env
+          .cast()
+          .map_err(|e| format!("转换 ICoreWebView2Environment7 失败: {e}"))?;
+        let mut raw_folder = windows::core::PWSTR::null();
+        env7
+          .UserDataFolder(&mut raw_folder)
+          .map_err(|e| format!("读取 WebView2 UserDataFolder 失败: {e}"))?;
+        let actual_str = raw_folder
+          .to_string()
+          .map_err(|e| format!("解析 UserDataFolder 失败: {e}"))?;
+        windows::Win32::System::Com::CoTaskMemFree(Some(raw_folder.0 as *const _));
 
-          let actual_norm = normalize_win_path(Path::new(&actual_str));
-          let expected_norm = normalize_win_path(&expected_owned);
-          if actual_norm == expected_norm {
-            Ok(())
-          } else {
-            Err(format!(
-              "Windows WebView2 实际数据目录被系统配置覆盖（实际: {actual_str}），已阻止打开以防串号"
-            ))
-          }
-        })();
-        let _ = tx.send(check);
-      });
+        let actual_norm = normalize_win_path(Path::new(&actual_str));
+        let expected_norm = normalize_win_path(&expected_owned);
+        if actual_norm == expected_norm {
+          Ok(())
+        } else {
+          Err(format!(
+            "Windows WebView2 实际数据目录被系统配置覆盖（实际: {actual_str}），已阻止打开以防串号"
+          ))
+        }
+      })();
+      let _ = tx.send(check);
+    });
 
     async move {
       res.map_err(|e| format!("访问 Windows WebView2 失败: {e}"))?;
-      rx
-        .await
+      rx.await
         .map_err(|_| "核对 Windows WebView2 数据目录中断".to_string())?
     }
   }
@@ -1201,7 +1218,11 @@ pub fn summarize_cookie_expiry(cookies: &[CookieMeta], now_ms: u64) -> CookieExp
       if is_noise_cookie_name(&cookie.name) {
         return None;
       }
-      Some((cookie.http_only, is_auth_cookie_name(&cookie.name), expires_at_ms))
+      Some((
+        cookie.http_only,
+        is_auth_cookie_name(&cookie.name),
+        expires_at_ms,
+      ))
     })
     .collect();
 
@@ -1248,7 +1269,10 @@ pub async fn read_macos_cookies_for_url(
   use std::cell::RefCell;
   use std::ptr::NonNull;
 
-  let host = url.host_str().ok_or_else(|| "服务域名无效".to_string())?.to_owned();
+  let host = url
+    .host_str()
+    .ok_or_else(|| "服务域名无效".to_string())?
+    .to_owned();
   let path = url.path().to_owned();
   let (sender, receiver) = tokio::sync::oneshot::channel();
   app
@@ -1271,20 +1295,26 @@ pub async fn read_macos_cookies_for_url(
         for cookie in unsafe { cookies.as_ref() }.to_vec() {
           let domain = cookie.domain().to_string().to_ascii_lowercase();
           let domain_matches = match domain.strip_prefix('.') {
-            Some(domain) => host == domain
-              || host.strip_suffix(domain).is_some_and(|prefix| prefix.ends_with('.')),
+            Some(domain) => {
+              host == domain
+                || host
+                  .strip_suffix(domain)
+                  .is_some_and(|prefix| prefix.ends_with('.'))
+            }
             None => host == domain,
           };
           let cookie_path = cookie.path().to_string();
           let path_matches = path == cookie_path
-            || path.strip_prefix(&cookie_path).is_some_and(|suffix| {
-              cookie_path.ends_with('/') || suffix.starts_with('/')
-            });
+            || path
+              .strip_prefix(&cookie_path)
+              .is_some_and(|suffix| cookie_path.ends_with('/') || suffix.starts_with('/'));
           let expires_at_ms = cookie
             .expiresDate()
             .and_then(|date| unix_secs_f64_to_ms(date.timeIntervalSince1970()));
           let expired = expires_at_ms.is_some_and(|exp| exp <= now_ms)
-            || cookie.expiresDate().is_some_and(|date| date.timeIntervalSinceNow() <= 0.0);
+            || cookie
+              .expiresDate()
+              .is_some_and(|date| date.timeIntervalSinceNow() <= 0.0);
           if domain_matches && path_matches && !expired {
             let name = cookie.name().to_string();
             let value = cookie.value().to_string();
@@ -1298,7 +1328,11 @@ pub async fn read_macos_cookies_for_url(
           }
         }
         pairs.sort_by_key(|(path_len, _)| std::cmp::Reverse(*path_len));
-        let header = pairs.into_iter().map(|(_, pair)| pair).collect::<Vec<_>>().join("; ");
+        let header = pairs
+          .into_iter()
+          .map(|(_, pair)| pair)
+          .collect::<Vec<_>>()
+          .join("; ");
         let summary = summarize_cookie_expiry(&metas, now_ms);
         if let Some(sender) = sender.borrow_mut().take() {
           let _ = sender.send(Ok((header, summary)));
@@ -1307,7 +1341,9 @@ pub async fn read_macos_cookies_for_url(
       unsafe { store.httpCookieStore().getAllCookies(&callback) };
     })
     .map_err(|_| "读取账号 Cookie 失败".to_string())?;
-  receiver.await.map_err(|_| "读取账号 Cookie 中断".to_string())?
+  receiver
+    .await
+    .map_err(|_| "读取账号 Cookie 中断".to_string())?
 }
 
 #[cfg(target_os = "macos")]
@@ -1344,7 +1380,9 @@ pub async fn write_cookie_clipboard(app: &tauri::AppHandle, header: String) -> R
       let _ = sender.send(result.map_err(|_| "无法写入系统剪贴板，请重试".to_string()));
     })
     .map_err(|_| "无法写入系统剪贴板，请重试".to_string())?;
-  receiver.await.map_err(|_| "写入系统剪贴板中断".to_string())?
+  receiver
+    .await
+    .map_err(|_| "写入系统剪贴板中断".to_string())?
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1975,8 +2013,7 @@ pub async fn delete_desktop_profile(
       })
       .map_err(|e| format!("调度主线程清理 WKWebsiteDataStore 失败: {e}"))?;
 
-    rx
-      .await
+    rx.await
       .map_err(|_| "等待 WKWebsiteDataStore 清理完成中断".to_string())?
   }
 
@@ -2070,10 +2107,13 @@ pub struct ProxyTestResult {
 }
 
 #[cfg(desktop)]
-pub async fn test_account_proxy(target_url: &str, raw_proxy: &str) -> Result<ProxyTestResult, String> {
+pub async fn test_account_proxy(
+  target_url: &str,
+  raw_proxy: &str,
+) -> Result<ProxyTestResult, String> {
   let proxy_opt = parse_account_proxy(raw_proxy)?;
-  let parsed_target = url::Url::parse(target_url.trim())
-    .map_err(|_| "目标服务入口地址无效".to_string())?;
+  let parsed_target =
+    url::Url::parse(target_url.trim()).map_err(|_| "目标服务入口地址无效".to_string())?;
   let target_host = parsed_target
     .host_str()
     .filter(|h| !h.is_empty())
@@ -2088,8 +2128,8 @@ pub async fn test_account_proxy(target_url: &str, raw_proxy: &str) -> Result<Pro
     .redirect(reqwest::redirect::Policy::none());
 
   if let Some(ref proxy_url) = proxy_opt {
-    let proxy = reqwest::Proxy::all(proxy_url.as_str())
-      .map_err(|e| format!("构造代理客户端失败: {e}"))?;
+    let proxy =
+      reqwest::Proxy::all(proxy_url.as_str()).map_err(|e| format!("构造代理客户端失败: {e}"))?;
     builder = builder.proxy(proxy);
   }
 
@@ -2109,7 +2149,11 @@ pub async fn test_account_proxy(target_url: &str, raw_proxy: &str) -> Result<Pro
   match res {
     Ok(resp) => {
       let code = resp.status().as_u16();
-      let prefix = if used_proxy { "代理连通" } else { "系统网络连通" };
+      let prefix = if used_proxy {
+        "代理连通"
+      } else {
+        "系统网络连通"
+      };
       Ok(ProxyTestResult {
         ok: true,
         latency_ms,
@@ -2131,7 +2175,11 @@ pub async fn test_account_proxy(target_url: &str, raw_proxy: &str) -> Result<Pro
       } else {
         format!("请求失败: {err}")
       };
-      let prefix = if used_proxy { "代理不可用" } else { "连接失败" };
+      let prefix = if used_proxy {
+        "代理不可用"
+      } else {
+        "连接失败"
+      };
       Ok(ProxyTestResult {
         ok: false,
         latency_ms,
@@ -2146,7 +2194,10 @@ pub async fn test_account_proxy(target_url: &str, raw_proxy: &str) -> Result<Pro
 
 #[cfg(not(desktop))]
 #[allow(dead_code)]
-pub async fn test_account_proxy(_target_url: &str, _raw_proxy: &str) -> Result<ProxyTestResult, String> {
+pub async fn test_account_proxy(
+  _target_url: &str,
+  _raw_proxy: &str,
+) -> Result<ProxyTestResult, String> {
   Err("当前平台不支持代理测试".to_string())
 }
 
@@ -2166,14 +2217,21 @@ mod tests {
       return;
     }
 
-    let ipv4 = parse_account_proxy("  HTTP://127.0.0.1:7890/ ").unwrap().unwrap();
+    let ipv4 = parse_account_proxy("  HTTP://127.0.0.1:7890/ ")
+      .unwrap()
+      .unwrap();
     assert_eq!(format_account_proxy(&ipv4), "http://127.0.0.1:7890");
 
     let ipv6 = parse_account_proxy("http://[::1]:10808").unwrap().unwrap();
     assert_eq!(format_account_proxy(&ipv6), "http://[::1]:10808");
 
-    let domain = parse_account_proxy("http://proxy_1.example-host.local:80").unwrap().unwrap();
-    assert_eq!(format_account_proxy(&domain), "http://proxy_1.example-host.local:80");
+    let domain = parse_account_proxy("http://proxy_1.example-host.local:80")
+      .unwrap()
+      .unwrap();
+    assert_eq!(
+      format_account_proxy(&domain),
+      "http://proxy_1.example-host.local:80"
+    );
 
     for invalid in [
       "http://127.0.0.1",
@@ -2191,7 +2249,10 @@ mod tests {
       "http://127.0.0.1: 7890",
       "http://proxy!bad.local:7890",
     ] {
-      assert!(parse_account_proxy(invalid).is_err(), "expected error for {invalid}");
+      assert!(
+        parse_account_proxy(invalid).is_err(),
+        "expected error for {invalid}"
+      );
     }
   }
 
@@ -2218,7 +2279,9 @@ mod tests {
   #[cfg(windows)]
   #[test]
   fn windows_proxy_args_and_error_matching() {
-    let url80 = parse_account_proxy("http://proxy.local:80").unwrap().unwrap();
+    let url80 = parse_account_proxy("http://proxy.local:80")
+      .unwrap()
+      .unwrap();
     let args80 = windows_proxy_browser_args(&url80);
     assert!(args80.contains("--proxy-server=http://proxy.local:80"));
     assert!(args80.contains("--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection"));

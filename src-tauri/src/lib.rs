@@ -1,4 +1,5 @@
 mod group_transport;
+mod key_vault;
 mod platform;
 mod providers;
 mod session_manager;
@@ -9,12 +10,12 @@ mod updater;
 use platform::ProxyTestResult;
 use session_manager::{ManagerSnapshot, SessionManager, APP_TITLE};
 use site_adapters::SiteAdaptersSnapshot;
-use storage::{
-  AccountKey, ExternalAgentKind, GroupMemberRole, GroupSharedSkill, GroupWorkflowMode,
-};
 #[cfg(desktop)]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use storage::{
+  AccountKey, ExternalAgentKind, GroupMemberRole, GroupSharedSkill, GroupWorkflowMode,
+};
 use tauri::{AppHandle, Manager, State};
 use updater::{InstallUpdateOutcome, InstallUpdateRequest, UpdateCheckResult};
 
@@ -188,6 +189,20 @@ async fn dismiss_notice(mgr: State<'_, Arc<SessionManager>>) -> Result<ManagerSn
 }
 
 #[tauri::command]
+async fn continue_with_empty_config(
+  mgr: State<'_, Arc<SessionManager>>,
+) -> Result<ManagerSnapshot, String> {
+  mgr.continue_with_empty_config().await
+}
+
+#[tauri::command]
+async fn restore_config_from_backup(
+  mgr: State<'_, Arc<SessionManager>>,
+) -> Result<ManagerSnapshot, String> {
+  mgr.restore_config_from_backup().await
+}
+
+#[tauri::command]
 async fn trigger_quota_sync(
   app: AppHandle,
   mgr: State<'_, Arc<SessionManager>>,
@@ -237,7 +252,13 @@ async fn clear_account_data(
   mgr.clear_account_data(&app, &provider_id, &uuid).await
 }
 
+/// Tauri 命令的参数由前端扁平传入（invoke payload 的字段与参数一一对应），
+/// 无法像普通函数那样收成结构体而不改前端调用；8 个参数是三块加固
+/// （P0-0 禁用自动更新检查、P0-3 命令类审批开关）各加一个可选开关所致。
+/// 该 lint 由合并引入，此处显式 allow；基线既有的同类错误另由 clippy
+/// 清理 commit 统一处理。
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 async fn update_app_settings(
   app: AppHandle,
   mgr: State<'_, Arc<SessionManager>>,
@@ -245,12 +266,21 @@ async fn update_app_settings(
   minimize_to_tray: bool,
   global_shortcut: String,
   auto_approve: Option<bool>,
+  disable_auto_update_check: Option<bool>,
+  auto_approve_commands: Option<bool>,
 ) -> Result<ManagerSnapshot, String> {
   if webview.label() != "manager" {
     return Err("仅账号管理页可以修改应用设置".to_string());
   }
   mgr
-    .update_app_settings(&app, minimize_to_tray, &global_shortcut, auto_approve)
+    .update_app_settings(
+      &app,
+      minimize_to_tray,
+      &global_shortcut,
+      auto_approve,
+      disable_auto_update_check,
+      auto_approve_commands,
+    )
     .await
 }
 
@@ -377,7 +407,9 @@ async fn start_group_new_topic(
   if webview.label() != "manager" {
     return Err("仅账号管理页可以开启新话题".to_string());
   }
-  mgr.start_group_new_topic(group_id, keep_shared_context).await
+  mgr
+    .start_group_new_topic(group_id, keep_shared_context)
+    .await
 }
 
 #[tauri::command]
@@ -424,13 +456,48 @@ async fn upsert_external_agent(
   command: String,
   args: Vec<String>,
   workdir: Option<String>,
+  timeout_secs: Option<u64>,
+  idle_timeout_secs: Option<u64>,
 ) -> Result<ManagerSnapshot, String> {
   if webview.label() != "manager" {
     return Err("仅账号管理页可以管理 API / CLI 成员".to_string());
   }
   mgr
-    .upsert_external_agent(id, kind, name, base_url, api_key, model, command, args, workdir)
+    .upsert_external_agent(
+      id,
+      kind,
+      name,
+      base_url,
+      api_key,
+      model,
+      command,
+      args,
+      workdir,
+      timeout_secs,
+      idle_timeout_secs,
+    )
     .await
+}
+
+#[tauri::command]
+async fn cancel_external_member_turn(
+  mgr: State<'_, Arc<SessionManager>>,
+  webview: tauri::Webview,
+  group_id: String,
+  msg_id: String,
+) -> Result<bool, String> {
+  if webview.label() != "manager" {
+    return Err("仅账号管理页可以停止外部成员回复".to_string());
+  }
+  #[cfg(desktop)]
+  {
+    Ok(mgr.cancel_external_member_turn(group_id, msg_id).await)
+  }
+  #[cfg(not(desktop))]
+  {
+    let _ = (&mgr, group_id, msg_id);
+    Err("当前平台不支持停止外部成员回复".to_string())
+  }
 }
 
 #[tauri::command]
@@ -547,7 +614,8 @@ pub fn run() {
         use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
         use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 
-        let toggle_item = MenuItem::with_id(app, "tray_toggle", "显示 / 隐藏窗口", true, None::<&str>)?;
+        let toggle_item =
+          MenuItem::with_id(app, "tray_toggle", "显示 / 隐藏窗口", true, None::<&str>)?;
         let sep_item = PredefinedMenuItem::separator(app)?;
         let quit_item = MenuItem::with_id(app, "tray_quit", "退出叠号", true, None::<&str>)?;
         let tray_menu = Menu::with_items(app, &[&toggle_item, &sep_item, &quit_item])?;
@@ -586,14 +654,16 @@ pub fn run() {
           .min_inner_size(760.0, 520.0)
           .build()?;
 
-        let manager_builder =
-          tauri::webview::WebviewBuilder::new("manager", tauri::WebviewUrl::App("index.html".into()))
-            .disable_drag_drop_handler()
-            .on_navigation(|url| {
-              url.scheme() == "tauri"
-                || url.domain() == Some("tauri.localhost")
-                || (cfg!(dev) && url.host_str() == Some("localhost"))
-            });
+        let manager_builder = tauri::webview::WebviewBuilder::new(
+          "manager",
+          tauri::WebviewUrl::App("index.html".into()),
+        )
+        .disable_drag_drop_handler()
+        .on_navigation(|url| {
+          url.scheme() == "tauri"
+            || url.domain() == Some("tauri.localhost")
+            || (cfg!(dev) && url.host_str() == Some("localhost"))
+        });
 
         let _manager_wv = main_window.add_child(
           manager_builder,
@@ -671,6 +741,8 @@ pub fn run() {
       open_official_site,
       resolve_uuid_conflict,
       dismiss_notice,
+      continue_with_empty_config,
+      restore_config_from_backup,
       trigger_quota_sync,
       update_app_settings,
       select_group_chat,
@@ -686,6 +758,7 @@ pub fn run() {
       append_group_shared_context,
       upsert_external_agent,
       delete_external_agent,
+      cancel_external_member_turn,
       update_group_workflow,
       reset_group_thread_binding,
       get_site_adapters,
