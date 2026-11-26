@@ -233,7 +233,13 @@ pub fn merge_adapters(overrides: Vec<SiteAdapterConfig>) -> Vec<SiteAdapterConfi
   let mut result = builtin_site_adapters();
   for ov in overrides {
     if let Some(pos) = result.iter().position(|b| b.id == ov.id) {
-      result[pos] = ov;
+      let mut effective_ov = ov;
+      // 覆盖文件不得把内置适配的 hostPatterns 拓宽为通配符 "*"，否则
+      // 一条覆盖就能让内置适配匹配任意域名；此时保留内置的 hostPatterns。
+      if effective_ov.host_patterns.iter().any(|p| p == "*") {
+        effective_ov.host_patterns = result[pos].host_patterns.clone();
+      }
+      result[pos] = effective_ov;
     } else if let Some(generic_pos) = result.iter().position(|b| b.id == "generic") {
       result.insert(generic_pos, ov);
     } else {
@@ -353,6 +359,14 @@ pub const NET_HOOK_INIT_JS: &str = r#"(() => {
       esText: ''
     };
     window.__maamNet = state;
+
+    // 响应体只在主站（muse.ai / hark.com）的聊天 API 上读取。主框可能
+    // 加载 Apple ID / Facebook 等登录页，那些页面的 POST 响应体绝不能读。
+    // 非主站、非聊天接口只记录 URL / 方法 / 状态，不读响应体。
+    const initHost = (location.hostname || '').toLowerCase();
+    const isPrimaryHost = initHost === 'muse.ai' || initHost.endsWith('.muse.ai') || initHost === 'hark.com' || initHost === 'app.hark.com' || initHost.endsWith('.hark.com');
+    const CHAT_API_PATTERNS = ['/api/', '/events', '/chat', '/view', '/api/messages/send', '/api/messages/', '/api/chat', '/conversation', '/completion', '/generate', '/stream'];
+    const isChatApiUrl = (u) => { try { const p = new URL(u, location.href).pathname.toLowerCase(); return CHAT_API_PATTERNS.some((pat) => p.includes(pat)); } catch (_) { return false; } };
 
     const TELEMETRY_RE = /google-analytics|googletagmanager|\/_mp\/|\/cdn-cgi\/rum|\/otlp\/|\/pixel\/|\/billing\/summary|\/unread-count|\/consent\/status|\/client-ip|\.(?:js|css|png|jpg|jpeg|svg|woff2?|ico)(?:\?|$)/i;
     const pushEntry = (entry) => {
@@ -501,7 +515,7 @@ pub const NET_HOOK_INIT_JS: &str = r#"(() => {
               entry.elapsedMs = nowTs - startedAt;
               const ct = (resp.headers && resp.headers.get ? (resp.headers.get('content-type') || '') : '').toLowerCase();
               entry.contentType = ct;
-              if (entry.status >= 400 && resp.clone) {
+              if (isPrimaryHost && isChatApiUrl(url) && entry.status >= 400 && resp.clone) {
                 resp.clone().text().then((t) => {
                   entry.errorSnippet = (t || '').replace(/\s+/g, ' ').trim().slice(0, 240);
                   entry.done = true;
@@ -511,7 +525,7 @@ pub const NET_HOOK_INIT_JS: &str = r#"(() => {
               }
               const looksStream = ct.includes('event-stream') || ct.includes('ndjson') || ct.includes('stream');
               const looksChatPost = method === 'POST' && (ct.includes('json') || ct.includes('text') || looksStream);
-              if (resp.ok && resp.clone && method === 'POST' && (looksStream || looksChatPost)) {
+              if (isPrimaryHost && isChatApiUrl(url) && resp.ok && resp.clone && method === 'POST' && (looksStream || looksChatPost)) {
                 entry.isStream = looksStream;
                 void consumeStream(resp.clone(), entry);
               } else {
@@ -537,7 +551,7 @@ pub const NET_HOOK_INIT_JS: &str = r#"(() => {
       window.EventSource = new Proxy(OrigES, {
         construct(target, args, newTarget) {
           const es = Reflect.construct(target, args, newTarget);
-          try {
+          if (isPrimaryHost) try {
             const u = String(args && args[0] ? args[0] : '');
             if (!TELEMETRY_RE.test(u)) {
               es.addEventListener('message', (ev) => {
@@ -563,7 +577,7 @@ pub const NET_HOOK_INIT_JS: &str = r#"(() => {
       window.WebSocket = new Proxy(OrigWS, {
         construct(target, args, newTarget) {
           const ws = Reflect.construct(target, args, newTarget);
-          try {
+          if (isPrimaryHost) try {
             const u = String(args && args[0] ? args[0] : '');
             if (!TELEMETRY_RE.test(u)) {
               ws.addEventListener('message', (ev) => {
@@ -583,6 +597,12 @@ pub const NET_HOOK_INIT_JS: &str = r#"(() => {
         }
       });
     }
+    try {
+      const d = Object.getOwnPropertyDescriptor(window, '__maamNet');
+      if (!d || d.configurable) {
+        Object.defineProperty(window, '__maamNet', { value: state, writable: false, configurable: false });
+      }
+    } catch (_) {} // Sealing raises the bar only; Rust must not trust page-provided values.
   } catch (_) {}
 })()"#;
 
@@ -667,6 +687,33 @@ mod tests {
       "Muse · Meta"
     );
     assert!(!get_adapters_snapshot(&dir).has_overrides);
+    let _ = fs::remove_dir_all(&dir);
+  }
+
+  #[test]
+  fn overrides_cannot_widen_builtin_host_patterns_to_wildcard() {
+    let dir = temp_dir("widen-guard");
+    let custom_json = r##"
+      [
+        {
+          "id": "muse",
+          "name": "Widened Muse",
+          "hostPatterns": ["*"]
+        }
+      ]
+    "##;
+    let snap = validate_and_save_overrides(&dir, custom_json).expect("save overrides");
+    assert_eq!(resolve_adapter_for_host(&dir, "muse.ai").id, "muse");
+    assert_eq!(
+      resolve_adapter_for_host(&dir, "evil.example.com").id,
+      "generic"
+    );
+    let muse_adapter = snap
+      .adapters
+      .iter()
+      .find(|a| a.id == "muse")
+      .expect("muse exists");
+    assert!(!muse_adapter.host_patterns.iter().any(|p| p == "*"));
     let _ = fs::remove_dir_all(&dir);
   }
 }

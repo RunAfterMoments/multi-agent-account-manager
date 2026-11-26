@@ -70,6 +70,12 @@ pub(crate) const LOGIN_CAPTURE_INIT_JS: &str = r#"(() => {
       inflight: false
     };
     window.__maamAuthCheck = authCheck;
+    try {
+      const desc = Object.getOwnPropertyDescriptor(window, '__maamAuthCheck');
+      if (!desc || desc.configurable) {
+        Object.defineProperty(window, '__maamAuthCheck', { value: authCheck, writable: false, configurable: false });
+      }
+    } catch (_) {} // Sealing raises the bar only; Rust must re-verify identity/quota server-side.
     const markAuthInvalid = (reason) => {
       authCheck.status = 'invalid';
       authCheck.reason = String(reason || 'unauthorized');
@@ -548,7 +554,8 @@ pub(crate) const LOGIN_CAPTURE_INIT_JS: &str = r#"(() => {
             }
           }
         }
-        const aid = window.__maamSubActionId || '40e0249eeae158685b6a8d0c3b203f53dd4f2c7d63';
+        // When no action id was scanned from page scripts, do not call an unknown server action; rely on cached quota.
+        const aid = window.__maamSubActionId || '';
         if (callServerFn && aid) {
           const res = await callServerFn(aid, [{ includeAgreement: true }]);
           inspectNode(res, 0, true);

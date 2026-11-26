@@ -190,10 +190,23 @@ export function renderMiddleContent(
   const supportsCookieCopy = supportsProxy || isMobile;
   const canReorder = providerAccounts.length > 1 && state.conflicts.length === 0;
 
+  // P0-1：配置加载失败导致写盘被阻止时，给出两个可点的选择
+  //（之前只有文案，没有按钮）。继续使用空配置会丢弃损坏的配置
+  //（原文件已有 .corrupt-* 备份）；从备份恢复按 .bak、最新
+  // .corrupt-* 的顺序逐个尝试。
+  const persistActionsHtml = state.persistBlocked
+    ? `
+        <div class="notice-actions">
+          <button id="continue-empty-config-btn" class="notice-action-btn" type="button">继续使用空配置</button>
+          <button id="restore-config-backup-btn" class="notice-action-btn" type="button">从备份恢复</button>
+        </div>
+      `
+    : "";
   const noticeHtml = state.notice
     ? `
       <div class="notice-bar">
         <span>${escapeHtml(state.notice)}</span>
+        ${persistActionsHtml}
         <button id="dismiss-notice-btn" class="notice-close" type="button" title="关闭提示">✕</button>
       </div>
     `

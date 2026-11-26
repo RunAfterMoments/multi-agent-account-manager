@@ -219,6 +219,10 @@ pub struct SessionManager {
   #[cfg(desktop)]
   group_worker_semaphore: Arc<tokio::sync::Semaphore>,
   inner: Mutex<InnerState>,
+  /// P1-7 优化：SessionManager 持有唯一的 ApiKeyVault 实例。
+  /// 原先每次 upsert/delete 都新建实例，keyring 可用性探测
+  ///（一次 D-Bus 往返）每次都重做；复用后探测只做一次。
+  api_key_vault: crate::key_vault::ApiKeyVault,
   /// 防抖写盘：请求计数（每次 `request_persist` +1）与唤醒信号。
   persist_epoch: AtomicU64,
   persist_notify: Arc<tokio::sync::Notify>,
@@ -258,6 +262,7 @@ impl SessionManager {
       recent_downloads: std::sync::Mutex::new(HashMap::new()),
       #[cfg(desktop)]
       group_worker_semaphore: Arc::new(tokio::sync::Semaphore::new(GROUP_MAX_CONCURRENT_WORKERS)),
+      api_key_vault: crate::key_vault::ApiKeyVault::new(app_data_dir.clone()),
       inner: Mutex::new(InnerState {
         store_path,
         app_data_dir,
@@ -2298,7 +2303,10 @@ impl SessionManager {
 
   #[cfg(desktop)]
   fn record_recent_download(&self, download_id: u64, path: PathBuf) {
-    let mut recent = self.recent_downloads.lock().unwrap();
+    let mut recent = self
+      .recent_downloads
+      .lock()
+      .unwrap_or_else(|e| e.into_inner());
     recent.insert(download_id, path);
     while recent.len() > 32 {
       if let Some(&oldest_id) = recent.keys().min() {
@@ -2339,7 +2347,7 @@ impl SessionManager {
       }
       tauri::webview::DownloadEvent::Finished { url, path, success } => {
         let entry = {
-          let mut map = pending.lock().unwrap();
+          let mut map = pending.lock().unwrap_or_else(|e| e.into_inner());
           let popped = map.get_mut(url.as_str()).and_then(VecDeque::pop_front);
           if map.get(url.as_str()).is_some_and(VecDeque::is_empty) {
             map.remove(url.as_str());

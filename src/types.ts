@@ -197,6 +197,9 @@ export interface ManagerSnapshot {
   activeGroupId: string | null;
   externalAgents: ExternalAgentView[];
   accountErrors?: AccountPageError[];
+  /** 配置加载失败 / 版本过高时为 true：写盘已被阻止，需用户二选一。 */
+  persistBlocked?: boolean;
+  readOnly?: boolean;
 }
 
 export interface UpdateCheckResult {

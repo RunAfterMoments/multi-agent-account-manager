@@ -397,6 +397,11 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
     if let proxyRaw = spec.proxyUrl, !proxyRaw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
       if let proxyCfg = Self.buildHttpConnectProxyConfig(raw: proxyRaw) {
         dataStore.proxyConfigurations = [proxyCfg]
+      } else {
+        // 代理配置解析失败时显式清空，不静默沿用上一次的代理配置，
+        // 并向 Rust 侧报错，避免用户看到的只是「代理不可用」。
+        dataStore.proxyConfigurations = []
+        AccountSessionCoordinator.shared.emitSessionFailed(spec: spec, reason: "代理配置无效，已清除旧代理配置")
       }
     } else {
       dataStore.proxyConfigurations = []
@@ -405,7 +410,7 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
     let config = WKWebViewConfiguration()
     config.websiteDataStore = dataStore
     config.allowsInlineMediaPlayback = true
-    config.preferences.javaScriptCanOpenWindowsAutomatically = true
+    config.preferences.javaScriptCanOpenWindowsAutomatically = false
     config.defaultWebpagePreferences.allowsContentJavaScript = true
     config.userContentController.addUserScript(
       WKUserScript(source: Self.hookInitScript, injectionTime: .atDocumentStart, forMainFrameOnly: true)
@@ -499,14 +504,33 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
       return
     }
     let abs = url.absoluteString
-    if abs == "about:blank" || abs.hasPrefix("about:srcdoc") || abs.hasPrefix("blob:null/") || abs.hasPrefix("blob:https://") {
+    let isMainFrame = navigationAction.targetFrame?.isMainFrame ?? true
+    // blob: 导航只在主框无条件放行；子框的 blob: 走下面的 host 校验，
+    // blob:null/（无 host）一律拒绝。
+    if abs == "about:blank" || abs.hasPrefix("about:srcdoc") || (isMainFrame && (abs.hasPrefix("blob:null/") || abs.hasPrefix("blob:https://"))) {
       decisionHandler(.allow)
       return
     }
-    let isMainFrame = navigationAction.targetFrame?.isMainFrame ?? true
     if !isMainFrame {
       let scheme = url.scheme?.lowercased() ?? ""
-      decisionHandler((scheme == "https" || scheme == "http" || scheme == "about" || scheme == "blob" || scheme == "data") ? .allow : .cancel)
+      // 子框只允许 https 与带 host 的 blob:，且 host 必须在白名单内，
+      // 或是验证码 / widget 域名；http 与其他 scheme 一律拒绝。
+      // 与主框共享同一个 WKWebsiteDataStore，子框不能任意加载外站。
+      if (scheme == "https" || scheme == "blob"), let host = url.host?.lowercased() {
+        // hostMatchesAllowed 只认 https scheme，blob: 需按 host 手动比对白名单。
+        let hostAllowed: Bool
+        if scheme == "blob" {
+          hostAllowed = currentSpec.allowedHosts.contains("*") || currentSpec.allowedHosts.contains { allowed in
+            let clean = allowed.lowercased()
+            return host == clean || host.hasSuffix("." + clean)
+          }
+        } else {
+          hostAllowed = AccountSessionCoordinator.shared.hostMatchesAllowed(url, allowedHosts: currentSpec.allowedHosts)
+        }
+        decisionHandler((hostAllowed || isSubframeAllowedHost(host)) ? .allow : .cancel)
+        return
+      }
+      decisionHandler(.cancel)
       return
     }
     let scheme = url.scheme?.lowercased() ?? ""
@@ -554,6 +578,17 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
 
   func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
     handleLoadError(webView, error: error)
+  }
+
+  // 子框可加载的第三方 iframe：仅验证码 / widget 域名（精确 host 或其子域）。
+  private func isSubframeAllowedHost(_ host: String) -> Bool {
+    let allowedSuffixes = ["hcaptcha.com", "challenges.cloudflare.com", "www.gstatic.com", "www.google.com"]
+    for suffix in allowedSuffixes {
+      if host == suffix || host.hasSuffix("." + suffix) {
+        return true
+      }
+    }
+    return false
   }
 
   private func handleLoadError(_ webView: WKWebView, error: Error) {
@@ -687,12 +722,9 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
         if self.consecutiveLoggedOutCount >= 2 {
           AccountSessionCoordinator.shared.emitSessionLoggedOut(spec: spec)
           if stale && !self.staleResetDone {
+            // 不再用 GET 自动登出：探针误判会把已登录用户登出。
+            // 只上报已登出事件，由用户手动处理。
             self.staleResetDone = true
-            if spec.providerId == "muse", let logoutUrl = URL(string: "https://muse.ai/api/logout") {
-              self.mainWebView?.load(URLRequest(url: logoutUrl))
-            } else if spec.providerId == "hark", let loginUrl = URL(string: "https://app.hark.com/login") {
-              self.mainWebView?.load(URLRequest(url: loginUrl))
-            }
           }
         }
       }
@@ -702,14 +734,16 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
   @available(iOS 17.0, *)
   private static func buildHttpConnectProxyConfig(raw: String) -> ProxyConfiguration? {
     let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard let url = URL(string: trimmed),
+    // 含 userinfo（user:pass@host）时拒绝：凭据不能静默丢弃后继续用无认证代理。
+    // 端口必须显式给出且在 1...65535 内，不再默认 80。
+    guard !trimmed.contains("@"),
+          let url = URL(string: trimmed),
           url.scheme?.lowercased() == "http",
           let host = url.host,
-          !host.isEmpty else {
-      return nil
-    }
-    let portVal = UInt16(url.port ?? 80)
-    guard let nwPort = NWEndpoint.Port(rawValue: portVal) else {
+          !host.isEmpty,
+          let port = url.port,
+          port >= 1 && port <= 65535,
+          let nwPort = NWEndpoint.Port(rawValue: UInt16(port)) else {
       return nil
     }
     let endpoint = NWEndpoint.hostPort(host: NWEndpoint.Host(host), port: nwPort)

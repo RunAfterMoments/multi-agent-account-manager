@@ -801,7 +801,8 @@ class AccountWebActivity : AppCompatActivity() {
                             }
                           }
                         }
-                        const aid = window.__maamSubActionId || '40e0249eeae158685b6a8d0c3b203f53dd4f2c7d63';
+                        // 未从页面脚本里扫到 action id 时不调未知 server action，只用已缓存的额度。
+                        const aid = window.__maamSubActionId || '';
                         if (callServerFn && aid && typeof window.__maamMapSub === 'function') {
                           const res = await callServerFn(aid, [{ includeAgreement: true }]);
                           const mapped = window.__maamMapSub(res);
@@ -1827,7 +1828,8 @@ class AccountWebActivity : AppCompatActivity() {
         runCatching {
             val cm = WebViewCompat.getProfile(wv).cookieManager
             cm.setAcceptCookie(true)
-            cm.setAcceptThirdPartyCookies(wv, true)
+            // 第三方 Cookie 默认关闭：登录流程如需再按指定域名放开。
+            cm.setAcceptThirdPartyCookies(wv, false)
         }
         if (applyInitialSettings) {
             wv.settings.apply {
@@ -1839,7 +1841,8 @@ class AccountWebActivity : AppCompatActivity() {
                 allowFileAccess = false
                 allowContentAccess = false
                 mediaPlaybackRequiresUserGesture = false
-                mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
+                // 混合内容一律禁止：http 子资源不得以明文发出同域 Cookie。
+                mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
                 val cleanUa = sanitizeAndroidUserAgent(userAgentString)
                 if (cleanUa != userAgentString) {
                     userAgentString = cleanUa
@@ -1878,14 +1881,10 @@ class AccountWebActivity : AppCompatActivity() {
     }
 
     private fun handleWebPermissionRequest(request: PermissionRequest) {
-        val protectedOnly = request.resources
-            ?.filter { it == PermissionRequest.RESOURCE_PROTECTED_MEDIA_ID }
-            ?.toTypedArray()
-        if (!protectedOnly.isNullOrEmpty()) {
-            request.grant(protectedOnly)
-        } else {
-            request.deny()
-        }
+        // 受保护媒体 ID（RESOURCE_PROTECTED_MEDIA_ID）是可用于追踪的设备标识，
+        // 此前无用户确认即自动放行；这里没有确认 UI，改为一律拒绝，
+        // 而不是静默放行。
+        request.deny()
     }
 
     private fun decideMainFrameOverride(
@@ -2005,12 +2004,16 @@ class AccountWebActivity : AppCompatActivity() {
             var conn: HttpURLConnection? = null
             try {
                 val initialParsed = URL(rawUrl)
+                // 下载仅允许 HTTPS：http 初始地址与 https→http 降级一律拒绝。
+                if (!initialParsed.protocol.equals("https", ignoreCase = true)) {
+                    throw IllegalArgumentException("下载仅允许 HTTPS")
+                }
                 var currentUrl = initialParsed
                 var activeConn: HttpURLConnection? = null
                 for (hop in 0 until 10) {
                     val scheme = currentUrl.protocol.lowercase()
-                    if (scheme != "https" && scheme != "http") {
-                        throw IllegalArgumentException("不支持的下载地址协议")
+                    if (scheme != "https") {
+                        throw IllegalStateException("下载重定向到非 HTTPS 地址已被拒绝")
                     }
                     val c = (currentUrl.openConnection() as HttpURLConnection).apply {
                         connectTimeout = 20_000
@@ -2049,6 +2052,11 @@ class AccountWebActivity : AppCompatActivity() {
                 if (status !in 200..299) {
                     throw IllegalStateException("服务器返回错误状态（HTTP $status）")
                 }
+                // HTTP 下载也要有大小上限（与 blob 下载的 256MB 上限对齐思路，
+                // 这里取 512MB）；流式复制里另有逐块累计上限兜底。
+                if (conn.contentLengthLong > 512L * 1024L * 1024L) {
+                    throw IllegalStateException("下载文件超过 512MB 上限")
+                }
                 val contentDisp = conn.getHeaderField("Content-Disposition")
                 val serverMime = conn.contentType ?: declaredMime
                 val rawName = parseContentDispositionFilename(contentDisp)
@@ -2058,7 +2066,7 @@ class AccountWebActivity : AppCompatActivity() {
                 val finalMime = resolveMimeType(finalName, serverMime)
                 val saved = conn.inputStream.use { input ->
                     saveStreamToPublicDownloads(finalName, finalMime) { out ->
-                        copyStreamWithCheck(input, out, sessionGen)
+                        copyStreamWithCheck(input, out, sessionGen, 512L * 1024L * 1024L)
                     }
                 }
                 onDownloadCompleted(sessionGen, saved)
@@ -2320,14 +2328,24 @@ class AccountWebActivity : AppCompatActivity() {
         }
     }
 
-    private fun copyStreamWithCheck(input: InputStream, output: OutputStream, sessionGen: Long) {
+    private fun copyStreamWithCheck(
+        input: InputStream,
+        output: OutputStream,
+        sessionGen: Long,
+        maxBytes: Long = Long.MAX_VALUE,
+    ) {
         val buf = ByteArray(16 * 1024)
+        var totalWritten = 0L
         while (true) {
             if (Thread.currentThread().isInterrupted || sessionGen != activeSessionGeneration.get()) {
                 throw InterruptedException("会话已切换")
             }
             val n = input.read(buf)
             if (n <= 0) break
+            totalWritten += n
+            if (totalWritten > maxBytes) {
+                throw IllegalStateException("下载文件超过大小上限")
+            }
             output.write(buf, 0, n)
         }
         output.flush()

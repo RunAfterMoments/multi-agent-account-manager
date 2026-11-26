@@ -421,6 +421,27 @@ body,
   overflow-wrap: anywhere;
 }
 
+.notice-actions {
+  display: flex;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.notice-action-btn {
+  border: 1px solid var(--warn-border);
+  background: #fff;
+  color: var(--warn-text);
+  cursor: pointer;
+  font-size: 12px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  white-space: nowrap;
+}
+
+.notice-action-btn:hover {
+  background: var(--warn-bg);
+}
+
 .notice-close {
   border: none;
   background: transparent;

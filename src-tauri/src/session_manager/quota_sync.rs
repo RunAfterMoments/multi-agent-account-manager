@@ -497,7 +497,7 @@ impl SessionManager {
     let tx_inner = Arc::clone(&tx_cell);
     webview
       .eval_with_callback(IDENTITY_PROBE_JS, move |raw| {
-        if let Some(sender) = tx_inner.lock().unwrap().take() {
+        if let Some(sender) = tx_inner.lock().unwrap_or_else(|e| e.into_inner()).take() {
           let _ = sender.send(raw);
         }
       })

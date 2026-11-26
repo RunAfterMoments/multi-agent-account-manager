@@ -747,7 +747,7 @@ impl SessionManager {
       }
       if !record.api_key.is_empty() {
         if let Some(key_ref) = record.api_key_ref.clone() {
-          let vault = crate::key_vault::ApiKeyVault::new(locked.app_data_dir.clone());
+          let vault = &self.api_key_vault;
           vault
             .store_key(&key_ref, &record.api_key)
             .map_err(|e| format!("保存 API Key 到系统凭据库失败：{e}"))?;
@@ -796,7 +796,7 @@ impl SessionManager {
       // 与内存/磁盘的旧记录不一致，下次启动会用“编辑失败”的新 Key。
       if vault_written {
         if let Some(key_ref) = record_key_ref {
-          let vault = crate::key_vault::ApiKeyVault::new(locked.app_data_dir.clone());
+          let vault = &self.api_key_vault;
           match prev_api_key {
             Some(old) if !old.is_empty() => {
               let _ = vault.store_key(&key_ref, &old);
@@ -813,7 +813,7 @@ impl SessionManager {
     // P1-7 缺陷修复：kind 改为 local_cli 后旧 vault 条目成孤儿，保存成功后清理。
     if kind != ExternalAgentKind::OpenaiApi {
       if let Some(key_ref) = prev_key_ref {
-        crate::key_vault::ApiKeyVault::new(locked.app_data_dir.clone()).delete_key(&key_ref);
+        self.api_key_vault.delete_key(&key_ref);
       }
     }
 
@@ -849,7 +849,7 @@ impl SessionManager {
 
     // P1-7：保存成功后同步删除 vault 里的 Key，失败忽略，不阻塞删除。
     if let Some(key_ref) = removed_key_ref {
-      crate::key_vault::ApiKeyVault::new(locked.app_data_dir.clone()).delete_key(&key_ref);
+      self.api_key_vault.delete_key(&key_ref);
     }
 
     #[cfg(desktop)]
@@ -1953,7 +1953,7 @@ impl SessionManager {
     let tx_inner = Arc::clone(&tx_cell);
     webview
       .eval_with_callback(js, move |raw| {
-        if let Some(sender) = tx_inner.lock().unwrap().take() {
+        if let Some(sender) = tx_inner.lock().unwrap_or_else(|e| e.into_inner()).take() {
           let _ = sender.send(raw);
         }
       })
@@ -1981,6 +1981,13 @@ impl SessionManager {
   ) {
     use std::io::Write;
     let path = app_data_dir.join("auto-approve-audit.log");
+    // 按大小轮转：超过 1MB 时把旧日志移到 .1（只保留一份旧日志），
+    // 避免长期高频点击让审计日志无限增长。轮转失败也不影响主流程。
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() > 1_048_576) {
+      let rotated = app_data_dir.join("auto-approve-audit.log.1");
+      let _ = std::fs::remove_file(&rotated);
+      let _ = std::fs::rename(&path, &rotated);
+    }
     let Ok(mut file) = std::fs::OpenOptions::new()
       .create(true)
       .append(true)

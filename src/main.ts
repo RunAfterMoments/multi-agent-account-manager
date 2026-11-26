@@ -1267,6 +1267,13 @@ function bindEvents(state: ManagerSnapshot, provider: ProviderInfo): void {
     await callCommand("dismiss_notice");
   });
 
+  document.querySelector("#continue-empty-config-btn")?.addEventListener("click", async () => {
+    await callCommand("continue_with_empty_config");
+  });
+  document.querySelector("#restore-config-backup-btn")?.addEventListener("click", async () => {
+    await callCommand("restore_config_from_backup");
+  });
+
   const toastEl = document.querySelector("#download-toast");
   if (toastEl) {
     toastEl.addEventListener("mouseenter", () => {

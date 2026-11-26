@@ -999,7 +999,7 @@ pub async fn configure_windows_timezone(
       let core = match platform_wv.controller().CoreWebView2() {
         Ok(core) => core,
         Err(e) => {
-          if let Some(sender) = tx_slot.lock().unwrap().take() {
+          if let Some(sender) = tx_slot.lock().unwrap_or_else(|e| e.into_inner()).take() {
             let _ = sender.send(Err(format!("获取 CoreWebView2 失败: {e}")));
           }
           return;
@@ -1016,7 +1016,7 @@ pub async fn configure_windows_timezone(
           } else {
             Err(format!("设置 WebView2 时区失败: {err_code:?}"))
           };
-          if let Some(sender) = tx_cb.lock().unwrap().take() {
+          if let Some(sender) = tx_cb.lock().unwrap_or_else(|e| e.into_inner()).take() {
             let _ = sender.send(outcome);
           }
           Ok(())
@@ -1025,7 +1025,7 @@ pub async fn configure_windows_timezone(
       let method_ptr = PCWSTR(method_w.as_ptr());
       let params_ptr = PCWSTR(params_w.as_ptr());
       if let Err(e) = core.CallDevToolsProtocolMethod(method_ptr, params_ptr, &handler) {
-        if let Some(sender) = tx_slot.lock().unwrap().take() {
+        if let Some(sender) = tx_slot.lock().unwrap_or_else(|e| e.into_inner()).take() {
           let _ = sender.send(Err(format!("调用 WebView2 时区接口失败: {e}")));
         }
       }
@@ -1369,20 +1369,54 @@ pub async fn write_cookie_clipboard(app: &tauri::AppHandle, header: String) -> R
     return Err("该账号暂无可复制的 Cookie，请先登录".to_string());
   }
   let (sender, receiver) = tokio::sync::oneshot::channel();
+  let header_for_write = header.clone();
   app
     .run_on_main_thread(move || {
       let result = arboard::Clipboard::new().and_then(|mut clipboard| {
         let text = clipboard.set().exclude_from_history();
         #[cfg(windows)]
         let text = text.exclude_from_cloud().exclude_from_monitoring();
-        text.text(header)
+        text.text(header_for_write)
       });
       let _ = sender.send(result.map_err(|_| "无法写入系统剪贴板，请重试".to_string()));
     })
     .map_err(|_| "无法写入系统剪贴板，请重试".to_string())?;
   receiver
     .await
-    .map_err(|_| "写入系统剪贴板中断".to_string())?
+    .map_err(|_| "写入系统剪贴板中断".to_string())?;
+  // 剪贴板 60 秒后自动清理：Cookie 长时间留在剪贴板里会被其他应用读到。
+  // 只在剪贴板内容仍是本次写入的 Cookie 时才清空，用户中途复制了别的内容则不动。
+  // 写失败时不启动清理任务；清理本身尽力而为，任何错误都静默忽略。
+  let app_handle = app.clone();
+  tokio::spawn(async move {
+    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+    let (get_tx, get_rx) = tokio::sync::oneshot::channel();
+    if app_handle
+      .run_on_main_thread(move || {
+        let res = arboard::Clipboard::new().and_then(|mut cb| cb.get_text());
+        let _ = get_tx.send(res);
+      })
+      .is_err()
+    {
+      return;
+    }
+    if let Ok(Ok(current)) = get_rx.await {
+      if current == header {
+        let (clear_tx, clear_rx) = tokio::sync::oneshot::channel();
+        if app_handle
+          .run_on_main_thread(move || {
+            let res = arboard::Clipboard::new()
+              .and_then(|mut cb| cb.set().exclude_from_history().text(String::new()));
+            let _ = clear_tx.send(res);
+          })
+          .is_ok()
+        {
+          let _ = clear_rx.await;
+        }
+      }
+    }
+  });
+  Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1429,22 +1463,36 @@ fn push_validated_imported_cookie(
   {
     return;
   }
-  if raw_value.bytes().any(|b| matches!(b, b'\r' | b'\n' | 0)) {
+  // 值里出现 `;` 或 `,` 会被移动端当作 Set-Cookie 属性分隔符解析，
+  // 可注入 Domain/Path 等属性（审计已用临时测试验证），直接丢弃该条。
+  if raw_value
+    .bytes()
+    .any(|b| matches!(b, b'\r' | b'\n' | 0 | b';' | b','))
+  {
     return;
   }
   let value = raw_value.to_string();
 
   let default_clean = default_host.trim().to_ascii_lowercase();
+  // 父域 Cookie：Domain=hark.com 可用于 app.hark.com 的账号。
+  // 只有父域本身至少有两个标签（如 hark.com，com 不行）且入口/白名单
+  // host 确实是它的子域时才放行，仍拒绝无关域。
+  let is_parent_domain = |parent: &str, child: &str| -> bool {
+    parent.contains('.') && child.ends_with(&format!(".{parent}"))
+  };
+  let domain_matches = |cookie_domain: &str, host: &str| -> bool {
+    crate::providers::host_matches(cookie_domain, host) || is_parent_domain(cookie_domain, host)
+  };
   let mut domain = raw_domain
     .map(|d| d.trim().to_ascii_lowercase())
     .filter(|d| !d.is_empty())
     .unwrap_or_else(|| default_clean.clone());
   let check_host = domain.trim_start_matches('.');
   if check_host.is_empty()
-    || (!crate::providers::host_matches(check_host, &default_clean)
+    || (!domain_matches(check_host, &default_clean)
       && !allowed_hosts
         .iter()
-        .any(|allowed| crate::providers::host_matches(check_host, allowed)))
+        .any(|allowed| domain_matches(check_host, allowed)))
   {
     return;
   }
@@ -1463,6 +1511,12 @@ fn push_validated_imported_cookie(
     path = "/".to_string();
     secure = true;
   } else if name.starts_with("__Secure-") {
+    secure = true;
+  }
+
+  // SameSite=None 的 Cookie 不带 Secure 会被浏览器静默丢弃，
+  // 用户会以为导入成功。强制补 Secure。
+  if same_site.as_deref() == Some("none") {
     secure = true;
   }
 
@@ -1975,14 +2029,14 @@ pub async fn delete_desktop_profile(
 
         let ns_str = NSString::from_str(&uuid_formatted);
         let Some(ns_uuid) = NSUUID::initWithUUIDString(NSUUID::alloc(), &ns_str) else {
-          if let Some(sender) = tx_cell.lock().unwrap().take() {
+          if let Some(sender) = tx_cell.lock().unwrap_or_else(|e| e.into_inner()).take() {
             let _ = sender.send(Err("构造 NSUUID 失败".to_string()));
           }
           return;
         };
 
         let Some(mtm) = objc2::MainThreadMarker::new() else {
-          if let Some(sender) = tx_cell.lock().unwrap().take() {
+          if let Some(sender) = tx_cell.lock().unwrap_or_else(|e| e.into_inner()).take() {
             let _ = sender.send(Err("当前不在 macOS 主线程".to_string()));
           }
           return;
@@ -2002,7 +2056,7 @@ pub async fn delete_desktop_profile(
               Err(format!("移除 WKWebsiteDataStore 失败: {msg}"))
             }
           };
-          if let Some(sender) = tx_inner.lock().unwrap().take() {
+          if let Some(sender) = tx_inner.lock().unwrap_or_else(|e| e.into_inner()).take() {
             let _ = sender.send(outcome);
           }
         });
@@ -2474,6 +2528,63 @@ mod tests {
       assert_eq!(tauri_ck.name(), "__Host-sess");
       assert_eq!(tauri_ck.value(), "tok1");
     }
+  }
+
+  #[test]
+  fn parse_imported_cookies_rejects_semicolon_injection_and_forces_secure_for_samesite_none() {
+    let allowed = vec!["app.hark.com".to_string()];
+    let now = 1_700_000_000i64;
+
+    // 值含 `;` 可注入 Set-Cookie 属性，整条丢弃（全部被滤掉时返回 Err）。
+    assert!(parse_imported_cookies(
+      r#"[{"name":"a","value":"abc; Domain=evil.example","domain":"app.hark.com"}]"#,
+      "app.hark.com",
+      &allowed,
+      now
+    )
+    .is_err());
+    // 值含 `,` 同样丢弃。
+    assert!(parse_imported_cookies(
+      r#"[{"name":"a","value":"abc,xyz","domain":"app.hark.com"}]"#,
+      "app.hark.com",
+      &allowed,
+      now
+    )
+    .is_err());
+    // SameSite=None 且 secure=false 时强制补 Secure。
+    let none = parse_imported_cookies(
+      r#"[{"name":"a","value":"val","domain":"app.hark.com","secure":false,"sameSite":"none"}]"#,
+      "app.hark.com",
+      &allowed,
+      now,
+    )
+    .unwrap();
+    assert_eq!(none.len(), 1);
+    assert!(none[0].secure);
+    assert_eq!(none[0].same_site.as_deref(), Some("none"));
+    // 父域 Cookie：Domain=hark.com 可用于 app.hark.com 的账号。
+    assert!(parse_imported_cookies(
+      r#"[{"name":"a","value":"v","domain":"hark.com"}]"#,
+      "app.hark.com",
+      &allowed,
+      now
+    )
+    .is_ok());
+    // 公共后缀与无关域仍拒绝。
+    assert!(parse_imported_cookies(
+      r#"[{"name":"a","value":"v","domain":"com"}]"#,
+      "app.hark.com",
+      &allowed,
+      now
+    )
+    .is_err());
+    assert!(parse_imported_cookies(
+      r#"[{"name":"a","value":"v","domain":"evil.com"}]"#,
+      "app.hark.com",
+      &allowed,
+      now
+    )
+    .is_err());
   }
 
   #[test]

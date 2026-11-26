@@ -7,6 +7,8 @@ import android.content.ClipboardManager
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.os.PersistableBundle
 import android.provider.Settings
 import androidx.core.content.FileProvider
@@ -262,6 +264,16 @@ class AccountSessionPlugin(private val activity: Activity) : Plugin(activity) {
                 }
                 clipboard.setPrimaryClip(clip)
                 invoke.resolve(JSObject())
+                // 60 秒后自动清理剪贴板：只在内容仍是本次复制的 Cookie 时才清。
+                Handler(Looper.getMainLooper()).postDelayed({
+                    try {
+                        val currentText = clipboard.primaryClip?.getItemAt(0)?.text?.toString()
+                        if (currentText == cookies) {
+                            clipboard.setPrimaryClip(ClipData.newPlainText("", ""))
+                        }
+                    } catch (_: Exception) {
+                    }
+                }, 60_000)
             } catch (error: Exception) {
                 invoke.reject("复制 Cookie 失败，请稍后重试")
             }
@@ -376,11 +388,22 @@ class AccountSessionPlugin(private val activity: Activity) : Plugin(activity) {
             val partFile = File(updatesDir, "$safeName.part")
             val expectedSha = args.sha256?.trim()?.lowercase()?.takeIf { it.isNotEmpty() }
 
+            // SHA-256 必填（P0）：缺失或格式非法时拒绝安装并删除已下载文件，
+            // 不复用旧文件、不调起安装器。Rust 侧已在调用前强制要求，这里是
+            // 纵深防御——绕开 Rust 命令直接调插件时也不能跳过校验。
+            if (expectedSha == null || !Regex("^[a-f0-9]{64}$").matches(expectedSha)) {
+                if (targetFile.exists()) targetFile.delete()
+                if (partFile.exists()) partFile.delete()
+                val errMsg = if (expectedSha == null) "缺少更新包 SHA-256，拒绝安装" else "SHA-256 格式无效，拒绝安装"
+                AccountSessionCoordinator.emitUpdateProgress("error", 0L, null, null, errMsg)
+                invoke.reject(errMsg)
+                return@thread
+            }
+
             try {
-                val canReuse = targetFile.exists() && targetFile.length() > 0L && (
-                    (expectedSha != null && computeSha256Hex(targetFile) == expectedSha) ||
-                        (expectedSha == null && lastDownloadedUrl == args.url && lastDownloadedPath == targetFile.absolutePath)
-                )
+                // 复用分支一律重算摘要，不再凭 URL 信任旧文件。
+                val canReuse = targetFile.exists() && targetFile.length() > 0L &&
+                    computeSha256Hex(targetFile) == expectedSha
 
                 if (!canReuse) {
                     AccountSessionCoordinator.emitUpdateProgress(
@@ -439,7 +462,7 @@ class AccountSessionPlugin(private val activity: Activity) : Plugin(activity) {
                         message = "正在校验安装包完整性...",
                     )
                     val actualSha = digest.digest().joinToString("") { "%02x".format(it) }
-                    if (expectedSha != null && actualSha != expectedSha) {
+                    if (actualSha != expectedSha) {
                         partFile.delete()
                         throw IllegalStateException("安装包 SHA-256 校验失败，请重试")
                     }
@@ -544,6 +567,17 @@ class AccountSessionPlugin(private val activity: Activity) : Plugin(activity) {
         if (!currentUrl.protocol.equals("https", ignoreCase = true)) {
             throw IllegalArgumentException("仅允许 HTTPS 更新地址")
         }
+        // 重定向白名单（与 Rust updater.rs 的 is_allowed_redirect_target 一致）：
+        // 初始地址与每一跳都必须是这四个精确主机，不含子域名。
+        val allowedHosts = setOf(
+            "github.com",
+            "api.github.com",
+            "objects.githubusercontent.com",
+            "release-assets.githubusercontent.com"
+        )
+        if (!allowedHosts.contains(currentUrl.host.lowercase())) {
+            throw IllegalStateException("重定向目标主机不在白名单内")
+        }
         for (hop in 0 until 10) {
             val conn = (currentUrl.openConnection() as HttpURLConnection).apply {
                 connectTimeout = 15_000
@@ -571,6 +605,9 @@ class AccountSessionPlugin(private val activity: Activity) : Plugin(activity) {
                 val nextUrl = URL(currentUrl, location)
                 if (!nextUrl.protocol.equals("https", ignoreCase = true)) {
                     throw IllegalStateException("重定向到非 HTTPS 地址已被拒绝")
+                }
+                if (!allowedHosts.contains(nextUrl.host.lowercase())) {
+                    throw IllegalStateException("重定向目标主机不在白名单内")
                 }
                 currentUrl = nextUrl
                 continue
