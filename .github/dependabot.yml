@@ -1,0 +1,20 @@
+# Dependabot：定期为 cargo / npm / GitHub Actions 提更新 PR。
+# CI 与 release 工作流里的 action 均已固定到 commit SHA，
+# Dependabot 会在上游发布新版时更新这些 SHA（需在仓库设置里允许它修改工作流文件）。
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /src-tauri
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
