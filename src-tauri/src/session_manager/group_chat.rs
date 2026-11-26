@@ -23,7 +23,10 @@ use crate::group_transport;
 use crate::group_transport::ResolvedMemberTransport;
 #[cfg(target_os = "macos")]
 use crate::platform;
-use crate::providers::{classify_top_level_url, resolve_provider, NavigationDecision, ProviderId};
+use crate::providers::{
+  classify_top_level_url, is_verified_callback_origin, resolve_provider, NavigationDecision,
+  ProviderId,
+};
 #[cfg(desktop)]
 use crate::site_adapters::SiteAdapterConfig;
 use crate::site_adapters::{self, SiteAdaptersSnapshot};
@@ -2282,11 +2285,11 @@ impl SessionManager {
 
     if let Some(bound_str) = bound_url {
       if let Ok(target_url) = Url::parse(&bound_str) {
-        if matches!(
-          classify_top_level_url(&spec, &target_url, false),
-          NavigationDecision::AllowHttps
-        ) && Self::normalize_url_for_thread(&target_url)
-          != Self::normalize_url_for_thread(&cur_url)
+        // 绑定的 thread_url 只允许跳回本站（callback_origins）：之前用
+        // classify_top_level_url 的 AllowHttps 会放行任意 allowed_host
+        //（CDN、facebook.com 等），会话页会带着账号 Cookie 跳过去。
+        if is_verified_callback_origin(&spec, &target_url)
+          && Self::normalize_url_for_thread(&target_url) != Self::normalize_url_for_thread(&cur_url)
         {
           if wv.navigate(target_url).is_ok() {
             Self::wait_webview_settled(wv, 24).await;
@@ -2322,10 +2325,10 @@ impl SessionManager {
       .as_deref()
       .and_then(|s| Url::parse(s).ok())
     {
-      if matches!(
-        classify_top_level_url(&spec, &new_url, false),
-        NavigationDecision::AllowHttps
-      ) && Self::normalize_url_for_thread(&new_url) != Self::normalize_url_for_thread(&cur_url)
+      // new_chat_url 同样只允许本站：适配器覆盖（用户可编辑的 JSON）
+      // 里写一个 CDN/外站地址就能让会话页带着 Cookie 跳过去。
+      if is_verified_callback_origin(&spec, &new_url)
+        && Self::normalize_url_for_thread(&new_url) != Self::normalize_url_for_thread(&cur_url)
       {
         if wv.navigate(new_url).is_ok() {
           Self::wait_webview_settled(wv, 20).await;

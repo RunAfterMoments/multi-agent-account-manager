@@ -1490,9 +1490,8 @@ pub(crate) const IDENTITY_PROBE_JS: &str = r#"(() => {
 #[cfg(desktop)]
 pub(crate) fn build_new_chat_click_js(adapter: &SiteAdapterConfig) -> String {
   let adapter_json = serde_json::to_string(adapter).unwrap_or_else(|_| "{}".to_string());
-  r#"(() => {
+  r#"((adapter) => {
   try {
-    const adapter = __ADAPTER__;
     const sels = Array.isArray(adapter.newChatSelectors) ? adapter.newChatSelectors : [];
     for (const sel of sels) {
       if (!sel) continue;
@@ -1510,8 +1509,9 @@ pub(crate) fn build_new_chat_click_js(adapter: &SiteAdapterConfig) -> String {
   } catch (err) {
     return JSON.stringify({ clicked: false, error: String(err) });
   }
-})()"#
-    .replace("__ADAPTER__", &adapter_json)
+})"#
+    .to_string()
+    + &format!("({adapter_json})")
 }
 
 #[cfg(desktop)]
@@ -1526,12 +1526,8 @@ pub(crate) fn build_group_attach_file_js(
     .unwrap_or_else(|_| "\"text/markdown\"".to_string());
   let content_json =
     serde_json::to_string(&attachment.content).unwrap_or_else(|_| "\"\"".to_string());
-  r#"(() => {
+  r#"((adapter, fileName, mimeType, content) => {
   try {
-    const adapter = __ADAPTER__;
-    const fileName = __FILENAME__;
-    const mimeType = __MIME__;
-    const content = __CONTENT__;
 
     const isVisibleEl = (el, minW = 16, minH = 12) => {
       if (!el || !el.isConnected) return false;
@@ -1626,21 +1622,17 @@ pub(crate) fn build_group_attach_file_js(
   } catch (err) {
     return JSON.stringify({ dispatched: false, error: String(err) });
   }
-})()"#
-    .replace("__ADAPTER__", &adapter_json)
-    .replace("__FILENAME__", &name_json)
-    .replace("__MIME__", &mime_json)
-    .replace("__CONTENT__", &content_json)
+})"#
+    .to_string()
+    + &format!("({adapter_json}, {name_json}, {mime_json}, {content_json})")
 }
 
 #[cfg(desktop)]
 pub(crate) fn build_group_check_attached_js(adapter: &SiteAdapterConfig, filename: &str) -> String {
   let adapter_json = serde_json::to_string(adapter).unwrap_or_else(|_| "{}".to_string());
   let name_json = serde_json::to_string(filename).unwrap_or_else(|_| "\"\"".to_string());
-  r#"(() => {
+  r#"((adapter, fileName) => {
   try {
-    const adapter = __ADAPTER__;
-    const fileName = __FILENAME__;
     const isVisibleEl = (el) => {
       if (!el || !el.isConnected) return false;
       const r = el.getBoundingClientRect();
@@ -1673,17 +1665,17 @@ pub(crate) fn build_group_check_attached_js(adapter: &SiteAdapterConfig, filenam
   } catch (err) {
     return JSON.stringify({ ready: false, error: String(err) });
   }
-})()"#
-    .replace("__ADAPTER__", &adapter_json)
-    .replace("__FILENAME__", &name_json)
+})"#
+    .to_string()
+    + &format!("({adapter_json}, {name_json})")
 }
 
 #[cfg(desktop)]
 pub(crate) fn build_hark_click_preview_card_js(preview_text: &str) -> String {
   let prev_json = serde_json::to_string(preview_text).unwrap_or_else(|_| "\"\"".to_string());
-  r#"(() => {
+  r#"((previewTextArg) => {
   try {
-    const previewText = (__PREVIEW__ || '').trim();
+    const previewText = (previewTextArg || '').trim();
     if (!previewText) return JSON.stringify({ clicked: false });
     const winH = window.innerHeight || document.documentElement.clientHeight || 800;
     const isVisibleEl = (el, minW = 140, minH = 56) => {
@@ -1765,16 +1757,17 @@ pub(crate) fn build_hark_click_preview_card_js(preview_text: &str) -> String {
   } catch (err) {
     return JSON.stringify({ clicked: false, error: String(err) });
   }
-})()"#
-    .replace("__PREVIEW__", &prev_json)
+})"#
+    .to_string()
+    + &format!("({prev_json})")
 }
 
 #[cfg(desktop)]
 pub(crate) fn build_hark_read_expanded_js(card_preview: &str) -> String {
   let card_json = serde_json::to_string(card_preview).unwrap_or_else(|_| "\"\"".to_string());
-  r#"(() => {
+  r#"((cardPreviewArg) => {
   try {
-    const cardPreview = (__CARD_PREVIEW__ || '').trim();
+    const cardPreview = (cardPreviewArg || '').trim();
     const anchor = cardPreview.split(/\r?\n/).map((l) => l.trim()).find((l) => l.length >= 2) || '';
     const winW = window.innerWidth || document.documentElement.clientWidth || 1000;
     const winH = window.innerHeight || document.documentElement.clientHeight || 800;
@@ -1854,8 +1847,9 @@ pub(crate) fn build_hark_read_expanded_js(card_preview: &str) -> String {
   } catch (err) {
     return JSON.stringify({ text: '', error: String(err) });
   }
-})()"#
-    .replace("__CARD_PREVIEW__", &card_json)
+})"#
+    .to_string()
+    + &format!("({card_json})")
 }
 
 #[cfg(desktop)]
@@ -1892,11 +1886,8 @@ pub(crate) fn build_group_send_js(
   let adapter_json = serde_json::to_string(adapter).unwrap_or_else(|_| "{}".to_string());
   let job_json = serde_json::to_string(job_id).unwrap_or_else(|_| "\"\"".to_string());
   let prompt_json = serde_json::to_string(prompt_text).unwrap_or_else(|_| "\"\"".to_string());
-  r#"(() => {
+  r#"((adapter, jobId, promptText) => {
   try {
-    const adapter = __ADAPTER__;
-    const jobId = __JOB_ID__;
-    const promptText = __PROMPT__;
     const host = (location.hostname || '').toLowerCase();
     const path = (location.pathname || '').toLowerCase();
     const isVisibleEl = (el, minW = 16, minH = 12) => {
@@ -2411,20 +2402,17 @@ pub(crate) fn build_group_send_js(
   } catch (err) {
     return JSON.stringify({ ok: false, status: 'error', error: String(err) });
   }
-})()"#
-    .replace("__ADAPTER__", &adapter_json)
-    .replace("__JOB_ID__", &job_json)
-    .replace("__PROMPT__", &prompt_json)
+})"#
+    .to_string()
+    + &format!("({adapter_json}, {job_json}, {prompt_json})")
 }
 
 #[cfg(desktop)]
 pub(crate) fn build_group_poll_js(adapter: &SiteAdapterConfig, job_id: &str) -> String {
   let adapter_json = serde_json::to_string(adapter).unwrap_or_else(|_| "{}".to_string());
   let job_json = serde_json::to_string(job_id).unwrap_or_else(|_| "\"\"".to_string());
-  r#"(() => {
+  r#"((adapter, jobId) => {
   try {
-    const adapter = __ADAPTER__;
-    const jobId = __JOB_ID__;
     const job = window.__maamGroupJobs && window.__maamGroupJobs[jobId];
     if (!job) {
       return JSON.stringify({ state: 'error', text: '', error: '页面已刷新或任务上下文已丢失' });
@@ -3155,9 +3143,9 @@ pub(crate) fn build_group_poll_js(adapter: &SiteAdapterConfig, job_id: &str) -> 
   } catch (err) {
     return JSON.stringify({ state: 'error', text: '', error: String(err) });
   }
-})()"#
-    .replace("__ADAPTER__", &adapter_json)
-    .replace("__JOB_ID__", &job_json)
+})"#
+    .to_string()
+    + &format!("({adapter_json}, {job_json})")
 }
 
 #[cfg(desktop)]
@@ -3167,10 +3155,8 @@ pub(crate) fn build_group_sync_latest_js(
 ) -> String {
   let adapter_json = serde_json::to_string(adapter).unwrap_or_else(|_| "{}".to_string());
   let query_json = serde_json::to_string(raw_user_content).unwrap_or_else(|_| "\"\"".to_string());
-  r#"(() => {
+  r#"((adapter, rawUserContent) => {
   try {
-    const adapter = __ADAPTER__;
-    const rawUserContent = __QUERY__;
     const endMarker = '（请直接回答「当前问题」，不要复述上方方括号标题）';
 
     const isVisibleEl = (el, minW = 16, minH = 12) => {
@@ -3558,7 +3544,83 @@ pub(crate) fn build_group_sync_latest_js(
   } catch (err) {
     return JSON.stringify({ ok: false, text: '', error: String(err) });
   }
-})()"#
-    .replace("__ADAPTER__", &adapter_json)
-    .replace("__QUERY__", &query_json)
+})"#
+    .to_string()
+    + &format!("({adapter_json}, {query_json})")
+}
+
+#[cfg(all(test, desktop))]
+mod tests {
+  use super::*;
+
+  fn test_adapter() -> SiteAdapterConfig {
+    serde_json::from_value(serde_json::json!({
+      "id": "muse",
+      "name": "Muse",
+      "newChatSelectors": ["button"],
+      "composerSelectors": ["textarea"]
+    }))
+    .unwrap()
+  }
+
+  fn json_str(value: &str) -> String {
+    serde_json::to_string(value).unwrap()
+  }
+
+  /// 占位符碰撞回归：旧实现用链式 .replace()，值里的占位符会被后一次
+  /// replace 展开成 JS（文件名含 `__CONTENT__` + 内容含引号/分号即可
+  /// 逃出字符串）。新实现把值当 IIFE 实参传，输出里必须原样包含
+  /// 每个值的 JSON 编码，且模板里不再出现任何 `__X__` 占位符。
+  #[test]
+  fn attach_file_values_with_placeholder_tokens_stay_verbatim() {
+    let attachment = GroupAttachment {
+      filename: "a__CONTENT__b\"; evil();//".to_string(),
+      mime_type: "text/plain__FILENAME__".to_string(),
+      content: "x\"; alert(1);//__MIME__\n__ADAPTER__".to_string(),
+    };
+    let js = build_group_attach_file_js(&test_adapter(), &attachment);
+    assert!(js.starts_with("((adapter, fileName, mimeType, content) => {"));
+    assert!(js.contains(&json_str("a__CONTENT__b\"; evil();//")));
+    assert!(js.contains(&json_str("text/plain__FILENAME__")));
+    assert!(js.contains(&json_str("x\"; alert(1);//__MIME__\n__ADAPTER__")));
+    // 值以 JSON 实参形式原样出现（而不是被某次 .replace() 展开），
+    // 且调用点 `})({...args...})` 存在。
+    assert!(js.contains("})({"));
+  }
+
+  #[test]
+  fn group_send_job_and_prompt_with_placeholder_tokens_stay_verbatim() {
+    let js = build_group_send_js(
+      &test_adapter(),
+      "job__PROMPT__1",
+      "hi __JOB_ID__\"; evil();//",
+    );
+    assert!(js.starts_with("((adapter, jobId, promptText) => {"));
+    assert!(js.contains(&json_str("job__PROMPT__1")));
+    assert!(js.contains(&json_str("hi __JOB_ID__\"; evil();//")));
+    assert!(js.contains("})({"));
+  }
+
+  #[test]
+  fn new_chat_click_adapter_with_placeholder_selector_stays_verbatim() {
+    let mut adapter = test_adapter();
+    adapter.new_chat_selectors = vec!["button__FILENAME__".to_string()];
+    let js = build_new_chat_click_js(&adapter);
+    assert!(js.starts_with("((adapter) => {"));
+    assert!(js.contains(&json_str("button__FILENAME__")));
+    assert!(js.contains("})({"));
+  }
+
+  #[test]
+  fn preview_and_query_values_with_placeholder_tokens_stay_verbatim() {
+    let preview = build_hark_click_preview_card_js("hello \"__PREVIEW__\" ; evil();//");
+    assert!(preview.starts_with("((previewTextArg) => {"));
+    assert!(preview.contains(&json_str("hello \"__PREVIEW__\" ; evil();//")));
+    assert!(preview.contains("})("));
+
+    let sync = build_group_sync_latest_js(&test_adapter(), "user text __ADAPTER__ \"; evil();//");
+    assert!(sync.starts_with("((adapter, rawUserContent) => {"));
+    assert!(sync.contains(&json_str("user text __ADAPTER__ \"; evil();//")));
+    assert!(sync.contains("})({"));
+  }
 }

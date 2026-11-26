@@ -650,7 +650,7 @@ export function renderModal(
       eModal.formKind === "openai_api"
         ? `
           <input id="ext-agent-url-input" class="modal-input" maxlength="260" placeholder="Base URL（例如 https://api.deepseek.com/v1 或 http://127.0.0.1:11434/v1）" value="${escapeHtml(eModal.baseUrlDraft)}" ${saving ? "disabled" : ""} />
-          <input id="ext-agent-key-input" class="modal-input" maxlength="512" type="password" placeholder="API Key（编辑时留空表示不修改；本机 Ollama 可留空）" value="${escapeHtml(eModal.apiKeyDraft)}" ${saving ? "disabled" : ""} />
+          <input id="ext-agent-key-input" class="modal-input" maxlength="512" type="password" placeholder="API Key（编辑时留空表示不修改；本机 Ollama 可留空）" ${saving ? "disabled" : ""} />
           <input id="ext-agent-model-input" class="modal-input" maxlength="120" placeholder="模型名称（例如 gpt-4o / deepseek-chat / qwen2.5:14b）" value="${escapeHtml(eModal.modelDraft)}" ${saving ? "disabled" : ""} />
         `
         : `

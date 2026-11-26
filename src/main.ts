@@ -2021,6 +2021,9 @@ function bindEvents(state: ManagerSnapshot, provider: ProviderInfo): void {
       const nextKind = btn.dataset.extKind as ExternalAgentKind | undefined;
       if (nextKind && modal.formKind !== nextKind) {
         modal.formKind = nextKind;
+        // 切类型必须清空 Key 草稿：否则给 A 成员输的 Key 会跟着
+        // 保存进 B 成员（另一种 kind）里。
+        modal.apiKeyDraft = "";
         modal.error = undefined;
         render();
       }
@@ -2036,6 +2039,9 @@ function bindEvents(state: ManagerSnapshot, provider: ProviderInfo): void {
       modal.formKind = preset.kind;
       modal.nameDraft = preset.name;
       modal.baseUrlDraft = preset.baseUrl ?? "";
+      // 预设不带 Key：切预设必须清空 Key 草稿，否则之前给别的
+      // 成员输的 Key 会跟着保存进这个预设成员里。
+      modal.apiKeyDraft = "";
       modal.modelDraft = preset.model ?? "";
       modal.commandDraft = preset.command ?? "";
       modal.argsDraft = preset.args ?? "";

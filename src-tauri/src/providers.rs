@@ -184,7 +184,8 @@ const EMBEDDED_WIDGET_HOSTS: &[&str] = &[
   "friendlycaptcha.com",
   "geetest.com",
   "captcha-delivery.com",
-  "firebaseapp.com",
+  // 注意：firebaseapp.com 是 Firebase Hosting 公共后缀，任何人都能在上面
+  // 托管任意内容，不能当作可信的内嵌 widget 域名（之前会放行整个后缀）。
   "stripe.com",
   "stripecdn.com",
 ];
@@ -406,6 +407,19 @@ mod tests {
       &spec,
       &Url::parse("https://evil.com/").unwrap()
     ));
+    // 在 allowed_hosts 里但不在 callback_origins 里的主机：classify 会
+    // 放行（AllowHttps），但 thread_url / new_chat_url 跳转只认本站，
+    // 这些一律拒绝，否则会话页会带着账号 Cookie 跳过去。
+    for host in [
+      "https://metaaiusercontent.com/file",
+      "https://facebook.com/login",
+      "https://appleid.apple.com/auth",
+    ] {
+      assert!(
+        !is_verified_callback_origin(&spec, &Url::parse(host).unwrap()),
+        "{host} must not be a verified callback origin"
+      );
+    }
     // 非默认端口不是同一个 origin。
     assert!(!is_verified_callback_origin(
       &spec,

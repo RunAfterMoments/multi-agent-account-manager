@@ -212,6 +212,60 @@ v3 压缩包经复审（综合 6.0/10，NO-GO）抓出 7 个问题，已逐项�
 15/15 通过。Rust `cargo test` 与 Kotlin/Swift 编译仍未跑通
 （原因同第二节：本机缺系统依赖与移动端工具链），需走 CI 或有依赖的机器。
 
+## 七、P0 攻坚 PR-A + PR-B（v5，2026-11-26 晚）
+
+### PR-A — scripts.rs 注入（MAAM-H-02）
+
+`src-tauri/src/session_manager/scripts.rs` 里 8 个 `build_*_js`
+原来用链式 `.replace("__X__", &json)` 把 JSON 文本替换进 JS 模板：
+先替换的值里若含有后一个占位符（如文件名含 `__CONTENT__`、
+内容含引号/分号），会被后一次 replace 展开成可执行的 JS，
+实测可逃出字符串（文件名 `a__CONTENT__b"; evil();//` 即可）。
+全部改为 IIFE 实参传入：模板写成 `((adapter, fileName, ...) => {...})(json, ...)`，
+值只以 JSON 编码出现在调用参数里，不再经过任何文本替换。
+涉及的 8 个 builder：`build_new_chat_click_js`、`build_group_attach_file_js`、
+`build_group_check_attached_js`、`build_hark_click_preview_card_js`、
+`build_hark_read_expanded_js`、`build_group_send_js`、`build_group_poll_js`、
+`build_group_sync_latest_js`（复审说 5 处，实际清点是 8 处）。
+`scripts.rs` 里已无任何 `__X__` 占位符。
+
+新增 4 个 Rust 单测（`scripts.rs` 末尾）：文件名/内容/提示词/
+适配器选择器里带占位符与注入载荷时，输出必须原样包含各值的
+JSON 编码。验证方式：`rustfmt --check` 通过；另写 node 验证脚本
+（`gemini/verify-pr-a.py`）把 8 个模板抽出来，喂对抗性参数
+（含占位符、引号、分号、`//`）在 DOM stub 下实跑，8/8 通过，
+返回的都是正常 JSON，注入的 `alert()` 一次也没执行。
+说明：这次是机械重写，我直接做的，没走 Gemini 出 diff
+（它前两轮在精确代码上已出过 3 次事实错误），改用实跑验证兜底。
+
+### PR-B — API Key 跨成员泄露 + 白名单（MAAM-H-06 前端 + MAAM-H-08）
+
+- `src/main.ts`：切成员类型（`[data-ext-kind]`）与切预设
+  （`[data-ext-preset-idx]`）时清空 `apiKeyDraft`。之前给 A 成员
+  输的 Key 会留在草稿里，跟着保存进 B 成员。
+- `src/modals.ts:653`：Key 输入框去掉 HTML `value="..."`。
+  编辑打开时草稿本来就是空的（留空表示不修改），输入过程由
+  `input` 事件同步草稿、不经过重新渲染，去掉后不影响输入；
+  代价是保存失败重渲染后要重输 Key（可接受）。
+- `src-tauri/src/providers.rs`：`EMBEDDED_WIDGET_HOSTS` 去掉
+  `"firebaseapp.com"`（Firebase Hosting 公共后缀，任何人可托管
+  任意内容，不能当可信 widget 域名）。代码与文档里无任何合法依赖。
+- `src-tauri/src/session_manager/group_chat.rs`：绑定的 `thread_url`
+  与适配器的 `new_chat_url` 跳转，从 `classify_top_level_url` 的
+  `AllowHttps`（放行任意 allowed_host：CDN、facebook.com 等）
+  收紧为 `is_verified_callback_origin`（只认本站 callback_origins：
+  muse.ai、www.muse.ai、app.hark.com、hark.com）。
+  `providers.rs` 的拒绝测试已扩展，覆盖 metaaiusercontent.com /
+  facebook.com / appleid.apple.com。记录绑定时校验当前页的
+  `classify_top_level_url` 不动。
+
+验证：`rustfmt --check` 通过；`npm run build` 通过；
+`npm run test:js` 15/15 通过。Rust `cargo test` 仍未跑通
+（本机缺系统依赖，见第二节），Kotlin/Swift 不涉及本次改动。
+
+待继续：PR-C（OpenAI API SSRF/重定向、auto_approve 熔断）、
+PR-D（A2A/LocalCli 提权与隔离）、PR-E（updater 防降级、CI、Command 校验、Android 卡死）。
+
 ## 六、发版前真机手动测试清单
 
 1. Android 更新：去掉 SHA-256 调用一次，应拒绝安装并删文件；
