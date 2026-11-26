@@ -289,7 +289,11 @@ class AccountSessionPlugin(private val activity: Activity) : Plugin(activity) {
                     invoke.reject("系统 WebView 不支持 MULTI_PROFILE")
                     return@runOnUiThread
                 }
-                val cookieManager = ProfileStore.getInstance().getProfile(args.uuid)?.cookieManager
+                // 新账号从未打开过时 profile 还不存在（profile 由打开会话
+                // 的 WebViewCompat.setProfile 创建），getProfile 会返回 null
+                // 导致导入直接失败；用 getOrCreateProfile（webkit 1.18.0
+                // 已提供）按需创建。
+                val cookieManager = ProfileStore.getInstance().getOrCreateProfile(args.uuid)?.cookieManager
                 if (cookieManager == null) {
                     invoke.reject("无法访问该账号的隔离 Cookie 存储")
                     return@runOnUiThread

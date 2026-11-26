@@ -194,19 +194,23 @@ export function renderMiddleContent(
   //（之前只有文案，没有按钮）。继续使用空配置会丢弃损坏的配置
   //（原文件已有 .corrupt-* 备份）；从备份恢复按 .bak、最新
   // .corrupt-* 的顺序逐个尝试。
-  const persistActionsHtml = state.persistBlocked
+  // 横幅与提示条分离：提示条可以点 ✕ 关闭，但写盘被锁的状态不会因此
+  // 解除，恢复按钮必须一直可见，不能跟着提示条一起消失。
+  const persistBlockedHtml = state.persistBlocked
     ? `
+      <div class="notice-bar persist-blocked-bar">
+        <span>配置写盘被阻止，请选择：</span>
         <div class="notice-actions">
           <button id="continue-empty-config-btn" class="notice-action-btn" type="button">继续使用空配置</button>
           <button id="restore-config-backup-btn" class="notice-action-btn" type="button">从备份恢复</button>
         </div>
-      `
+      </div>
+    `
     : "";
   const noticeHtml = state.notice
     ? `
       <div class="notice-bar">
         <span>${escapeHtml(state.notice)}</span>
-        ${persistActionsHtml}
         <button id="dismiss-notice-btn" class="notice-close" type="button" title="关闭提示">✕</button>
       </div>
     `
@@ -451,6 +455,7 @@ export function renderMiddleContent(
     </div>
     ${listToolbarHtml}
     ${noticeHtml}
+    ${persistBlockedHtml}
     ${conflictsHtml}
     <div class="account-list">${listBody}</div>
     ${renderDownloadToast(downloadToast)}

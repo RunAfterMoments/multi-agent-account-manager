@@ -1268,6 +1268,13 @@ function bindEvents(state: ManagerSnapshot, provider: ProviderInfo): void {
   });
 
   document.querySelector("#continue-empty-config-btn")?.addEventListener("click", async () => {
+    if (
+      !window.confirm(
+        "继续使用空配置将丢弃当前损坏的配置（已有 .corrupt-* 备份），确定吗？",
+      )
+    ) {
+      return;
+    }
     await callCommand("continue_with_empty_config");
   });
   document.querySelector("#restore-config-backup-btn")?.addEventListener("click", async () => {

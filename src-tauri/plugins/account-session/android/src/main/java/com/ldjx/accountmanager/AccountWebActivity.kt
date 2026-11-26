@@ -504,7 +504,7 @@ class AccountWebActivity : AppCompatActivity() {
             "png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "ico",
             "mp4", "mov", "webm", "mkv", "avi", "mp3", "wav", "m4a", "ogg", "flac",
             "csv", "tsv", "json", "txt", "md", "xml", "yaml", "yml",
-            "doc", "docx", "xls", "xlsx", "ppt", "pptx", "apk",
+            "doc", "docx", "xls", "xlsx", "ppt", "pptx",
         )
 
         private fun sanitizeAndroidUserAgent(raw: String): String {
@@ -1915,6 +1915,18 @@ class AccountWebActivity : AppCompatActivity() {
                 "Google OAuth 按政策需使用系统浏览器，请使用邮箱/手机号登录，或在账号设置中通过「导入 Cookie」载入登录态",
             )
             return true
+        }
+        // http/https 先验 host 再谈下载：下载拦截不能绕过域名白名单，
+        // 否则聊天内容里的外站链接（如 https://evil.com/x.apk?download=1）
+        // 会被当作下载直接放行。blob:/data: 不走这里（blob 在上面已单独
+        // 验过内层 host，data: 仍走下载拦截）。合法附件不受影响，
+        // muse 的 allowedHosts 已含 CDN 域名。
+        val urlScheme = uri.scheme?.lowercase().orEmpty()
+        if (urlScheme == "https" || urlScheme == "http") {
+            if (!AccountSessionCoordinator.hostMatchesAllowed(uri, spec.allowedHosts)) {
+                if (isPopup) destroyPopupWebView()
+                return true
+            }
         }
         if (shouldInterceptUrlAsDownload(uri, isRedirect)) {
             handleDownloadRequest(

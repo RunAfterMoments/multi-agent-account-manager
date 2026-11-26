@@ -207,14 +207,24 @@ impl SessionManager {
         "未找到可用的配置备份（accounts.json.bak 或 accounts.json.corrupt-*）".to_string(),
       );
     }
+    // 先校验再覆盖：候选先复制到同目录临时文件并加载验证，通过才原子
+    // rename 到 store_path。之前是先覆盖 store_path 再校验，全部候选
+    // 失败时 store_path 会被最后一个坏候选覆盖掉。
+    let temp_path = store_path.with_file_name("accounts.json.restore-tmp");
     let mut last_err = String::new();
     for candidate in candidates {
-      if std::fs::copy(&candidate, &store_path).is_err() {
+      if std::fs::copy(&candidate, &temp_path).is_err() {
         continue;
       }
-      let loaded = load_or_migrate_store(&store_path);
+      let loaded = load_or_migrate_store(&temp_path);
       if loaded.persist_blocked {
         last_err = loaded.startup_notice.clone().unwrap_or_default();
+        let _ = std::fs::remove_file(&temp_path);
+        continue;
+      }
+      if std::fs::rename(&temp_path, &store_path).is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+        last_err = "备份文件无法写入配置路径".to_string();
         continue;
       }
       let mut locked = self.inner.lock().await;
@@ -232,6 +242,7 @@ impl SessionManager {
         .unwrap_or_else(ProviderId::muse);
       return Ok(Self::snapshot_from_locked(&locked));
     }
+    let _ = std::fs::remove_file(&temp_path);
     if last_err.is_empty() {
       last_err = "备份文件均无法读取".to_string();
     }

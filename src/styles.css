@@ -421,6 +421,13 @@ body,
   overflow-wrap: anywhere;
 }
 
+.persist-blocked-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
 .notice-actions {
   display: flex;
   gap: 6px;

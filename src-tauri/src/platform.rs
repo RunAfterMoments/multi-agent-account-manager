@@ -1441,6 +1441,12 @@ fn normalize_same_site(raw: Option<&str>) -> Option<String> {
   }
 }
 
+/// 允许作为父域的域名白名单（`Domain=hark.com` 配 app.hark.com 入口等）。
+/// 只能是自有域名，公共后缀（workers.dev、github.io、vercel.app 等）
+/// 永远不得加入——否则一条 `Domain=workers.dev` 的 Cookie 会被种到整个
+/// 公共后缀下，发往攻击者控制的同后缀子域。
+const ALLOWED_PARENT_DOMAINS: &[&str] = &["hark.com", "muse.ai"];
+
 fn push_validated_imported_cookie(
   out: &mut Vec<ImportedCookieSpec>,
   seen: &mut std::collections::HashMap<(String, String, String), usize>,
@@ -1463,11 +1469,13 @@ fn push_validated_imported_cookie(
   {
     return;
   }
-  // 值里出现 `;` 或 `,` 会被移动端当作 Set-Cookie 属性分隔符解析，
-  // 可注入 Domain/Path 等属性（审计已用临时测试验证），直接丢弃该条。
+  // 值里出现 `;` 会被当作 Set-Cookie 属性分隔符解析，可注入
+  // Domain/Path 等属性，直接丢弃该条。`,` 不拦：它是合法的 Cookie
+  // 值字符（JSON/偏好值里常见），Chromium、Android、iOS 的解析器都只
+  // 以 `;` 分隔属性，桌面端值还走 `set_value()` 不拼字符串。
   if raw_value
     .bytes()
-    .any(|b| matches!(b, b'\r' | b'\n' | 0 | b';' | b','))
+    .any(|b| matches!(b, b'\r' | b'\n' | 0 | b';'))
   {
     return;
   }
@@ -1475,10 +1483,10 @@ fn push_validated_imported_cookie(
 
   let default_clean = default_host.trim().to_ascii_lowercase();
   // 父域 Cookie：Domain=hark.com 可用于 app.hark.com 的账号。
-  // 只有父域本身至少有两个标签（如 hark.com，com 不行）且入口/白名单
-  // host 确实是它的子域时才放行，仍拒绝无关域。
+  // 只有父域在白名单内且入口/白名单 host 确实是它的子域时才放行，
+  // 仍拒绝无关域与公共后缀（见 ALLOWED_PARENT_DOMAINS）。
   let is_parent_domain = |parent: &str, child: &str| -> bool {
-    parent.contains('.') && child.ends_with(&format!(".{parent}"))
+    ALLOWED_PARENT_DOMAINS.contains(&parent) && child.ends_with(&format!(".{parent}"))
   };
   let domain_matches = |cookie_domain: &str, host: &str| -> bool {
     crate::providers::host_matches(cookie_domain, host) || is_parent_domain(cookie_domain, host)
@@ -1488,7 +1496,17 @@ fn push_validated_imported_cookie(
     .filter(|d| !d.is_empty())
     .unwrap_or_else(|| default_clean.clone());
   let check_host = domain.trim_start_matches('.');
-  if check_host.is_empty()
+  // Domain 也会拼进 `k=v; Domain={}; Path={}` 模板再 Cookie::parse，
+  // 必须是纯 DNS 字符，否则 `;` 可注入属性。标签不能为空、首尾不能是
+  // `.`/`-`（".."、".evil.com"、"evil-.com" 之类一律拒绝）。
+  let host_chars_ok = !check_host.is_empty()
+    && check_host
+      .bytes()
+      .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
+    && !check_host.contains("..")
+    && !check_host.starts_with(['.', '-'])
+    && !check_host.ends_with(['.', '-']);
+  if !host_chars_ok
     || (!domain_matches(check_host, &default_clean)
       && !allowed_hosts
         .iter()
@@ -1498,6 +1516,10 @@ fn push_validated_imported_cookie(
   }
 
   let raw_p = raw_path.map(|p| p.trim()).unwrap_or("/");
+  // Path 同样拼进模板：`;`、控制字符可注入属性或截断解析，直接丢弃该条。
+  if raw_p.bytes().any(|b| b < 0x20 || b == 0x7f || b == b';') {
+    return;
+  }
   let mut path = if raw_p.is_empty() {
     "/".to_string()
   } else if raw_p.starts_with('/') {
@@ -2543,11 +2565,39 @@ mod tests {
       now
     )
     .is_err());
-    // 值含 `,` 同样丢弃。
-    assert!(parse_imported_cookies(
+    // 值含 `,` 应通过：`,` 是合法值字符，解析器只以 `;` 分隔属性。
+    let comma = parse_imported_cookies(
       r#"[{"name":"a","value":"abc,xyz","domain":"app.hark.com"}]"#,
       "app.hark.com",
       &allowed,
+      now,
+    )
+    .unwrap();
+    assert_eq!(comma.len(), 1);
+    assert_eq!(comma[0].value, "abc,xyz");
+    // Path 含 `;` 可注入属性，整条丢弃。
+    assert!(parse_imported_cookies(
+      r#"[{"name":"a","value":"v","domain":"app.hark.com","path":"/; Domain=evil.com"}]"#,
+      "app.hark.com",
+      &allowed,
+      now
+    )
+    .is_err());
+    // Domain 含 `;` 或非法字符，整条丢弃。
+    assert!(parse_imported_cookies(
+      r#"[{"name":"a","value":"v","domain":"app.hark.com; Domain=evil.com"}]"#,
+      "app.hark.com",
+      &allowed,
+      now
+    )
+    .is_err());
+    // 父域是公共后缀（workers.dev）时拒绝：白名单里有
+    // meta-agents-apps.workers.dev 也不得放行整个后缀。
+    let workers_allowed = vec!["meta-agents-apps.workers.dev".to_string()];
+    assert!(parse_imported_cookies(
+      r#"[{"name":"a","value":"v","domain":"workers.dev"}]"#,
+      "meta-agents-apps.workers.dev",
+      &workers_allowed,
       now
     )
     .is_err());

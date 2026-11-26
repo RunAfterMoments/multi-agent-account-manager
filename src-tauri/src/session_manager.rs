@@ -1679,7 +1679,7 @@ impl SessionManager {
       let path = self
         .recent_downloads
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .get(&download_id)
         .cloned()
         .ok_or_else(|| "未找到对应的下载文件记录".to_string())?;
@@ -2330,7 +2330,7 @@ impl SessionManager {
         let filename = Self::extract_download_filename(Some(destination.as_path()), &url);
         pending
           .lock()
-          .unwrap()
+          .unwrap_or_else(|e| e.into_inner())
           .entry(url.as_str().to_string())
           .or_default()
           .push_back((download_id, destination.clone()));

@@ -232,18 +232,22 @@ fn parse_overrides_str(raw: &str) -> Result<Vec<SiteAdapterConfig>, String> {
 pub fn merge_adapters(overrides: Vec<SiteAdapterConfig>) -> Vec<SiteAdapterConfig> {
   let mut result = builtin_site_adapters();
   for ov in overrides {
-    if let Some(pos) = result.iter().position(|b| b.id == ov.id) {
-      let mut effective_ov = ov;
-      // 覆盖文件不得把内置适配的 hostPatterns 拓宽为通配符 "*"，否则
-      // 一条覆盖就能让内置适配匹配任意域名；此时保留内置的 hostPatterns。
-      if effective_ov.host_patterns.iter().any(|p| p == "*") {
+    let mut effective_ov = ov;
+    // 任何 override 都不得带通配符 "*"：覆盖内置 id 时去掉 "*" 后若为空，
+    // 保留内置的 hostPatterns；新增 id 去掉 "*" 后若为空，整条丢弃，
+    // 否则一条自定义规则就能通配接管全部域名。
+    effective_ov.host_patterns.retain(|p| p != "*");
+    if let Some(pos) = result.iter().position(|b| b.id == effective_ov.id) {
+      if effective_ov.host_patterns.is_empty() {
         effective_ov.host_patterns = result[pos].host_patterns.clone();
       }
       result[pos] = effective_ov;
-    } else if let Some(generic_pos) = result.iter().position(|b| b.id == "generic") {
-      result.insert(generic_pos, ov);
-    } else {
-      result.push(ov);
+    } else if !effective_ov.host_patterns.is_empty() {
+      if let Some(generic_pos) = result.iter().position(|b| b.id == "generic") {
+        result.insert(generic_pos, effective_ov);
+      } else {
+        result.push(effective_ov);
+      }
     }
   }
   result
@@ -714,6 +718,49 @@ mod tests {
       .find(|a| a.id == "muse")
       .expect("muse exists");
     assert!(!muse_adapter.host_patterns.iter().any(|p| p == "*"));
+    let _ = fs::remove_dir_all(&dir);
+  }
+
+  #[test]
+  fn new_custom_adapter_with_wildcard_only_is_dropped() {
+    let dir = temp_dir("wildcard-new-id");
+    let custom_json = r##"
+      [
+        {
+          "id": "my_override",
+          "name": "My Override",
+          "hostPatterns": ["*"]
+        }
+      ]
+    "##;
+    let snap = validate_and_save_overrides(&dir, custom_json).expect("save overrides");
+    assert!(!snap.adapters.iter().any(|a| a.id == "my_override"));
+    assert_eq!(
+      resolve_adapter_for_host(&dir, "evil.example.com").id,
+      "generic"
+    );
+    let _ = fs::remove_dir_all(&dir);
+  }
+
+  #[test]
+  fn new_custom_adapter_keeps_non_wildcard_patterns() {
+    let dir = temp_dir("wildcard-mixed");
+    let custom_json = r##"
+      [
+        {
+          "id": "my_override",
+          "name": "My Override",
+          "hostPatterns": ["*", "example.com"]
+        }
+      ]
+    "##;
+    let snap = validate_and_save_overrides(&dir, custom_json).expect("save overrides");
+    let adapter = snap
+      .adapters
+      .iter()
+      .find(|a| a.id == "my_override")
+      .expect("my_override exists");
+    assert_eq!(adapter.host_patterns, vec!["example.com".to_string()]);
     let _ = fs::remove_dir_all(&dir);
   }
 }

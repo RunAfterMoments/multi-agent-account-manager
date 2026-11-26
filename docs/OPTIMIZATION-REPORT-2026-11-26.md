@@ -156,7 +156,63 @@
 - iOS 下载功能缺口：功能缺口而非安全修复，未做。
 - 审计报告里标注"待真机测试"的 5 项：本次未做真机测试。
 
-## 四、发版前真机手动测试清单
+## 五、复审修复（v4，2026-11-26 晚）
+
+v3 压缩包经复审（综合 6.0/10，NO-GO）抓出 7 个问题，已逐项对照代码核实
+并全部修复。10 个文件，+214/-40 行。
+
+1. **iOS 代理无效时直连（高危）**：`AccountWebViewController.swift`
+   的代理失败分支补 `dismiss + return`，不再无代理加载入口页。
+   顺序：先 `emitSessionFailed`（sendEvent 要求 activeSpec 仍在），
+   再 `invalidateAndClose(spec.switchSeq)`（否则 `deleteProfile`
+   会因 `isUuidActive` 卡住），最后关闭。
+2. **Cookie 导入残余注入**（`platform.rs`）：
+   - `Path` 加校验：含 `;` 或控制字符直接丢弃该条；
+   - `Domain` 加 DNS 字符校验（仅 `[a-z0-9.-]`、标签非空、首尾非 `./-`）；
+   - `is_parent_domain` 改为显式白名单 `hark.com`、`muse.ai`，
+     `Domain=workers.dev` 不再放行（白名单里有
+     `meta-agents-apps.workers.dev` 也不得种整个公共后缀）；
+   - 值放宽 `,`：`,` 是合法值字符，Chromium/Android/iOS 解析器只以 `;`
+     分隔属性，桌面端还走 `set_value()`；测试同步更新，并新增
+     Path/Domain 注入与 workers.dev 拒绝的断言。
+3. **iOS blob 校验死代码**：新增 `blobInnerUrl`（剥掉 `"blob:"` 前缀再
+   解析内层 URL——Foundation 解析 `blob:https://` 时 `url.host` 为 nil）。
+   主框 `blob:https://` 仅内层 host 在白名单内才放行，
+   `blob:null/` 保持放行；子框 blob 必须有内层 host 且在白名单/
+   验证码域名内，`blob:null/` 子框拒绝。
+4. **前端 persistBlocked 横幅**：恢复按钮移出可关闭的提示条，改成独立的
+   不可关闭横幅（`persist-blocked-bar`），点 ✕ 不再让按钮消失；
+   「继续使用空配置」加 `window.confirm` 二次确认；
+   `store.rs` 的 `restore_config_from_backup` 改为先复制候选到同目录
+   临时文件 `accounts.json.restore-tmp` 校验，通过才原子 rename 覆盖，
+   全部失败时不再让坏候选覆盖 `store_path`。
+5. **漏改的 2 处 `.lock().unwrap()`**：`session_manager.rs` 的
+   `reveal_downloaded_file` 与 `handle_desktop_download_event`
+   （FFI 回调内）全部改为 `unwrap_or_else(|e| e.into_inner())`；
+   全仓 `src-tauri/src` 已无 `.lock().unwrap()`。
+6. **`merge_adapters` 通配绕过**：所有 override 先去掉 `"*"`；
+   覆盖内置 id 去掉后为空则保留内置 hostPatterns；新增 id 去掉后
+   为空则整条丢弃。新增两个测试（纯通配新增被丢弃、混合通配只保留非通配）。
+7. **Android**：
+   - `decideMainFrameOverride` 对 http/https 先验 `hostMatchesAllowed`
+     再谈下载拦截，聊天内容里的外站链接不再被当作下载放行；
+     blob:/data: 保持现有流程；合法附件不受影响（CDN 域名已在白名单内）；
+   - `DOWNLOAD_HINT_EXTENSIONS` 去掉 `"apk"`；
+   - `importProfileCookies` 改用 `getOrCreateProfile`（已用 webkit 1.18.0
+     的 sources jar 核实该 API 存在）：新账号从未打开过时 profile
+     还不存在，之前 `getProfile` 返回 null 导致导入直接失败。
+
+   补充说明：Gemini 本轮给出的方案有 3 处事实错误，已纠正未采用——
+   代理分支先 invalidate 再 emit 会把事件屏蔽掉；`getOrCreateProfile`
+   经 sources jar 核实是存在的（Gemini 称不存在）；Cookie/前端/
+   merge_adapters 几处方案用了不存在的 API 与返回类型。
+   第三方 Cookie 关闭后 Muse SSO / Turnstile / hCaptcha 登录仍需真机实测。
+
+验证：`rustfmt --check` 通过；`npm run build` 通过；`npm run test:js`
+15/15 通过。Rust `cargo test` 与 Kotlin/Swift 编译仍未跑通
+（原因同第二节：本机缺系统依赖与移动端工具链），需走 CI 或有依赖的机器。
+
+## 六、发版前真机手动测试清单
 
 1. Android 更新：去掉 SHA-256 调用一次，应拒绝安装并删文件；
    篡改已下载 APK 后重进，应重新下载而非复用。
