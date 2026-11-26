@@ -65,6 +65,7 @@ impl SessionManager {
       conflicts: locked.conflicts.clone(),
       notice: locked.notice.clone(),
       modal_active: locked.modal_active,
+      effective_sidebar_collapsed: Self::is_sidebar_effectively_collapsed(locked),
       settings: locked.store.settings.clone(),
       global_shortcut_active: locked.global_shortcut_active,
       global_shortcut_error: locked.global_shortcut_error.clone(),

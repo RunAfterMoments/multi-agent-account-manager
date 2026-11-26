@@ -198,6 +198,19 @@ async fn set_modal_active(
 }
 
 #[tauri::command]
+async fn set_sidebar_collapsed(
+  app: AppHandle,
+  mgr: State<'_, Arc<SessionManager>>,
+  webview: tauri::Webview,
+  collapsed: bool,
+) -> Result<ManagerSnapshot, String> {
+  if webview.label() != "manager" {
+    return Err("仅账号管理页可以切换侧边栏折叠".to_string());
+  }
+  mgr.set_sidebar_collapsed(&app, collapsed).await
+}
+
+#[tauri::command]
 async fn open_official_site(
   app: AppHandle,
   mgr: State<'_, Arc<SessionManager>>,
@@ -821,6 +834,7 @@ pub fn run() {
       reveal_downloaded_file,
       switch_account,
       set_modal_active,
+      set_sidebar_collapsed,
       open_official_site,
       resolve_uuid_conflict,
       dismiss_notice,

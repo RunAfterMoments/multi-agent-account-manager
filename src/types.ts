@@ -25,6 +25,7 @@ export interface AppSettings {
   autoApprove: boolean;
   disableAutoUpdateCheck: boolean;
   autoApproveCommands: boolean;
+  sidebarCollapsed: boolean;
 }
 
 export interface ProxyTestResult {
@@ -199,6 +200,8 @@ export interface ManagerSnapshot {
   accountErrors?: AccountPageError[];
   /** 配置加载失败 / 版本过高时为 true：写盘已被阻止，需用户二选一。 */
   persistBlocked?: boolean;
+  /** 当前生效的折叠态（Rust 布局与前端显隐的单一真相源）。 */
+  effectiveSidebarCollapsed: boolean;
   readOnly?: boolean;
 }
 

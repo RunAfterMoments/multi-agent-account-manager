@@ -220,6 +220,10 @@ body,
   color: #64748b;
 }
 
+.desktop-shell.sidebar-collapsed .middle-column {
+  display: none;
+}
+
 .middle-column {
   width: min(312px, calc(100% - 68px));
   min-width: 0;

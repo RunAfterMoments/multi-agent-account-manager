@@ -21,6 +21,7 @@ use super::{
   ActiveSessionSlot, InnerState, ManagerSnapshot, SessionManager, WarmDesktopEntry, APP_TITLE,
   AUTO_APPROVE_INIT_JS, BACKGROUND_RAF_INIT_JS, DOM_PAINT_READY_JS, GROUP_IDLE_RECLAIM_MS,
   LEFT_PANE_WIDTH, LOGIN_CAPTURE_INIT_JS, MAX_CONCURRENT_PREWARMS, MAX_WARM_DESKTOP_VIEWS,
+  SERVICE_RAIL_WIDTH,
 };
 use crate::platform;
 #[cfg(desktop)]
@@ -238,6 +239,18 @@ impl SessionManager {
     }
   }
 
+  /// 当前生效的折叠态：用户偏好 + 弹窗/锁死/冲突强制展开。
+  /// 弹窗开时临时展开（set_modal_active 本来就会调布局重算，关弹窗
+  /// 后自动缩回）；锁死或 UUID 冲突时强制展开，不隐藏恢复按钮。
+  /// 前后端单一真相源：snapshot_from_locked 也用它算
+  /// `effective_sidebar_collapsed`。
+  pub(super) fn is_sidebar_effectively_collapsed(locked: &InnerState) -> bool {
+    locked.store.settings.sidebar_collapsed
+      && !locked.modal_active
+      && !locked.persist_blocked
+      && locked.conflicts.is_empty()
+  }
+
   #[cfg(desktop)]
   pub(super) fn apply_desktop_layout_locked(app: &AppHandle, locked: &InnerState) {
     let Some(main_win) = app.get_window("main") else {
@@ -255,7 +268,17 @@ impl SessionManager {
     );
     let _ = (win_w, win_h);
 
-    let left_phys = ((LEFT_PANE_WIDTH * scale).round().max(0.0) as u32).min(phys_size.width);
+    // 折叠态只留 68px 服务栏（与 styles.css 的 .service-rail 同宽），
+    // 账号 WebView 多出 312px。manager 与账号 WebView 的 bounds、
+    // 群聊后台 keep_group_behind 全部走 left_phys，一处改完就全端联动。
+    // 注意不用 CSS 过渡动画：原生子 WebView 的 set_bounds 是瞬时跳变，
+    // CSS 动画会造成 200ms 白缝或挤压抖动，前端用 display:none 瞬切。
+    let left_logical = if Self::is_sidebar_effectively_collapsed(locked) {
+      SERVICE_RAIL_WIDTH
+    } else {
+      LEFT_PANE_WIDTH
+    };
+    let left_phys = ((left_logical * scale).round().max(0.0) as u32).min(phys_size.width);
     let right_phys = phys_size.width.saturating_sub(left_phys);
 
     let active_committed_label = locked.active_slot.as_ref().and_then(|slot| {

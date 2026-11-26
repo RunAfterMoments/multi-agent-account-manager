@@ -698,6 +698,47 @@ webview.rs `PendingDownloads` 别名 + `format!` 去引用 + `never_loop` allow�
   `libwebkit2gtk-4.1-dev` `libgdk-pixbuf-2.0-dev` `libayatana-appindicator3-dev`
   `librsvg2-dev`；`CARGO_TARGET_DIR` 仍用工作区内目录，绝不放 512M 的 `/tmp`。
 
+## 十一、侧边栏折叠功能（2026-11-26 晚，单独 commit）
+
+按用户给的设计单独做，不混进 v6.1 安全修复。收起 312px `.middle-column`，保留 68px
+`.service-rail`（绝不收到 0：右侧账号页是原生子 WebView，永远盖在 manager HTML 之上，
+无法在账号页上叠悬浮展开按钮；服务栏是天然的展开入口）。左半区总宽
+`LEFT_PANE_WIDTH = 380px`，收起态 68px，右侧对话区多出 312px。
+
+- Rust：`AppSettings` 加 `#[serde(default)] pub sidebar_collapsed: bool`
+  （旧 `accounts.json` 无需升 `STORE_VERSION`）；`session_manager.rs` 加
+  `const SERVICE_RAIL_WIDTH: f64 = 68.0`；`ManagerSnapshot` 加派生字段
+  `effective_sidebar_collapsed`（`snapshot_from_locked` 统一计算，前后端单一真相源）；
+  `SessionManager::set_sidebar_collapsed`（改偏好 → `#[cfg(desktop)]` 重算布局 →
+  `request_persist()` 异步防抖写盘 → 返回 snapshot）；`webview.rs` 新增
+  `is_sidebar_effectively_collapsed(locked) = settings.sidebar_collapsed && !modal_active && !persist_blocked && conflicts.is_empty()`，
+  `apply_desktop_layout_locked` 是唯一依赖 `LEFT_PANE_WIDTH` 的入口，
+  一处改完全端联动（active WebView、macOS loading、群聊后台、Resize/DPI 全走这里；
+  `set_modal_active` 本来就会调它，弹窗临时展开/关闭后自动复原是零额外代码）。
+  `lib.rs` 新增 `set_sidebar_collapsed` 命令（带标准 `webview.label() != "manager"`
+  校验，命令总数 44），注册进 `generate_handler![]`。
+- 前端：`types.ts` 两字段；`state.ts` 加 `ICON_CHEVRON_LEFT/RIGHT`；
+  `styles.css` 仅一条规则（`.desktop-shell.sidebar-collapsed .middle-column { display: none; }`，
+  无宽度过渡动画——原生 `set_bounds` 是瞬时跳变，CSS 动画会出 200ms 白缝）；
+  `main.ts`：`.desktop-shell` 按 snapshot 挂 class；`.rail-footer` 顶部放
+  `#toggle-sidebar-btn`（chevron 随态翻转，title 写 `Ctrl+\`，收起态且有 notice
+  或 downloadToast 时挂 `.warn-dot`）；`setSidebarCollapsed` 轻量 invoke
+  （不复用 `update_app_settings`，后者会重注册快捷键并广播脚本，太重）；
+  收起态点已选服务 / 无激活账号的服务 / 无 activeGroupId 的群聊时自动展开；
+  `Cmd/Ctrl + \` 快捷键（不在全局注册，只在 manager 内；`Cmd/Ctrl + B` 留给富文本加粗）。
+- 刻意未动：`initial_hidden_child_rect` 也用了 `LEFT_PANE_WIDTH`，但那个视图隐藏在
+  屏幕外、激活时重算布局，不影响。
+- 偏好与生效态分离：用户偏好 `sidebar_collapsed`，实际生效
+  `effective = 偏好 && !modal_active && !persist_blocked && conflicts.is_empty()`——
+  收起态点设置/更新时自动临时展开到 380px 显示完整弹窗，关闭后自动缩回；
+  写盘锁死或 UUID 冲突时强制展开，不隐藏恢复按钮。
+- 测试：新增 `sidebar_effective_collapsed_forced_open_by_modal_blocked_conflicts`
+  （`SessionManager::new(temp_dir)` + `get_snapshot()` + 直接改 `inner.lock()` +
+  `snapshot_from_locked`；覆盖 modal_active / persist_blocked / conflicts 三种强制展开，
+  以及老配置 JSON 默认反序列化为 `false`）。
+- 细节：代码里的反斜杠经字节数核实正确（keydown 行 2 个反斜杠 = 单个 `\` 字符串；
+  title 行每处 2 个）；工具输出显示会转义反斜杠，以字节数为准，别凭显示改。
+
 ## 十二、残留（v6.1 后，未变）
 
 - Windows-only Rust（Job Object `SetInformationJobObject` 路径）与 Kotlin/Swift

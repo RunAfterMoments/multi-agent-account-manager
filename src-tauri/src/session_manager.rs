@@ -41,6 +41,8 @@ const AUTO_ROUTE_STICKY_MAX_USED_PCT: u8 = 85;
 const AUTO_ROUTE_COOLDOWN_MS: u64 = 120_000;
 #[cfg(desktop)]
 const LEFT_PANE_WIDTH: f64 = 380.0;
+/// 收起态左栏宽：只留服务栏（68px，与 styles.css 的 .service-rail 一致）。
+const SERVICE_RAIL_WIDTH: f64 = 68.0;
 #[cfg(desktop)]
 const MAX_WARM_DESKTOP_VIEWS: usize = 10;
 #[cfg(desktop)]
@@ -97,6 +99,9 @@ pub struct ManagerSnapshot {
   pub conflicts: Vec<ConflictItem>,
   pub notice: Option<String>,
   pub modal_active: bool,
+  /// 当前生效的折叠态（用户偏好 + 弹窗/锁死/冲突强制展开后的结果），
+  /// 前后端单一真相源：Rust 布局与前端显隐都以它为准。
+  pub effective_sidebar_collapsed: bool,
   pub settings: AppSettings,
   pub global_shortcut_active: bool,
   pub global_shortcut_error: Option<String>,
@@ -1712,6 +1717,24 @@ impl SessionManager {
     Self::apply_desktop_layout_locked(app, &locked);
     #[cfg(not(desktop))]
     let _ = app;
+    Ok(Self::snapshot_from_locked(&locked))
+  }
+
+  /// 切换侧边栏折叠偏好（轻量命令，不走 update_app_settings——后者会
+  /// 重注册全局快捷键并向所有保活 WebView 广播 auto_approve 脚本）。
+  /// 偏好写盘走防抖 request_persist；布局立即按生效态重算。
+  pub async fn set_sidebar_collapsed(
+    &self,
+    app: &AppHandle,
+    collapsed: bool,
+  ) -> Result<ManagerSnapshot, String> {
+    let mut locked = self.inner.lock().await;
+    locked.store.settings.sidebar_collapsed = collapsed;
+    #[cfg(desktop)]
+    Self::apply_desktop_layout_locked(app, &locked);
+    #[cfg(not(desktop))]
+    let _ = app;
+    self.request_persist();
     Ok(Self::snapshot_from_locked(&locked))
   }
 
@@ -3524,6 +3547,34 @@ mod tests {
     let mgr4 = SessionManager::new(temp_dir.clone());
     assert!(mgr4.get_snapshot().await.external_agents.is_empty());
 
+    let _ = std::fs::remove_dir_all(&temp_dir);
+  }
+
+  #[tokio::test]
+  async fn sidebar_effective_collapsed_forced_open_by_modal_blocked_conflicts() {
+    // 生效态 = 偏好 && !弹窗 && !锁死 && 无冲突；老配置默认不折叠。
+    let temp_dir = std::env::temp_dir().join(format!("maam-sidebar-test-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&temp_dir).unwrap();
+    let mgr = SessionManager::new(temp_dir.clone());
+    assert!(!mgr.get_snapshot().await.effective_sidebar_collapsed);
+    {
+      let mut locked = mgr.inner.lock().await;
+      locked.store.settings.sidebar_collapsed = true;
+      assert!(SessionManager::snapshot_from_locked(&locked).effective_sidebar_collapsed);
+      locked.modal_active = true;
+      assert!(!SessionManager::snapshot_from_locked(&locked).effective_sidebar_collapsed);
+      locked.modal_active = false;
+      locked.persist_blocked = true;
+      assert!(!SessionManager::snapshot_from_locked(&locked).effective_sidebar_collapsed);
+      locked.persist_blocked = false;
+      locked.conflicts = vec![crate::storage::ConflictItem {
+        uuid: "00000000-0000-4000-8000-000000000001".to_string(),
+        providers: vec![ProviderId::muse()],
+      }];
+      assert!(!SessionManager::snapshot_from_locked(&locked).effective_sidebar_collapsed);
+      locked.conflicts = Vec::new();
+      assert!(SessionManager::snapshot_from_locked(&locked).effective_sidebar_collapsed);
+    }
     let _ = std::fs::remove_dir_all(&temp_dir);
   }
 

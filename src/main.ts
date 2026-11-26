@@ -22,6 +22,8 @@ import {
   ICON_UPDATE,
   ICON_SETTINGS,
   ICON_GROUP,
+  ICON_CHEVRON_LEFT,
+  ICON_CHEVRON_RIGHT,
   syncingMsgIds,
   themeMode,
   themeLabel,
@@ -399,7 +401,7 @@ function render(): void {
     `;
   } else {
     root.innerHTML = `
-      <div class="desktop-shell">
+      <div class="desktop-shell${snapshot.effectiveSidebarCollapsed ? " sidebar-collapsed" : ""}">
         <aside class="service-rail">
           <div class="rail-brand" title="叠号 · AI 助手账号切换器">
             <img src="/logos/app-logo.svg" alt="叠号" class="rail-brand-img" draggable="false" />
@@ -424,6 +426,16 @@ function render(): void {
               .join("")}
           </div>
           <div class="rail-footer">
+            <button
+              id="toggle-sidebar-btn"
+              class="rail-util-btn"
+              title="${snapshot.effectiveSidebarCollapsed ? "展开账号栏 (Ctrl+\\)" : "收起账号栏 (Ctrl+\\)"}"
+              type="button"
+            >
+              ${snapshot.effectiveSidebarCollapsed ? ICON_CHEVRON_RIGHT : ICON_CHEVRON_LEFT}
+              <span class="rail-util-label">${snapshot.effectiveSidebarCollapsed ? "展开" : "收起"}</span>
+              ${snapshot.effectiveSidebarCollapsed && (snapshot.notice || downloadToast) ? `<span class="warn-dot" aria-hidden="true"></span>` : ""}
+            </button>
             <button
               id="settings-btn"
               class="rail-util-btn ${snapshot.globalShortcutError ? "has-warn" : ""}"
@@ -486,8 +498,24 @@ function render(): void {
   shouldAnimateModal = false;
 }
 
+// 切换侧边栏折叠偏好（轻量命令，不走 update_app_settings）。
+async function setSidebarCollapsed(collapsed: boolean): Promise<void> {
+  if (!snapshot) return;
+  try {
+    snapshot = await invoke<ManagerSnapshot>("set_sidebar_collapsed", {
+      collapsed,
+    });
+  } catch (err) {
+    snapshot = { ...snapshot, notice: String(err) };
+  }
+  render();
+}
+
 function bindEvents(state: ManagerSnapshot, provider: ProviderInfo): void {
   document.querySelector("#group-chat-rail-btn")?.addEventListener("click", async () => {
+    if (state.effectiveSidebarCollapsed && !state.activeGroupId) {
+      await setSidebarCollapsed(false);
+    }
     if (viewMode === "groups") return;
     if (modal.kind !== "none") {
       await setModal({ kind: "none" });
@@ -500,6 +528,16 @@ function bindEvents(state: ManagerSnapshot, provider: ProviderInfo): void {
   document.querySelectorAll<HTMLElement>("[data-provider]").forEach((btn) => {
     btn.addEventListener("click", async () => {
       const nextId = btn.dataset.provider as ProviderId;
+      if (state.effectiveSidebarCollapsed) {
+        const alreadySelected =
+          viewMode === "provider" && nextId === state.selectedProviderId;
+        const hasActiveAccount = state.accounts.some(
+          (a) => a.providerId === nextId && isSameKey(state.activeAccount, a),
+        );
+        if (alreadySelected || !hasActiveAccount) {
+          await setSidebarCollapsed(false);
+        }
+      }
       if (!nextId || (viewMode === "provider" && nextId === state.selectedProviderId)) return;
       if (modal.kind !== "none") {
         await setModal({ kind: "none" });
@@ -1173,6 +1211,10 @@ function bindEvents(state: ManagerSnapshot, provider: ProviderInfo): void {
 
   document.querySelector("#group-send-btn")?.addEventListener("click", () => {
     void submitGroupMessage();
+  });
+
+  document.querySelector("#toggle-sidebar-btn")?.addEventListener("click", async () => {
+    await setSidebarCollapsed(!state.effectiveSidebarCollapsed);
   });
 
   document.querySelector("#theme-toggle-btn")?.addEventListener("click", () => {
@@ -2543,6 +2585,12 @@ async function bootstrap(): Promise<void> {
             alreadyWarm ? null : { providerId: targetAcc.providerId, uuid: targetAcc.uuid }
           );
         }
+        return;
+      }
+      if (ev.key === "\\") {
+        ev.preventDefault();
+        if (!snapshot) return;
+        await setSidebarCollapsed(!snapshot.effectiveSidebarCollapsed);
         return;
       }
       if (

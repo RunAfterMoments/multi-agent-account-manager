@@ -46,6 +46,10 @@ pub struct AppSettings {
   // 独立开关，默认关闭；开启后仍受 DANGER_RE 拦截危险命令。
   #[serde(default)]
   pub auto_approve_commands: bool,
+  /// 折叠左侧账号栏：只留 68px 服务栏，账号 WebView 多出 312px。
+  /// 旧版 accounts.json 没有该字段时默认 false，无需升 STORE_VERSION。
+  #[serde(default)]
+  pub sidebar_collapsed: bool,
 }
 
 impl Default for AppSettings {
@@ -56,6 +60,7 @@ impl Default for AppSettings {
       auto_approve: false,
       disable_auto_update_check: false,
       auto_approve_commands: false,
+      sidebar_collapsed: false,
     }
   }
 }
