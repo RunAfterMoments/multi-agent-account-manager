@@ -214,8 +214,8 @@ fn parse_overrides_str(raw: &str) -> Result<Vec<SiteAdapterConfig>, String> {
   } else {
     return Err("站点适配 JSON 必须是数组或包含 adapters 数组的对象".to_string());
   };
-  let mut parsed: Vec<SiteAdapterConfig> = serde_json::from_value(list_val)
-    .map_err(|e| format!("站点适配字段格式无效: {e}"))?;
+  let mut parsed: Vec<SiteAdapterConfig> =
+    serde_json::from_value(list_val).map_err(|e| format!("站点适配字段格式无效: {e}"))?;
   for item in &mut parsed {
     item.id = item.id.trim().to_string();
     item.name = item.name.trim().to_string();
@@ -322,8 +322,7 @@ pub fn validate_and_save_overrides(
     let mut f = File::create(&tmp_path).map_err(|e| format!("创建临时规则文件失败: {e}"))?;
     f.write_all(&pretty)
       .map_err(|e| format!("写入规则文件失败: {e}"))?;
-    f.sync_all()
-      .map_err(|e| format!("同步规则文件失败: {e}"))?;
+    f.sync_all().map_err(|e| format!("同步规则文件失败: {e}"))?;
   }
   fs::rename(&tmp_path, &path).map_err(|e| {
     let _ = fs::remove_file(&tmp_path);
@@ -607,7 +606,10 @@ mod tests {
     assert_eq!(resolve_adapter_for_host(&dir, "muse.ai").id, "muse");
     assert_eq!(resolve_adapter_for_host(&dir, "sub.muse.ai").id, "muse");
     assert_eq!(resolve_adapter_for_host(&dir, "app.hark.com").id, "hark");
-    assert_eq!(resolve_adapter_for_host(&dir, "unknown.example.org").id, "generic");
+    assert_eq!(
+      resolve_adapter_for_host(&dir, "unknown.example.org").id,
+      "generic"
+    );
     let _ = fs::remove_dir_all(&dir);
   }
 
@@ -638,17 +640,32 @@ mod tests {
 
     let snap = validate_and_save_overrides(&dir, custom_json).expect("save valid overrides");
     assert!(snap.has_overrides);
-    assert_eq!(resolve_adapter_for_host(&dir, "www.example.com").id, "custom_web");
+    assert_eq!(
+      resolve_adapter_for_host(&dir, "www.example.com").id,
+      "custom_web"
+    );
     let muse = resolve_adapter_for_host(&dir, "muse.ai");
     assert_eq!(muse.name, "Muse Custom");
-    assert_eq!(muse.composer_selectors, vec!["#custom-muse-box".to_string()]);
+    assert_eq!(
+      muse.composer_selectors,
+      vec!["#custom-muse-box".to_string()]
+    );
     assert!(muse.prefer_enter_submit);
-    assert_eq!(resolve_adapter_for_host(&dir, "other.example.net").id, "generic");
+    assert_eq!(
+      resolve_adapter_for_host(&dir, "other.example.net").id,
+      "generic"
+    );
 
     let reset_snap = reset_overrides(&dir).expect("reset overrides");
     assert!(!reset_snap.has_overrides);
-    assert_eq!(resolve_adapter_for_host(&dir, "www.example.com").id, "generic");
-    assert_eq!(resolve_adapter_for_host(&dir, "muse.ai").name, "Muse · Meta");
+    assert_eq!(
+      resolve_adapter_for_host(&dir, "www.example.com").id,
+      "generic"
+    );
+    assert_eq!(
+      resolve_adapter_for_host(&dir, "muse.ai").name,
+      "Muse · Meta"
+    );
     assert!(!get_adapters_snapshot(&dir).has_overrides);
     let _ = fs::remove_dir_all(&dir);
   }

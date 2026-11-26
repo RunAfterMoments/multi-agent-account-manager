@@ -6,12 +6,41 @@ use tauri::AppHandle;
 use tauri::Emitter;
 use url::Url;
 
-const LATEST_MANIFEST_URL: &str =
-  "https://github.com/ldjx7/multi-agent-account-manager/releases/latest/download/latest.json";
-const GITHUB_LATEST_API_URL: &str =
-  "https://api.github.com/repos/ldjx7/multi-agent-account-manager/releases/latest";
-const RELEASES_PAGE_URL: &str =
-  "https://github.com/ldjx7/multi-agent-account-manager/releases";
+/// 更新源仓库，编译期通过 `MAAM_UPDATE_REPO`（格式 `owner/repo`）配置。
+/// 未配置或格式非法时返回 `None`，表示更新功能默认关闭。
+fn parse_update_repo(raw: &str) -> Option<String> {
+  let raw = raw.trim();
+  if raw.matches('/').count() != 1 {
+    return None;
+  }
+  let (owner, repo) = raw.split_once('/')?;
+  let valid_segment = |s: &str| {
+    !s.is_empty()
+      && s
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+  };
+  if !valid_segment(owner) || !valid_segment(repo) {
+    return None;
+  }
+  Some(raw.to_string())
+}
+
+fn update_repo() -> Option<String> {
+  parse_update_repo(option_env!("MAAM_UPDATE_REPO").unwrap_or(""))
+}
+
+fn latest_manifest_url(repo: &str) -> String {
+  format!("https://github.com/{repo}/releases/latest/download/latest.json")
+}
+
+fn github_latest_api_url(repo: &str) -> String {
+  format!("https://api.github.com/repos/{repo}/releases/latest")
+}
+
+fn releases_page_url(repo: &str) -> String {
+  format!("https://github.com/{repo}/releases")
+}
 
 static UPDATE_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
@@ -48,6 +77,8 @@ pub struct UpdateCheckResult {
   pub filename: Option<String>,
   pub size: Option<u64>,
   pub release_page_url: String,
+  /// 未配置更新源（`MAAM_UPDATE_REPO`）时为 true：本次未做任何检查。
+  pub updates_disabled: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -143,10 +174,18 @@ fn parse_version(raw: &str) -> ParsedVersion {
     .split('.')
     .map(|seg| seg.trim().parse::<u64>().unwrap_or(0))
     .collect();
-  ParsedVersion { nums, is_prerelease }
+  ParsedVersion {
+    nums,
+    is_prerelease,
+  }
 }
 
 fn is_newer_version(current: &str, latest: &str) -> bool {
+  // 首选 semver 比较：正确处理预发布版本（1.0.0-rc.1 < 1.0.0-rc.2）。
+  // 无法解析为 semver 的字符串（如缺段、含非法字符）回退到旧的数值比较。
+  if let (Some(c), Some(l)) = (parse_semver(current), parse_semver(latest)) {
+    return l > c;
+  }
   let c = parse_version(current);
   let l = parse_version(latest);
   let max_len = c.nums.len().max(l.nums.len());
@@ -160,21 +199,64 @@ fn is_newer_version(current: &str, latest: &str) -> bool {
   c.is_prerelease && !l.is_prerelease
 }
 
-fn is_allowed_github_host(host: &str) -> bool {
-  let lower = host.to_ascii_lowercase();
-  lower == "github.com"
-    || lower.ends_with(".github.com")
-    || lower == "githubusercontent.com"
-    || lower.ends_with(".githubusercontent.com")
+/// 把 `1.2` / `v1.2.3-rc.1+build` 这类版本号规范化为 semver 要求
+/// 的三段式；不合法时返回 `None`，由调用方回退到旧比较。
+fn parse_semver(raw: &str) -> Option<semver::Version> {
+  let cleaned = clean_version(raw);
+  // 构建元数据（+build）按 SemVer 规范在比较版本先后时必须忽略，
+  // 且 semver crate 的 Ord 会比较它，故直接丢弃，只校验核心与预发布段。
+  let (core_pre, _build) = match cleaned.split_once('+') {
+    Some((head, tail)) => (head, Some(tail)),
+    None => (cleaned, None),
+  };
+  let (core, pre) = match core_pre.split_once('-') {
+    Some((c, p)) => (c, Some(p)),
+    None => (core_pre, None),
+  };
+  let segments: Vec<&str> = core.split('.').collect();
+  if segments.is_empty()
+    || segments.len() > 3
+    || segments
+      .iter()
+      .any(|s| s.is_empty() || !s.chars().all(|c| c.is_ascii_digit()))
+  {
+    return None;
+  }
+  let mut full = core.to_string();
+  for _ in segments.len()..3 {
+    full.push_str(".0");
+  }
+  if let Some(p) = pre {
+    full.push('-');
+    full.push_str(p);
+  }
+  semver::Version::parse(&full).ok()
 }
 
-fn validate_download_url(raw: &str) -> Result<Url, String> {
-  let parsed = Url::parse(raw.trim()).map_err(|_| "无效的更新包下载地址".to_string())?;
+/// 下载地址必须严格位于配置仓库的 Releases 下载路径下：
+/// `https://github.com/<owner>/<repo>/releases/download/<文件名>`。
+/// 只校验主机不限定路径的旧实现会放行任意 GitHub 用户的 release 文件。
+fn validate_download_url(raw: &str, repo: &str) -> Result<Url, String> {
+  let trimmed = raw.trim();
+  let prefix = format!("https://github.com/{repo}/releases/download/");
+  if trimmed.len() < prefix.len() || !trimmed[..prefix.len()].eq_ignore_ascii_case(&prefix) {
+    return Err("更新包下载地址必须位于配置仓库的 Releases 下载路径下".to_string());
+  }
+  let rest = &trimmed[prefix.len()..];
+  if rest.is_empty() || rest.contains(['?', '#']) {
+    return Err("更新包下载地址缺少文件名".to_string());
+  }
+  let parsed = Url::parse(trimmed).map_err(|_| "无效的更新包下载地址".to_string())?;
   if parsed.scheme() != "https" {
     return Err("仅允许通过 HTTPS 下载更新包".to_string());
   }
-  let host = parsed.host_str().ok_or_else(|| "更新地址缺少主机名".to_string())?;
-  if !is_allowed_github_host(host) {
+  if !parsed.username().is_empty() || parsed.password().is_some() {
+    return Err("更新包下载地址不得包含用户信息".to_string());
+  }
+  let host = parsed
+    .host_str()
+    .ok_or_else(|| "更新地址缺少主机名".to_string())?;
+  if !host.eq_ignore_ascii_case("github.com") {
     return Err(format!("不支持的更新源主机: {host}"));
   }
   Ok(parsed)
@@ -206,9 +288,10 @@ fn sanitize_filename(raw: Option<&str>, fallback: &str) -> String {
 }
 
 fn default_filename_for_platform(version: &str, url: &str) -> String {
-  let from_url = Url::parse(url)
-    .ok()
-    .and_then(|u| u.path_segments().and_then(|mut s| s.next_back().map(str::to_string)));
+  let from_url = Url::parse(url).ok().and_then(|u| {
+    u.path_segments()
+      .and_then(|mut s| s.next_back().map(str::to_string))
+  });
   if let Some(name) = from_url {
     if !name.trim().is_empty() {
       return sanitize_filename(Some(&name), "update.bin");
@@ -279,13 +362,49 @@ fn extract_sha256_digest(raw: Option<&str>) -> Option<String> {
   }
 }
 
+/// sha256 必填：缺失或格式非法直接拒绝，不下载、不复用、不安装。
+/// 这是桌面端与 Android 分支的单点关口——`download_and_install_update`
+/// 是唯一调用 Android 插件 `downloadAndInstallApk` 的入口，空 sha256
+/// 到不了 Kotlin 侧（插件内 `expectedSha == null` 的放行逻辑因此不可达）。
+fn require_expected_sha256(sha: Option<&str>) -> Result<String, String> {
+  extract_sha256_digest(sha).ok_or_else(|| "缺少更新包 SHA-256，拒绝安装".to_string())
+}
+
+/// 每一跳重定向目标都必须满足：https 且主机在白名单内。
+/// 白名单：github.com、api.github.com（清单 API 自身跳转，见笔记）、
+/// objects.githubusercontent.com、release-assets.githubusercontent.com。
+/// 子域名不在白名单内（如 github.com.evil.com、sub.github.com）。
+fn is_allowed_redirect_target(url: &Url) -> bool {
+  if url.scheme() != "https" {
+    return false;
+  }
+  let Some(host) = url.host_str() else {
+    return false;
+  };
+  matches!(
+    host.to_ascii_lowercase().as_str(),
+    "github.com"
+      | "api.github.com"
+      | "objects.githubusercontent.com"
+      | "release-assets.githubusercontent.com"
+  )
+}
+
 #[cfg(desktop)]
 fn build_http_client(user_agent: &str, timeout_secs: u64) -> Result<reqwest::Client, String> {
   reqwest::Client::builder()
     .user_agent(user_agent)
     .connect_timeout(std::time::Duration::from_secs(15))
     .timeout(std::time::Duration::from_secs(timeout_secs))
-    .redirect(reqwest::redirect::Policy::limited(10))
+    .redirect(reqwest::redirect::Policy::custom(|attempt| {
+      // previous 含初始 URL；超过 10 跳即停（与旧 Policy::limited(10) 同限）。
+      // stop() 会把 30x 响应原样返回，调用方按非 2xx 报错。
+      if attempt.previous().len() > 10 || !is_allowed_redirect_target(attempt.url()) {
+        attempt.stop()
+      } else {
+        attempt.follow()
+      }
+    }))
     .build()
     .map_err(|e| format!("创建网络客户端失败: {e}"))
 }
@@ -326,13 +445,39 @@ async fn fetch_text_with_status(
   }
 }
 
+/// 未配置更新源时返回的结果：不发起任何网络请求，只提示已关闭。
+fn disabled_check_result(current_version: &str) -> UpdateCheckResult {
+  UpdateCheckResult {
+    current_version: current_version.to_string(),
+    latest_version: current_version.to_string(),
+    has_update: false,
+    release_notes: "未配置更新源（编译时未设置 MAAM_UPDATE_REPO），检查更新与一键安装已关闭。"
+      .to_string(),
+    pub_date: None,
+    download_url: None,
+    sha256: None,
+    filename: None,
+    size: None,
+    release_page_url: String::new(),
+    updates_disabled: true,
+  }
+}
+
 pub async fn check_for_updates(app: &AppHandle) -> Result<UpdateCheckResult, String> {
   let current_version = app.package_info().version.to_string();
+  let Some(repo) = update_repo() else {
+    return Ok(disabled_check_result(&current_version));
+  };
   let platform_key = crate::platform::current_platform_name();
   let user_agent = format!("multi-agent-account-manager/{current_version}");
 
-  if let Ok((200..=299, body)) =
-    fetch_text_with_status(app, LATEST_MANIFEST_URL, &user_agent, Some("application/json")).await
+  if let Ok((200..=299, body)) = fetch_text_with_status(
+    app,
+    &latest_manifest_url(&repo),
+    &user_agent,
+    Some("application/json"),
+  )
+  .await
   {
     if let Ok(manifest) = serde_json::from_str::<LatestManifest>(&body) {
       let latest_version = clean_version(&manifest.version).to_string();
@@ -354,14 +499,15 @@ pub async fn check_for_updates(app: &AppHandle) -> Result<UpdateCheckResult, Str
         size: asset.and_then(|a| a.size),
         release_page_url: manifest
           .release_page_url
-          .unwrap_or_else(|| RELEASES_PAGE_URL.to_string()),
+          .unwrap_or_else(|| releases_page_url(&repo)),
+        updates_disabled: false,
       });
     }
   }
 
   let (status, body) = fetch_text_with_status(
     app,
-    GITHUB_LATEST_API_URL,
+    &github_latest_api_url(&repo),
     &user_agent,
     Some("application/vnd.github+json"),
   )
@@ -378,7 +524,8 @@ pub async fn check_for_updates(app: &AppHandle) -> Result<UpdateCheckResult, Str
       sha256: None,
       filename: None,
       size: None,
-      release_page_url: RELEASES_PAGE_URL.to_string(),
+      release_page_url: releases_page_url(&repo),
+      updates_disabled: false,
     });
   }
 
@@ -406,9 +553,8 @@ pub async fn check_for_updates(app: &AppHandle) -> Result<UpdateCheckResult, Str
     sha256: asset.and_then(|a| extract_sha256_digest(a.digest.as_deref())),
     filename: asset.map(|a| a.name.clone()),
     size: asset.map(|a| a.size),
-    release_page_url: release
-      .html_url
-      .unwrap_or_else(|| RELEASES_PAGE_URL.to_string()),
+    release_page_url: release.html_url.unwrap_or_else(|| releases_page_url(&repo)),
+    updates_disabled: false,
   })
 }
 
@@ -437,7 +583,7 @@ fn emit_progress(
 async fn download_to_updates_cache(
   app: &AppHandle,
   url: &str,
-  expected_sha256: Option<&str>,
+  expected_sha256: &str,
   filename: &str,
   user_agent: &str,
 ) -> Result<(std::path::PathBuf, u64), String> {
@@ -453,15 +599,15 @@ async fn download_to_updates_cache(
   std::fs::create_dir_all(&updates_dir).map_err(|e| format!("创建更新目录失败: {e}"))?;
 
   let dest_path = updates_dir.join(filename);
-  let expected_hex = extract_sha256_digest(expected_sha256);
+  // sha256 必填：非法值在调用方已拒绝，这里再校验一次。
+  let expected_hex = require_expected_sha256(Some(expected_sha256))?;
 
-  if let Some(ref want) = expected_hex {
-    if dest_path.is_file() {
-      if let Ok(actual) = compute_file_sha256_hex(&dest_path) {
-        if actual == *want {
-          let len = std::fs::metadata(&dest_path).map(|m| m.len()).unwrap_or(0);
-          return Ok((dest_path, len));
-        }
+  // 缓存复用只在哈希一致时成立。
+  if dest_path.is_file() {
+    if let Ok(actual) = compute_file_sha256_hex(&dest_path) {
+      if actual == expected_hex {
+        let len = std::fs::metadata(&dest_path).map(|m| m.len()).unwrap_or(0);
+        return Ok((dest_path, len));
       }
     }
   }
@@ -469,7 +615,14 @@ async fn download_to_updates_cache(
   let part_path = updates_dir.join(format!("{filename}.part"));
   let _ = std::fs::remove_file(&part_path);
 
-  emit_progress(app, "downloading", 0, None, Some(0), "正在连接下载服务器...");
+  emit_progress(
+    app,
+    "downloading",
+    0,
+    None,
+    Some(0),
+    "正在连接下载服务器...",
+  );
 
   let client = build_http_client(user_agent, 600)?;
   let mut resp = client
@@ -493,14 +646,10 @@ async fn download_to_updates_cache(
   let mut last_emit = std::time::Instant::now();
   let mut last_percent: Option<u8> = None;
 
-  while let Some(chunk) = resp
-    .chunk()
-    .await
-    .map_err(|e| {
-      let _ = std::fs::remove_file(&part_path);
-      format!("读取下载数据失败: {e}")
-    })?
-  {
+  while let Some(chunk) = resp.chunk().await.map_err(|e| {
+    let _ = std::fs::remove_file(&part_path);
+    format!("读取下载数据失败: {e}")
+  })? {
     file.write_all(&chunk).map_err(|e| {
       let _ = std::fs::remove_file(&part_path);
       format!("写入临时更新文件失败: {e}")
@@ -509,10 +658,19 @@ async fn download_to_updates_cache(
     downloaded = downloaded.saturating_add(chunk.len() as u64);
 
     let pct = total.map(|t| ((downloaded.saturating_mul(100)) / t).min(100) as u8);
-    if last_emit.elapsed() >= std::time::Duration::from_millis(150) || (pct.is_some() && pct != last_percent) {
+    if last_emit.elapsed() >= std::time::Duration::from_millis(150)
+      || (pct.is_some() && pct != last_percent)
+    {
       last_emit = std::time::Instant::now();
       last_percent = pct;
-      emit_progress(app, "downloading", downloaded, total, pct, "正在下载更新包...");
+      emit_progress(
+        app,
+        "downloading",
+        downloaded,
+        total,
+        pct,
+        "正在下载更新包...",
+      );
     }
   }
 
@@ -529,11 +687,9 @@ async fn download_to_updates_cache(
   );
 
   let actual_hex = format!("{:x}", hasher.finalize());
-  if let Some(want) = expected_hex {
-    if actual_hex != want {
-      let _ = std::fs::remove_file(&part_path);
-      return Err("更新包 SHA-256 校验失败，请重试".to_string());
-    }
+  if actual_hex != expected_hex {
+    let _ = std::fs::remove_file(&part_path);
+    return Err("更新包 SHA-256 校验失败，请重试".to_string());
   }
 
   if dest_path.exists() {
@@ -612,6 +768,41 @@ fn has_write_permission(dir: &std::path::Path) -> bool {
   }
 }
 
+/// macOS 覆盖更新用的 swap 脚本（仅 macOS 与测试目标可见，便于单元
+/// 测试检查回滚与超时逻辑；只在 macOS 安装分支使用）。
+/// 参数：$1 旧进程 pid、$2 新 .app、$3 目标 .app、$4 解压目录。
+/// 行为：等旧进程退出（最多 10 秒，超时直接 exit 2 中止，不替换）；
+/// 替换失败时先 rm -rf 目标（清掉跨卷失败留下的半截目录）再把备份移回。
+#[cfg(any(target_os = "macos", test))]
+const MACOS_SWAP_SCRIPT: &str = r#"pid="$1"
+src_app="$2"
+dst_app="$3"
+extract_dir="$4"
+i=0
+while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 100 ]; do
+  sleep 0.1
+  i=$((i + 1))
+done
+if kill -0 "$pid" 2>/dev/null; then
+  exit 2
+fi
+backup="${dst_app}.maam-backup.$$"
+rm -rf "$backup" 2>/dev/null || true
+if [ -e "$dst_app" ]; then
+  mv "$dst_app" "$backup" || exit 1
+fi
+if mv "$src_app" "$dst_app"; then
+  rm -rf "$backup" "$extract_dir" 2>/dev/null || true
+  /usr/bin/xattr -dr com.apple.quarantine "$dst_app" 2>/dev/null || true
+  /usr/bin/open -n "$dst_app"
+else
+  if [ -e "$backup" ]; then
+    rm -rf "$dst_app" 2>/dev/null || true
+    mv "$backup" "$dst_app" 2>/dev/null || true
+  fi
+  exit 1
+fi"#;
+
 #[cfg(target_os = "macos")]
 async fn install_macos_update(
   app: &AppHandle,
@@ -661,8 +852,7 @@ async fn install_macos_update(
     if extract_dir_for_task.exists() {
       let _ = std::fs::remove_dir_all(&extract_dir_for_task);
     }
-    std::fs::create_dir_all(&extract_dir_for_task)
-      .map_err(|e| format!("创建解压目录失败: {e}"))?;
+    std::fs::create_dir_all(&extract_dir_for_task).map_err(|e| format!("创建解压目录失败: {e}"))?;
 
     let status = std::process::Command::new("/usr/bin/tar")
       .arg("-xzf")
@@ -695,10 +885,11 @@ async fn install_macos_update(
     }
 
     let app_bundle = found_app.ok_or_else(|| "更新包中未找到 .app 应用目录".to_string())?;
-    let _ = std::process::Command::new("/usr/bin/xattr")
-      .args(["-dr", "com.apple.quarantine"])
-      .arg(&app_bundle)
-      .status();
+    // 注意：不要在这里去隔离属性。去隔离只在 swap 脚本成功替换后
+    // 执行一次（见 install_macos_update 的 swap 脚本）；而哈希校验
+    // 已在下载步骤（download_to_updates_cache）完成，去隔离发生在
+    // 校验通过之后。解压后立即去隔离会让未经替换的新 .app 在校验
+    // 链外就绕过 Gatekeeper。
     Ok(app_bundle)
   })
   .await
@@ -727,30 +918,7 @@ async fn install_macos_update(
     });
   }
 
-  let swap_script = r#"pid="$1"
-src_app="$2"
-dst_app="$3"
-extract_dir="$4"
-i=0
-while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 100 ]; do
-  sleep 0.1
-  i=$((i + 1))
-done
-backup="${dst_app}.maam-backup.$$"
-rm -rf "$backup" 2>/dev/null || true
-if [ -e "$dst_app" ]; then
-  mv "$dst_app" "$backup" || exit 1
-fi
-if mv "$src_app" "$dst_app"; then
-  rm -rf "$backup" "$extract_dir" 2>/dev/null || true
-  /usr/bin/xattr -dr com.apple.quarantine "$dst_app" 2>/dev/null || true
-  /usr/bin/open -n "$dst_app"
-else
-  if [ -e "$backup" ] && [ ! -e "$dst_app" ]; then
-    mv "$backup" "$dst_app" 2>/dev/null || true
-  fi
-  exit 1
-fi"#;
+  let swap_script = MACOS_SWAP_SCRIPT;
 
   std::process::Command::new("/bin/sh")
     .arg("-c")
@@ -825,24 +993,75 @@ async fn install_windows_update(
   })
 }
 
+/// 安装时按最新清单重新核对前端传来的请求：只接受与清单一致的
+/// version / download_url / sha256 / filename，不再信任前端传值。
+/// 返回本次安装应使用的文件名（已清洗）。
+fn verify_install_request_against_manifest(
+  req: &InstallUpdateRequest,
+  expected_sha: &str,
+  manifest: &UpdateCheckResult,
+) -> Result<String, String> {
+  if manifest.updates_disabled {
+    return Err("未配置更新源，无法核对更新清单".to_string());
+  }
+  if clean_version(&req.version) != manifest.latest_version {
+    return Err("请求安装的版本与最新更新清单不一致，请重新检查更新".to_string());
+  }
+  let Some(manifest_url) = manifest.download_url.as_deref() else {
+    return Err("最新更新清单中没有本平台的安装包".to_string());
+  };
+  if manifest_url != req.download_url {
+    return Err("下载地址与最新更新清单不一致，拒绝安装".to_string());
+  }
+  let Some(manifest_sha) = manifest.sha256.as_deref() else {
+    return Err("最新更新清单中缺少 SHA-256，拒绝安装".to_string());
+  };
+  if manifest_sha != expected_sha {
+    return Err("SHA-256 与最新更新清单不一致，拒绝安装".to_string());
+  }
+  let filename = match manifest.filename.as_deref() {
+    Some(manifest_name) => {
+      let wanted = sanitize_filename(Some(manifest_name), "");
+      let given = sanitize_filename(req.filename.as_deref(), "");
+      if !given.is_empty() && given != wanted {
+        return Err("文件名与最新更新清单不一致，拒绝安装".to_string());
+      }
+      wanted
+    }
+    None => sanitize_filename(
+      req.filename.as_deref(),
+      &default_filename_for_platform(&req.version, manifest_url),
+    ),
+  };
+  if filename.is_empty() {
+    return Err("无法确定安装包文件名".to_string());
+  }
+  Ok(filename)
+}
+
 pub async fn download_and_install_update(
   app: &AppHandle,
   req: InstallUpdateRequest,
 ) -> Result<InstallUpdateOutcome, String> {
-  let validated_url = validate_download_url(&req.download_url)?;
+  let Some(repo) = update_repo() else {
+    return Err("未配置更新源（编译时未设置 MAAM_UPDATE_REPO），无法下载更新".to_string());
+  };
+  let validated_url = validate_download_url(&req.download_url, &repo)?;
+  // sha256 必填：所有平台分支共用的关口，缺失直接拒绝。
+  let expected_sha = require_expected_sha256(req.sha256.as_deref())?;
   let _guard = UpdateLockGuard::try_acquire()?;
+  // 安装时重新取最新清单核对，不再信任前端传来的 url / sha256 / 文件名。
+  let manifest = check_for_updates(app).await?;
+  let filename = verify_install_request_against_manifest(&req, &expected_sha, &manifest)?;
   let current_version = app.package_info().version.to_string();
   let user_agent = format!("multi-agent-account-manager/{current_version}");
-  let fallback_name = default_filename_for_platform(&req.version, validated_url.as_str());
-  let filename = sanitize_filename(req.filename.as_deref(), &fallback_name);
 
   #[cfg(target_os = "android")]
   {
-    let sha = extract_sha256_digest(req.sha256.as_deref());
     let res = crate::platform::mobile::download_and_install_apk(
       app,
       validated_url.as_str(),
-      sha.as_deref(),
+      Some(expected_sha.as_str()),
       &filename,
       &user_agent,
     )
@@ -855,7 +1074,9 @@ pub async fn download_and_install_update(
 
   #[cfg(target_os = "ios")]
   {
-    let _ = (filename, user_agent);
+    // iOS 只打开下载地址（Safari 内下载、用户自签安装），无法在应用内
+    // 校验 IPA；但请求仍须携带 sha256（上方统一关口），缺失即拒绝。
+    let _ = (filename, user_agent, &expected_sha);
     crate::platform::mobile::open_external_url(app, validated_url.as_str()).await?;
     Ok(InstallUpdateOutcome {
       status: "installer_launched".to_string(),
@@ -868,7 +1089,7 @@ pub async fn download_and_install_update(
     let (dest_path, downloaded) = match download_to_updates_cache(
       app,
       validated_url.as_str(),
-      req.sha256.as_deref(),
+      &expected_sha,
       &filename,
       &user_agent,
     )
@@ -916,11 +1137,52 @@ pub async fn download_and_install_update(
   }
 }
 
-pub async fn open_external_url(app: &AppHandle, raw_url: &str) -> Result<(), String> {
-  let parsed = Url::parse(raw_url.trim()).map_err(|_| "无效的链接地址".to_string())?;
+/// 「发布页」只允许打开配置仓库的 Releases 页：
+/// `https://github.com/<owner>/<repo>/releases` 或
+/// `https://github.com/<owner>/<repo>/releases/tag/<tag>`。
+/// 旧实现只校验 scheme 为 https：清单里的 release_page_url 未经核对，
+/// 前端传任意 https 链接都会被打开（P2 第二轮审查新发现，确认成立——
+/// 唯一调用方是更新弹窗的「发布页」按钮，URL 来自清单）。
+fn validate_releases_page_url(raw: &str, repo: &str) -> Result<Url, String> {
+  let parsed = Url::parse(raw.trim()).map_err(|_| "无效的发布页地址".to_string())?;
   if parsed.scheme() != "https" {
     return Err("仅支持打开 HTTPS 链接".to_string());
   }
+  if !parsed.username().is_empty()
+    || parsed.password().is_some()
+    || parsed.query().is_some()
+    || parsed.fragment().is_some()
+  {
+    return Err("发布页地址不得包含用户信息、查询参数或片段".to_string());
+  }
+  let host = parsed.host_str().unwrap_or("");
+  if !host.eq_ignore_ascii_case("github.com") {
+    return Err(format!("不支持的发布页主机: {host}"));
+  }
+  let (owner, name) = repo.split_once('/').unwrap_or(("", ""));
+  let segments: Vec<String> = parsed
+    .path_segments()
+    .map(|s| s.map(str::to_string).collect())
+    .unwrap_or_default();
+  let is_releases_page = segments.len() >= 3
+    && segments[0].eq_ignore_ascii_case(owner)
+    && segments[1].eq_ignore_ascii_case(name)
+    && segments[2].eq_ignore_ascii_case("releases")
+    && (segments.len() == 3
+      || (segments.len() >= 5
+        && segments[3].eq_ignore_ascii_case("tag")
+        && !segments[4].is_empty()));
+  if !is_releases_page {
+    return Err("发布页地址必须位于配置仓库的 Releases 下".to_string());
+  }
+  Ok(parsed)
+}
+
+pub async fn open_external_url(app: &AppHandle, raw_url: &str) -> Result<(), String> {
+  let Some(repo) = update_repo() else {
+    return Err("未配置更新源，无法打开发布页".to_string());
+  };
+  let parsed = validate_releases_page_url(raw_url, &repo)?;
 
   #[cfg(desktop)]
   {
@@ -931,5 +1193,325 @@ pub async fn open_external_url(app: &AppHandle, raw_url: &str) -> Result<(), Str
   #[cfg(mobile)]
   {
     crate::platform::mobile::open_external_url(app, parsed.as_str()).await
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn parse_update_repo_accepts_owner_slash_repo() {
+    assert_eq!(
+      parse_update_repo("ldjx7/multi-agent-account-manager"),
+      Some("ldjx7/multi-agent-account-manager".to_string())
+    );
+    assert_eq!(
+      parse_update_repo("  my-org/my_repo.v2  "),
+      Some("my-org/my_repo.v2".to_string())
+    );
+  }
+
+  #[test]
+  fn parse_update_repo_rejects_bad_shapes() {
+    for raw in [
+      "",
+      "onlyowner",
+      "a/b/c",
+      "/repo",
+      "owner/",
+      "owner/repo with space",
+      "owner/repo?x=1",
+      "https://github.com/owner/repo",
+    ] {
+      assert_eq!(parse_update_repo(raw), None, "应拒绝: {raw}");
+    }
+  }
+
+  #[test]
+  fn update_repo_urls_derive_from_configured_repo() {
+    let repo = "my-org/my-fork";
+    assert_eq!(
+      latest_manifest_url(repo),
+      "https://github.com/my-org/my-fork/releases/latest/download/latest.json"
+    );
+    assert_eq!(
+      github_latest_api_url(repo),
+      "https://api.github.com/repos/my-org/my-fork/releases/latest"
+    );
+    assert_eq!(
+      releases_page_url(repo),
+      "https://github.com/my-org/my-fork/releases"
+    );
+  }
+
+  #[test]
+  fn disabled_check_result_reports_updates_off() {
+    let res = disabled_check_result("0.1.10");
+    assert!(res.updates_disabled);
+    assert!(!res.has_update);
+    assert_eq!(res.current_version, "0.1.10");
+    assert_eq!(res.latest_version, "0.1.10");
+    assert!(res.download_url.is_none());
+    assert!(res.sha256.is_none());
+    assert!(res.release_page_url.is_empty());
+  }
+
+  #[test]
+  fn is_newer_version_compares_prereleases() {
+    // 任务书 P0-2-8：1.0.0-rc.1 → 1.0.0-rc.2 必须为 true。
+    assert!(is_newer_version("1.0.0-rc.1", "1.0.0-rc.2"));
+    assert!(is_newer_version("1.0.0-rc.1", "1.0.0"));
+    assert!(is_newer_version("1.0.0-alpha", "1.0.0-alpha.1"));
+    assert!(!is_newer_version("1.0.0", "1.0.0-rc.1"));
+    assert!(!is_newer_version("1.0.0-rc.2", "1.0.0-rc.1"));
+  }
+
+  #[test]
+  fn is_newer_version_handles_short_and_prefixed_versions() {
+    assert!(is_newer_version("1.2", "1.10"));
+    assert!(is_newer_version("v1.2.3", "1.2.4"));
+    assert!(!is_newer_version("1.0.0", "1.0.0"));
+    assert!(!is_newer_version("1.0.0+build1", "1.0.0+build2"));
+    assert!(is_newer_version("1.0.0", "1.0.1"));
+    assert!(!is_newer_version("2.0.0", "1.9.9"));
+  }
+
+  const TEST_REPO: &str = "my-org/my-fork";
+
+  #[test]
+  fn validate_download_url_accepts_configured_repo_release() {
+    let url = validate_download_url(
+      "https://github.com/my-org/my-fork/releases/download/v0.1.10/account-manager-0.1.10-macos.app.tar.gz",
+      TEST_REPO,
+    )
+    .expect("合法地址应通过");
+    assert_eq!(url.host_str(), Some("github.com"));
+  }
+
+  #[test]
+  fn validate_download_url_rejects_other_repos_and_spoof_hosts() {
+    for raw in [
+      // 其他用户仓库
+      "https://github.com/other-user/other-repo/releases/download/v1.0.0/app.tar.gz",
+      // http://
+      "http://github.com/my-org/my-fork/releases/download/v1.0.0/app.tar.gz",
+      // 子域名伪装
+      "https://github.com.evil.com/my-org/my-fork/releases/download/v1.0.0/app.tar.gz",
+      // userinfo 伪装
+      "https://github.com@evil.com/my-org/my-fork/releases/download/v1.0.0/app.tar.gz",
+      // 后缀伪装
+      "https://evilgithub.com/my-org/my-fork/releases/download/v1.0.0/app.tar.gz",
+      // 无文件名
+      "https://github.com/my-org/my-fork/releases/download/",
+      // 同 owner 不同仓库
+      "https://github.com/my-org/other-repo/releases/download/v1.0.0/app.tar.gz",
+      // 非 download 路径
+      "https://github.com/my-org/my-fork/releases/tag/v1.0.0",
+      // 重定向目标主机不作为初始下载地址（只允许出现在重定向链中）
+      "https://objects.githubusercontent.com/1234/app.tar.gz",
+    ] {
+      assert!(
+        validate_download_url(raw, TEST_REPO).is_err(),
+        "应拒绝: {raw}"
+      );
+    }
+  }
+
+  #[test]
+  fn require_expected_sha256_rejects_missing_or_malformed() {
+    // 缺失直接拒绝：覆盖桌面端与 Android 分支（Rust 侧单点关口）。
+    assert!(require_expected_sha256(None).is_err());
+    assert!(require_expected_sha256(Some("")).is_err());
+    assert!(require_expected_sha256(Some("abc")).is_err());
+    assert!(require_expected_sha256(Some("zz".repeat(32).as_str())).is_err());
+    assert!(require_expected_sha256(Some("aa".repeat(31).as_str())).is_err());
+  }
+
+  #[test]
+  fn require_expected_sha256_normalizes_valid_hex() {
+    let lower = "ab".repeat(32);
+    assert_eq!(
+      require_expected_sha256(Some(&lower)).as_deref(),
+      Ok(lower.as_str())
+    );
+    assert_eq!(
+      require_expected_sha256(Some(&format!("SHA256:{}", lower.to_ascii_uppercase()))).as_deref(),
+      Ok(lower.as_str())
+    );
+  }
+
+  fn test_manifest() -> UpdateCheckResult {
+    UpdateCheckResult {
+      current_version: "0.1.9".to_string(),
+      latest_version: "0.1.10".to_string(),
+      has_update: true,
+      release_notes: String::new(),
+      pub_date: None,
+      download_url: Some(
+        "https://github.com/my-org/my-fork/releases/download/v0.1.10/app.tar.gz".to_string(),
+      ),
+      sha256: Some("ab".repeat(32)),
+      filename: Some("app.tar.gz".to_string()),
+      size: Some(123),
+      release_page_url: "https://github.com/my-org/my-fork/releases".to_string(),
+      updates_disabled: false,
+    }
+  }
+
+  fn test_request() -> InstallUpdateRequest {
+    InstallUpdateRequest {
+      version: "0.1.10".to_string(),
+      download_url: "https://github.com/my-org/my-fork/releases/download/v0.1.10/app.tar.gz"
+        .to_string(),
+      sha256: Some("ab".repeat(32)),
+      filename: Some("app.tar.gz".to_string()),
+    }
+  }
+
+  #[test]
+  fn verify_install_request_accepts_matching_manifest() {
+    let req = test_request();
+    let manifest = test_manifest();
+    let filename =
+      verify_install_request_against_manifest(&req, &"ab".repeat(32), &manifest).expect("应通过");
+    assert_eq!(filename, "app.tar.gz");
+    // 前端未传文件名时用清单的文件名。
+    let mut no_name = test_request();
+    no_name.filename = None;
+    assert_eq!(
+      verify_install_request_against_manifest(&no_name, &"ab".repeat(32), &manifest)
+        .expect("应通过"),
+      "app.tar.gz"
+    );
+  }
+
+  #[test]
+  fn verify_install_request_rejects_any_mismatch() {
+    let sha = "ab".repeat(32);
+    let manifest = test_manifest();
+    let mut req = test_request();
+
+    req.version = "0.1.9".to_string();
+    assert!(verify_install_request_against_manifest(&req, &sha, &manifest).is_err());
+    req.version = "v0.1.10".to_string();
+    assert!(verify_install_request_against_manifest(&req, &sha, &manifest).is_ok());
+
+    let mut req = test_request();
+    req.download_url =
+      "https://github.com/my-org/my-fork/releases/download/v0.1.10/other.tar.gz".to_string();
+    assert!(verify_install_request_against_manifest(&req, &sha, &manifest).is_err());
+
+    let mut req = test_request();
+    req.filename = Some("evil.tar.gz".to_string());
+    assert!(verify_install_request_against_manifest(&req, &sha, &manifest).is_err());
+
+    let mut manifest = test_manifest();
+    manifest.sha256 = None;
+    assert!(verify_install_request_against_manifest(&test_request(), &sha, &manifest).is_err());
+
+    let mut manifest = test_manifest();
+    manifest.download_url = None;
+    assert!(verify_install_request_against_manifest(&test_request(), &sha, &manifest).is_err());
+
+    let mut manifest = test_manifest();
+    manifest.updates_disabled = true;
+    assert!(verify_install_request_against_manifest(&test_request(), &sha, &manifest).is_err());
+
+    assert!(verify_install_request_against_manifest(
+      &test_request(),
+      &"cd".repeat(32),
+      &test_manifest()
+    )
+    .is_err());
+  }
+
+  #[test]
+  fn redirect_target_must_be_https_and_allowlisted() {
+    // 合法的重定向目标（任务书 P0-2-4 的用例）。
+    for raw in [
+      "https://github.com/my-org/my-fork/releases/download/v1.0.0/app.tar.gz",
+      "https://api.github.com/repos/my-org/my-fork/releases/latest",
+      "https://objects.githubusercontent.com/123456/app.tar.gz?X-Amz-Algorithm=AWS4-HMAC-SHA256",
+      "https://release-assets.githubusercontent.com/123456/app.tar.gz",
+    ] {
+      let url = Url::parse(raw).expect("测试地址应合法");
+      assert!(is_allowed_redirect_target(&url), "应放行: {raw}");
+    }
+    for raw in [
+      "http://github.com/my-org/my-fork/releases/download/v1.0.0/app.tar.gz",
+      "https://evil.com/app.tar.gz",
+      "https://github.com.evil.com/app.tar.gz",
+      "https://objects.githubusercontent.com.evil.com/app.tar.gz",
+      "https://sub.github.com/app.tar.gz",
+      "https://githubusercontent.com/app.tar.gz",
+    ] {
+      let url = Url::parse(raw).expect("测试地址应合法");
+      assert!(!is_allowed_redirect_target(&url), "应拒绝: {raw}");
+    }
+  }
+
+  #[test]
+  fn macos_swap_script_aborts_when_old_process_wont_exit() {
+    // 10 秒等待后旧进程仍在即中止，不做任何替换。
+    let wait_end = MACOS_SWAP_SCRIPT
+      .find("i=$((i + 1))")
+      .expect("应有等待循环");
+    let abort = MACOS_SWAP_SCRIPT.find("exit 2").expect("应有超时中止");
+    let backup = MACOS_SWAP_SCRIPT.find("maam-backup").expect("应有备份逻辑");
+    assert!(wait_end < abort && abort < backup);
+  }
+
+  #[test]
+  fn macos_swap_script_rollback_removes_partial_target_first() {
+    // 旧回滚条件 [ ! -e "$dst_app" ] 在跨卷失败留下半截目录时不成立。
+    assert!(!MACOS_SWAP_SCRIPT.contains("[ ! -e \"$dst_app\" ]"));
+    let remove = MACOS_SWAP_SCRIPT
+      .find("rm -rf \"$dst_app\"")
+      .expect("回滚应先删目标");
+    let restore = MACOS_SWAP_SCRIPT
+      .find("mv \"$backup\" \"$dst_app\"")
+      .expect("回滚应把备份移回");
+    assert!(remove < restore);
+    // 替换成功后仍去隔离（P0-2-5 保留的那一次）。
+    assert!(MACOS_SWAP_SCRIPT.contains("/usr/bin/xattr -dr com.apple.quarantine \"$dst_app\""));
+  }
+
+  #[test]
+  fn releases_page_url_accepts_configured_repo_releases() {
+    for raw in [
+      "https://github.com/my-org/my-fork/releases",
+      "https://github.com/my-org/my-fork/releases/tag/v0.1.10",
+      "https://github.com/My-Org/My-Fork/releases/tag/v0.1.10",
+    ] {
+      validate_releases_page_url(raw, TEST_REPO).expect("应通过");
+    }
+  }
+
+  #[test]
+  fn releases_page_url_rejects_anything_else() {
+    for raw in [
+      // 其他仓库
+      "https://github.com/other-user/other-repo/releases",
+      // http://
+      "http://github.com/my-org/my-fork/releases",
+      // 子域名伪装
+      "https://github.com.evil.com/my-org/my-fork/releases",
+      // userinfo 伪装
+      "https://github.com@evil.com/my-org/my-fork/releases",
+      // 仓库根目录
+      "https://github.com/my-org/my-fork",
+      // 其他路径
+      "https://github.com/my-org/my-fork/issues",
+      // 下载地址不是页面
+      "https://github.com/my-org/my-fork/releases/download/v0.1.10/app.tar.gz",
+      // 任意 https 外站
+      "https://evil.example.com/phishing",
+    ] {
+      assert!(
+        validate_releases_page_url(raw, TEST_REPO).is_err(),
+        "应拒绝: {raw}"
+      );
+    }
   }
 }
