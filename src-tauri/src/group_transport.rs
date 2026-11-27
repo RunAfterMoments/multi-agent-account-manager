@@ -1949,7 +1949,15 @@ mod tests {
     std::env::set_var("PATH", &old_path);
     let _ = std::fs::remove_dir_all(&dir);
     let path = found.expect("应在 PATH 里找到 .cmd 垫片");
-    assert_eq!(path, shim);
+    // Windows 文件系统不区分大小写：解析器按 PATHEXT（大写 .CMD）拼出
+    // 的候选路径，与实际创建的小写 .cmd 是同一文件，断言只比大小写
+    // 无关的相等，不能要求扩展名大小写逐字相同。
+    assert!(
+      path
+        .to_string_lossy()
+        .eq_ignore_ascii_case(&shim.to_string_lossy()),
+      "解析到的垫片应与创建的文件同一路径（不区分大小写）：{path:?} vs {shim:?}"
+    );
     assert!(super::resolve_cli_executable("maam-definitely-not-installed-xyz").is_err());
   }
 
