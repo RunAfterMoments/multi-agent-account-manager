@@ -1907,3 +1907,39 @@ check 上会多 3 条 `dead_code`/`unused import` 警告。全部补
 
 - Windows 真机复测：折叠侧边栏后切号是否零黑闪（主验证项）、最大化/改 DPI 后切号、群聊消息同步/沉淀按钮在触屏上可点——需用户在 Win 机上跑（本机无 Windows，也无触屏）。
 - 未升版本号、未打 tag——v1.0.0 正式切版等 macOS/Android/iOS 三端验收都 Go；minisign 的事未碰（仍等用户定）。
+
+## 二十五、切号后新账号页离线、要点一下才恢复联网（Phase 4 验收，用户真机反馈，2026-11-27 晚）
+
+### 1. 症状
+
+用户 Win11 真机（rc1 二进制）：切号后新账号的页面处于非联网状态，必须在页面上点一下才能恢复联网。
+
+### 2. 根因（已核实，不是 0d556da 的重排引入的）
+
+切号只 `show()` 新账号 WebView，从不给它键盘焦点：
+
+- `apply_desktop_layout_locked`（`webview.rs`）的新号分支只调 `acc_wv.set_bounds()` + `acc_wv.show()`，全仓库切号/布局路径里唯一的 `set_focus()` 是弹窗时对 manager 的那一次（`webview.rs:405`）；账号 WebView 创建时 builder 还设了 `.focused(false)`。rc1（tag `v1.0.0-rc1`）同款形状（整个 `webview.rs` 只有 1 处 `set_focus`，也是 manager 的），所以缺陷在 rc1 上就已存在，与 0d556da 把顺序改成“先显新号、再藏旧号”无关——重排只动了显/藏顺序，没碰焦点。
+- 切号时用户的点击落在左侧管理页，焦点一直留在 manager WebView 里；新账号页看得见、但 `document.hasFocus()` 为 false，收不到 `window focus` 事件。
+- 账号页在热池里隐藏期间被 Chromium 后台节流，SSE/心跳断开后多半只在 `window focus` 时重连（服务商页面常见行为；本仓库的群聊唤醒代码已在探查“正在连接|连接中|Connecting|Reconnecting|离线|重连中”这类文本，说明后台页变 stale 是已知现象）。`show()` 本身会经 wry 的 `SetIsVisible(true)` 触发一次真实 `visibilitychange`（vendored wry 0.57.2 `set_visible`，`ShowWindow` + `controller.SetIsVisible` 双管齐下），所以缺的不是可见性事件，而是焦点事件——页面不重连、一直显示离线；点一下页面正好给了 WebView2 焦点（`MoveFocus`）并触发 `focus`，于是恢复。症状与机制一一对应。
+- 补充核实：`BackgroundThrottlingPolicy::Disabled` 在 Windows 上是空操作——wry 0.57.2 的 webview2 后端根本不消费 `background_throttling` 属性（只在别处存着），所以隐藏的热池页默认就被 Chromium 节流；群聊页的 `wake_and_settle_group_webview`（`group_chat.rs:3547`，合成 `focus` + `visibilitychange` + `pageshow` 并轮询“连接中”文本）只服务于群聊成员页（隐藏着用），切号路径从未对账号页做过等价唤醒。
+
+### 3. 修复（`session_manager.rs` + `webview.rs`，2 文件）
+
+- `InnerState` 新增 `last_focused_account_label: Cell<Option<String>>`（`session_manager.rs`，沿用 `last_desktop_right_rect` 的 Cell 模式：`apply_desktop_layout_locked` 有 18 处调用点且只拿到 `&InnerState`；InnerState 只在 tokio Mutex 锁内访问，Cell 安全）。
+- `apply_desktop_layout_locked` 末尾（藏旧号循环之后，避免藏旧号扰动焦点归属）：有已提交槽位时，把当前 label 记入缓存；label 变化且非弹窗态时，对新账号 WebView 调一次 `acc_wv.set_focus()`（Tauri `Webview::set_focus` → wry `focus()` → `MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC)`，vendored wry 0.57.2:1670 核对过）。弹窗打开时不抢焦点（管理页保持焦点），label 照常记入缓存，关弹窗后不再补聚焦；无已提交槽位时清空缓存，下次切号重新聚焦。
+- 只聚焦、不补合成唤醒事件：前台账号页有原生焦点可用，`set_focus()` 发的是真实 `focus` 事件且 `document.hasFocus()` 为真，比群聊路径的合成事件更忠实于“点一下页面”的效果；不加猜测性的刷新兜底。
+- 覆盖所有切号路径：InstantWarm / AwaitWarmLoading / StageWarmPaint 定稿 / CreateCold 定稿最终都走 `apply_desktop_layout_locked`，槽位变化即触发一次聚焦；窗口缩放/折叠等纯布局重算因 label 未变而不抢焦点。
+
+### 4. 验证（本机逐项重跑，全绿）
+
+- `cargo fmt --manifest-path src-tauri/Cargo.toml --check`：通过。
+- `cargo clippy --all-targets -- -D warnings`（Linux）：通过（仅 1 条基线 manifest 警告）。
+- `cargo clippy --target x86_64-pc-windows-gnu --all-targets -- -D warnings`：通过（仅 1 条基线 manifest 警告）。
+- `cargo test --lib`：**132/132**。
+- `npm run build`：通过；`npm run test:js`：**30/30**。
+- Gemini 当天仍不可用：本轮代码由协调人按核实过的设计直接写，每处 API 均对照真实源码与 vendored 源码核对（`Webview::set_focus` / wry `focus()` / `MoveFocus` 在 tauri 2.12.6 与 wry 0.57.2 中核对；`Cell::replace` 无 `Copy` 约束）。
+
+### 5. 已知未验证项
+
+- Windows 真机验证（本机无 Windows，焦点行为编不到也跑不了）：切号后**不要点页面**，看新账号页是否自动恢复联网（主验证项）。若个别服务商页面仍不自动恢复，需用户补充：是哪个服务商、点页面空白处即可还是必须点页面内的“重试”类元素——再定是否需要补合成唤醒事件。
+- 未升版本号、未打 tag——v1.0.0 正式切版等 macOS/Android/iOS 三端验收都 Go；minisign 的事未碰（仍等用户定）。

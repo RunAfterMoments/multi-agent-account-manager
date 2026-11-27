@@ -478,6 +478,28 @@ impl SessionManager {
         platform::raise_macos_webview_to_front(&mgr_wv);
       }
     }
+
+    // 切号后聚焦新账号 WebView（联网恢复）：账号页在热池里隐藏期间被
+    // Chromium 后台节流，断开的 SSE/心跳多半只在 window focus 时重连；
+    // 切号只 show 不 focus，焦点一直留在管理页，页面收不到 focus、
+    // 一直显示离线，点一下页面（获得焦点）才恢复。只在已提交槽位
+    // 变化时聚焦一次，避免窗口缩放/折叠等纯布局重算抢走管理页的焦点；
+    // 弹窗打开时不抢，管理页保持焦点。label 照常记入缓存，关弹窗后
+    // 不再补聚焦；无已提交槽位时清空缓存，下次切号重新聚焦。
+    // 放循环之后：先藏旧号再聚焦，避免藏旧号扰动焦点归属。
+    match active_committed_label.as_ref() {
+      Some(label) => {
+        let prev = locked
+          .last_focused_account_label
+          .replace(Some(label.clone()));
+        if prev.as_deref() != Some(label.as_str()) && !locked.modal_active {
+          if let Some(acc_wv) = app.get_webview(label) {
+            let _ = acc_wv.set_focus();
+          }
+        }
+      }
+      None => locked.last_focused_account_label.set(None),
+    }
   }
 
   #[cfg(desktop)]

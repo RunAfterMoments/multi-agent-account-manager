@@ -209,6 +209,13 @@ struct InnerState {
   /// Cell 在此是安全的。
   #[cfg(desktop)]
   last_desktop_right_rect: std::cell::Cell<Option<(u32, u32, u32)>>,
+  /// 上次获得过焦点的已提交账号 WebView label：切号后只在槽位变化时
+  /// 对新账号调一次 set_focus（切号联网恢复修复）。Cell 而非 &mut
+  /// InnerState：理由同 last_desktop_right_rect（apply_desktop_layout_locked
+  /// 有 18 处调用点且只拿到 &InnerState）；InnerState 只在 tokio Mutex
+  /// 锁内访问，Cell 在此是安全的。
+  #[cfg(desktop)]
+  last_focused_account_label: std::cell::Cell<Option<String>>,
   #[cfg_attr(not(desktop), allow(dead_code))]
   group_channel_last_account: HashMap<(String, ProviderId), AccountKey>,
   #[cfg_attr(not(desktop), allow(dead_code))]
@@ -335,6 +342,8 @@ impl SessionManager {
         a2a_relay_in_flight: HashMap::new(),
         #[cfg(desktop)]
         last_desktop_right_rect: std::cell::Cell::new(None),
+        #[cfg(desktop)]
+        last_focused_account_label: std::cell::Cell::new(None),
         group_channel_last_account: HashMap::new(),
         account_last_assigned_ms: HashMap::new(),
         account_cooldown_until_ms: HashMap::new(),
