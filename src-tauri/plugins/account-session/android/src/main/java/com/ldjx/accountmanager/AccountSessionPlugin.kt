@@ -4,13 +4,18 @@ import android.app.Activity
 import android.content.ClipData
 import android.content.ClipDescription
 import android.content.ClipboardManager
+import android.content.Context
 import android.content.Intent
+import android.content.SharedPreferences
 import android.net.Uri
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.PersistableBundle
 import android.provider.Settings
+import android.security.keystore.KeyGenParameterSpec
+import android.security.keystore.KeyProperties
+import android.util.Base64
 import androidx.core.content.FileProvider
 import androidx.webkit.ProfileStore
 import androidx.webkit.WebViewFeature
@@ -28,8 +33,19 @@ import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
+import java.security.KeyStore
 import java.security.MessageDigest
+import javax.crypto.Cipher
+import javax.crypto.KeyGenerator
+import javax.crypto.SecretKey
+import javax.crypto.spec.GCMParameterSpec
 import kotlin.concurrent.thread
+import org.json.JSONObject
+
+private const val API_KEY_ALIAS = "maam-api-key"
+private const val API_KEY_PREFS_NAME = "maam-api-keys"
+private const val API_KEY_GCM_IV_BYTES = 12
+private const val API_KEY_GCM_TAG_BITS = 128
 
 @InvokeArg
 class SubscribeEventsArgs {
@@ -105,6 +121,22 @@ class DownloadApkArgs {
 @InvokeArg
 class InstallApkArgs {
     var path: String = ""
+}
+
+@InvokeArg
+class StoreApiKeyArgs {
+    var keyRef: String = ""
+    var key: String = ""
+}
+
+@InvokeArg
+class LoadApiKeyArgs {
+    var keyRef: String = ""
+}
+
+@InvokeArg
+class DeleteApiKeyArgs {
+    var keyRef: String = ""
 }
 
 @TauriPlugin
@@ -601,6 +633,89 @@ class AccountSessionPlugin(private val activity: Activity) : Plugin(activity) {
             }
         }
     }
+
+    @Command
+    fun storeApiKey(invoke: Invoke) {
+        val args = invoke.parseArgs(StoreApiKeyArgs::class.java)
+        thread(name = "maam-api-key") {
+            try {
+                if (args.keyRef.isBlank()) {
+                    invoke.reject("API Key 标识不能为空")
+                    return@thread
+                }
+                val secretKey = getOrCreateApiKey()
+                val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+                cipher.init(Cipher.ENCRYPT_MODE, secretKey)
+                val iv = cipher.iv ?: throw IllegalStateException("无法生成加密 IV")
+                val ciphertext = cipher.doFinal(args.key.toByteArray(Charsets.UTF_8))
+                val stored = Base64.encodeToString(iv + ciphertext, Base64.NO_WRAP)
+                apiKeyPrefs().edit().putString(args.keyRef, stored).apply()
+                invoke.resolve(JSObject())
+            } catch (t: Throwable) {
+                invoke.reject("保存 API Key 失败")
+            }
+        }
+    }
+
+    @Command
+    fun loadApiKey(invoke: Invoke) {
+        val args = invoke.parseArgs(LoadApiKeyArgs::class.java)
+        thread(name = "maam-api-key") {
+            try {
+                if (args.keyRef.isBlank()) {
+                    invoke.reject("API Key 标识不能为空")
+                    return@thread
+                }
+                val stored = apiKeyPrefs().getString(args.keyRef, null)
+                if (stored == null) {
+                    val ret = JSObject().apply {
+                        put("value", JSONObject.NULL)
+                    }
+                    invoke.resolve(ret)
+                    return@thread
+                }
+                val combined = Base64.decode(stored, Base64.NO_WRAP)
+                if (combined.size <= API_KEY_GCM_IV_BYTES) {
+                    invoke.reject("已保存的 API Key 数据损坏，无法解密")
+                    return@thread
+                }
+                // 注意：这里只取密钥、不新建。条目存在但密钥丢失时解密注定失败，
+                // 按设计直接 reject，不静默删数据、不重建密钥。
+                val secretKey = getApiKey()
+                    ?: throw IllegalStateException("Android Keystore 密钥不可用")
+                val iv = combined.copyOfRange(0, API_KEY_GCM_IV_BYTES)
+                val ciphertext = combined.copyOfRange(API_KEY_GCM_IV_BYTES, combined.size)
+                val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+                cipher.init(Cipher.DECRYPT_MODE, secretKey, GCMParameterSpec(API_KEY_GCM_TAG_BITS, iv))
+                val plaintext = cipher.doFinal(ciphertext)
+                val ret = JSObject().apply {
+                    put("value", String(plaintext, Charsets.UTF_8))
+                }
+                invoke.resolve(ret)
+            } catch (t: Throwable) {
+                invoke.reject("读取 API Key 失败")
+            }
+        }
+    }
+
+    @Command
+    fun deleteApiKey(invoke: Invoke) {
+        val args = invoke.parseArgs(DeleteApiKeyArgs::class.java)
+        thread(name = "maam-api-key") {
+            try {
+                if (args.keyRef.isBlank()) {
+                    invoke.reject("API Key 标识不能为空")
+                    return@thread
+                }
+                // remove 不存在的 key 也是成功（SharedPreferences.Editor.remove 无此 key 时静默无操作）。
+                apiKeyPrefs().edit().remove(args.keyRef).apply()
+                invoke.resolve(JSObject())
+            } catch (t: Throwable) {
+                invoke.reject("删除 API Key 失败")
+            }
+        }
+    }
+
     private fun openHttpConnection(
         rawUrl: String,
         userAgent: String,
@@ -672,5 +787,29 @@ class AccountSessionPlugin(private val activity: Activity) : Plugin(activity) {
             }
         }
         return digest.digest().joinToString("") { "%02x".format(it) }
+    }
+
+    private fun apiKeyPrefs(): SharedPreferences {
+        return activity.getSharedPreferences(API_KEY_PREFS_NAME, Context.MODE_PRIVATE)
+    }
+
+    private fun getApiKey(): SecretKey? {
+        val keyStore = KeyStore.getInstance("AndroidKeyStore")
+        keyStore.load(null)
+        return keyStore.getKey(API_KEY_ALIAS, null) as? SecretKey
+    }
+
+    private fun getOrCreateApiKey(): SecretKey {
+        getApiKey()?.let { return it }
+        val spec = KeyGenParameterSpec.Builder(
+            API_KEY_ALIAS,
+            KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT,
+        ).setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+            .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+            .setKeySize(256)
+            .build()
+        val keyGenerator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore")
+        keyGenerator.init(spec)
+        return keyGenerator.generateKey()
     }
 }

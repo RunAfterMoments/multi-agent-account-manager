@@ -235,11 +235,7 @@ impl SessionManager {
       // 里，须先取回内存，否则恢复后重启前全部 401；旧备份的明文 Key
       // 须先写入 vault，否则 save_store_atomic 剥离 api_key 后永久丢失。
       // 写入失败时不写盘，换下一个候选。
-      let vault_dir = store_path
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("."));
-      if !migrate_agent_keys_to_vault(&mut loaded.store, &vault_dir) {
+      if !migrate_agent_keys_to_vault(&mut loaded.store, &self.api_key_vault).await {
         last_err = "API Key 写入系统凭据库失败，已停止恢复该备份（原备份未动）".to_string();
         continue;
       }

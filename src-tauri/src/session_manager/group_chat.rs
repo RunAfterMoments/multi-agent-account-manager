@@ -761,6 +761,7 @@ impl SessionManager {
           let vault = &self.api_key_vault;
           vault
             .store_key(&key_ref, &record.api_key)
+            .await
             .map_err(|e| format!("保存 API Key 到系统凭据库失败：{e}"))?;
         }
       }
@@ -810,10 +811,10 @@ impl SessionManager {
           let vault = &self.api_key_vault;
           match prev_api_key {
             Some(old) if !old.is_empty() => {
-              let _ = vault.store_key(&key_ref, &old);
+              let _ = vault.store_key(&key_ref, &old).await;
             }
             _ => {
-              vault.delete_key(&key_ref);
+              vault.delete_key(&key_ref).await;
             }
           }
         }
@@ -824,7 +825,7 @@ impl SessionManager {
     // P1-7 缺陷修复：kind 改为 local_cli 后旧 vault 条目成孤儿，保存成功后清理。
     if kind != ExternalAgentKind::OpenaiApi {
       if let Some(key_ref) = prev_key_ref {
-        self.api_key_vault.delete_key(&key_ref);
+        self.api_key_vault.delete_key(&key_ref).await;
       }
     }
 
@@ -860,7 +861,7 @@ impl SessionManager {
 
     // P1-7：保存成功后同步删除 vault 里的 Key，失败忽略，不阻塞删除。
     if let Some(key_ref) = removed_key_ref {
-      self.api_key_vault.delete_key(&key_ref);
+      self.api_key_vault.delete_key(&key_ref).await;
     }
 
     #[cfg(desktop)]

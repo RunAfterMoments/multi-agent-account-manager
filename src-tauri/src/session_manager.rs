@@ -246,9 +246,24 @@ pub struct SessionManager {
 }
 
 impl SessionManager {
-  pub fn new(app_data_dir: PathBuf) -> Self {
+  /// 仅测试使用：生产经 setup 的 new_with_app 构造。
+  #[cfg(test)]
+  pub async fn new(app_data_dir: PathBuf) -> Self {
+    Self::new_inner(app_data_dir, None).await
+  }
+
+  /// setup 中使用：注入 AppHandle 供移动端 vault 桥接使用。
+  pub async fn new_with_app(app_data_dir: PathBuf, app: tauri::AppHandle) -> Self {
+    Self::new_inner(app_data_dir, Some(app)).await
+  }
+
+  async fn new_inner(app_data_dir: PathBuf, app: Option<tauri::AppHandle>) -> Self {
+    let vault = crate::key_vault::ApiKeyVault::new(app_data_dir.clone());
+    if let Some(app) = app {
+      vault.set_app_handle(app);
+    }
     let store_path = app_data_dir.join("accounts.json");
-    let loaded = load_or_migrate_store(&store_path);
+    let loaded = load_or_migrate_store(&store_path, &vault).await;
     let initial_minimize = loaded.store.settings.minimize_to_tray;
     let initial_auto_approve = loaded.store.settings.auto_approve;
     let initial_auto_approve_commands = loaded.store.settings.auto_approve_commands;
@@ -274,7 +289,7 @@ impl SessionManager {
       recent_downloads: std::sync::Mutex::new(HashMap::new()),
       #[cfg(desktop)]
       group_worker_semaphore: Arc::new(tokio::sync::Semaphore::new(GROUP_MAX_CONCURRENT_WORKERS)),
-      api_key_vault: crate::key_vault::ApiKeyVault::new(app_data_dir.clone()),
+      api_key_vault: vault,
       inner: Mutex::new(InnerState {
         store_path,
         app_data_dir,
@@ -319,6 +334,18 @@ impl SessionManager {
       #[cfg(test)]
       persist_write_count: AtomicU64::new(0),
     }
+  }
+
+  /// 仅测试：换掉 vault 实例（注入内存后端，供无 secret service 的
+  /// 机器上跑通 upsert/删除等逻辑测试）。换后立即按生产迁移逻辑
+  /// 重跑一次：构造时用的真实 vault 可能没能把磁盘 api_key_ref
+  /// 恢复进内存，换 vault 后需补跑。
+  #[cfg(test)]
+  pub async fn set_test_vault(&mut self, vault: crate::key_vault::ApiKeyVault) {
+    self.api_key_vault = vault;
+    let mut locked = self.inner.lock().await;
+    let _ =
+      crate::storage::migrate_agent_keys_to_vault(&mut locked.store, &self.api_key_vault).await;
   }
 
   #[cfg_attr(not(desktop), allow(dead_code))]
@@ -2871,7 +2898,7 @@ mod tests {
     };
     save_store_atomic(&store_path, &initial).unwrap();
 
-    let mgr = SessionManager::new(temp_dir.clone());
+    let mgr = SessionManager::new(temp_dir.clone()).await;
     let snap = mgr
       .reorder_accounts("muse", vec![m3.to_string(), m1.to_string(), m2.to_string()])
       .await
@@ -2879,7 +2906,10 @@ mod tests {
     let aliases: Vec<&str> = snap.accounts.iter().map(|a| a.alias.as_str()).collect();
     assert_eq!(aliases, vec!["m3", "h1", "m1", "m2", "h2"]);
 
-    let reloaded = SessionManager::new(temp_dir.clone()).get_snapshot().await;
+    let reloaded = SessionManager::new(temp_dir.clone())
+      .await
+      .get_snapshot()
+      .await;
     let reloaded_aliases: Vec<&str> = reloaded.accounts.iter().map(|a| a.alias.as_str()).collect();
     assert_eq!(reloaded_aliases, vec!["m3", "h1", "m1", "m2", "h2"]);
 
@@ -2966,7 +2996,7 @@ mod tests {
     };
     save_store_atomic(&store_path, &initial).unwrap();
 
-    let mgr = SessionManager::new(temp_dir.clone());
+    let mgr = SessionManager::new(temp_dir.clone()).await;
     let locked = mgr.inner.lock().await;
     let valid_key = AccountKey {
       provider_id: ProviderId::muse(),
@@ -3175,7 +3205,7 @@ mod tests {
     };
     save_store_atomic(&store_path, &initial).unwrap();
 
-    let mgr = SessionManager::new(temp_dir.clone());
+    let mgr = SessionManager::new(temp_dir.clone()).await;
 
     let (_, _, p1, fp1) = mgr
       .build_turn_prompt_for_member(
@@ -3342,7 +3372,12 @@ mod tests {
   async fn hybrid_external_agents_a2a_anti_loop_and_thread_bindings() {
     let temp_dir = std::env::temp_dir().join(format!("maam-hybrid-group-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&temp_dir).unwrap();
-    let mgr = SessionManager::new(temp_dir.clone());
+    let mut mgr = SessionManager::new(temp_dir.clone()).await;
+    // 该测试只关心 A2A 防环逻辑，API Key 存取走内存 vault
+    // （无 secret service 的机器上也能跑）。
+    mgr
+      .set_test_vault(crate::key_vault::ApiKeyVault::new_memory(temp_dir.clone()))
+      .await;
 
     let api_snap = mgr
       .upsert_external_agent(
@@ -3472,7 +3507,16 @@ mod tests {
   async fn external_agent_api_key_vault_roundtrip_edit_keeps_key_and_delete_clears_vault() {
     let temp_dir = std::env::temp_dir().join(format!("maam-vault-e2e-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&temp_dir).unwrap();
-    let mgr = SessionManager::new(temp_dir.clone());
+    // 无 secret service 的机器上用共享内存 vault（跨重启共享同一份数据）。
+    let shared_vault_data =
+      std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+    let mut mgr = SessionManager::new(temp_dir.clone()).await;
+    mgr
+      .set_test_vault(crate::key_vault::ApiKeyVault::new_memory_shared(
+        temp_dir.clone(),
+        shared_vault_data.clone(),
+      ))
+      .await;
 
     // 新建带 Key 的 API 成员：快照只给 hasApiKey，不含明文。
     let snap = mgr
@@ -3498,7 +3542,13 @@ mod tests {
     assert!(on_disk.contains("apiKeyRef"), "磁盘配置应存引用 id");
 
     // 重启后内存 Key 应从 vault 恢复（hasApiKey 为 true 即证明）。
-    let mgr2 = SessionManager::new(temp_dir.clone());
+    let mut mgr2 = SessionManager::new(temp_dir.clone()).await;
+    mgr2
+      .set_test_vault(crate::key_vault::ApiKeyVault::new_memory_shared(
+        temp_dir.clone(),
+        shared_vault_data.clone(),
+      ))
+      .await;
     let snap2 = mgr2.get_snapshot().await;
     assert!(snap2.external_agents[0].has_api_key);
     let agent_id = snap2.external_agents[0].id.clone();
@@ -3526,7 +3576,13 @@ mod tests {
     assert_eq!(kept, "sk-live-123", "留空编辑不得清空内存 Key");
 
     // 再次重启：Key 仍能从 vault 恢复。
-    let mgr3 = SessionManager::new(temp_dir.clone());
+    let mut mgr3 = SessionManager::new(temp_dir.clone()).await;
+    mgr3
+      .set_test_vault(crate::key_vault::ApiKeyVault::new_memory_shared(
+        temp_dir.clone(),
+        shared_vault_data.clone(),
+      ))
+      .await;
     assert!(mgr3.get_snapshot().await.external_agents[0].has_api_key);
 
     // 删除成员：vault 里的 Key 同步清除。
@@ -3536,7 +3592,9 @@ mod tests {
       .await
       .expect("delete agent");
     assert_eq!(
-      crate::key_vault::ApiKeyVault::new(temp_dir.clone()).load_key(&key_ref),
+      crate::key_vault::ApiKeyVault::new_memory_shared(temp_dir.clone(), shared_vault_data.clone())
+        .load_key(&key_ref)
+        .await,
       None,
       "删除后 vault 不得再含该 Key"
     );
@@ -3545,7 +3603,7 @@ mod tests {
       !vault_raw.contains("sk-live-123"),
       "删除后回退文件不得再含该 Key"
     );
-    let mgr4 = SessionManager::new(temp_dir.clone());
+    let mgr4 = SessionManager::new(temp_dir.clone()).await;
     assert!(mgr4.get_snapshot().await.external_agents.is_empty());
 
     let _ = std::fs::remove_dir_all(&temp_dir);
@@ -3556,7 +3614,7 @@ mod tests {
     // 生效态 = 偏好 && !弹窗 && !锁死 && 无冲突；老配置默认不折叠。
     let temp_dir = std::env::temp_dir().join(format!("maam-sidebar-test-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&temp_dir).unwrap();
-    let mgr = SessionManager::new(temp_dir.clone());
+    let mgr = SessionManager::new(temp_dir.clone()).await;
     assert!(!mgr.get_snapshot().await.effective_sidebar_collapsed);
     {
       let mut locked = mgr.inner.lock().await;
@@ -3584,7 +3642,15 @@ mod tests {
   async fn external_agent_kind_change_to_local_cli_clears_orphan_vault_entry() {
     let temp_dir = std::env::temp_dir().join(format!("maam-vault-kind-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&temp_dir).unwrap();
-    let mgr = SessionManager::new(temp_dir.clone());
+    let shared_vault_data =
+      std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+    let mut mgr = SessionManager::new(temp_dir.clone()).await;
+    mgr
+      .set_test_vault(crate::key_vault::ApiKeyVault::new_memory_shared(
+        temp_dir.clone(),
+        shared_vault_data.clone(),
+      ))
+      .await;
 
     let snap = mgr
       .upsert_external_agent(
@@ -3604,18 +3670,20 @@ mod tests {
       .expect("create api agent");
     let agent_id = snap.external_agents[0].id.clone();
     assert_eq!(
-      crate::key_vault::ApiKeyVault::new(temp_dir.clone())
+      crate::key_vault::ApiKeyVault::new_memory_shared(temp_dir.clone(), shared_vault_data.clone())
         .load_key(&crate::key_vault::api_key_ref_for(&agent_id))
-        .as_deref(),
+        .await
+        .as_deref()
+        .map(String::as_str),
       Some("sk-live-456"),
-      "新建后 vault 应含该 Key（与后端无关：keyring 或回退文件）"
+      "新建后内存测试 vault 应含该 Key"
     );
 
     // kind 改为 local_cli：vault 里的旧 Key 必须同步清除，不得成孤儿。
     // 命令须用白名单内的（claude）：PR-D 起非白名单命令保存即拒绝。
     mgr
       .upsert_external_agent(
-        Some(agent_id),
+        Some(agent_id.clone()),
         ExternalAgentKind::LocalCli,
         "Claude-CLI".to_string(),
         String::new(),
@@ -3633,6 +3701,13 @@ mod tests {
     assert!(
       !vault_raw.contains("sk-live-456"),
       "kind 改为 local_cli 后 vault 不得残留旧 Key"
+    );
+    assert_eq!(
+      crate::key_vault::ApiKeyVault::new_memory_shared(temp_dir.clone(), shared_vault_data.clone())
+        .load_key(&crate::key_vault::api_key_ref_for(&agent_id))
+        .await,
+      None,
+      "kind 改为 local_cli 后内存 vault 不得残留旧 Key"
     );
 
     let _ = std::fs::remove_dir_all(&temp_dir);
@@ -3724,7 +3799,7 @@ mod tests {
   async fn auto_channel_routing_sticky_quota_switch_cooldown_and_failover() {
     let temp_dir = std::env::temp_dir().join(format!("maam-auto-route-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&temp_dir).unwrap();
-    let mgr = SessionManager::new(temp_dir.clone());
+    let mgr = SessionManager::new(temp_dir.clone()).await;
 
     let k1 = AccountKey {
       provider_id: ProviderId::muse(),
@@ -3840,7 +3915,7 @@ mod tests {
   async fn resolve_group_dispatch_targets_enforces_same_channel_mutual_exclusion() {
     let temp_dir = std::env::temp_dir().join(format!("maam-auto-mutex-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&temp_dir).unwrap();
-    let mgr = SessionManager::new(temp_dir.clone());
+    let mgr = SessionManager::new(temp_dir.clone()).await;
 
     let m1 = AccountKey {
       provider_id: ProviderId::muse(),
@@ -4017,7 +4092,7 @@ mod tests {
     };
     save_store_atomic(&store_path, &initial).unwrap();
 
-    let mgr = SessionManager::new(temp_dir.clone());
+    let mgr = SessionManager::new(temp_dir.clone()).await;
     let vid = 42u64;
     let mut locked = mgr.inner.lock().await;
     #[cfg(desktop)]
@@ -4151,7 +4226,7 @@ mod tests {
     };
     save_store_atomic(&store_path, &initial).unwrap();
 
-    let mgr = SessionManager::new(temp_dir.clone());
+    let mgr = SessionManager::new(temp_dir.clone()).await;
     let vid = 77u64;
     let mut locked = mgr.inner.lock().await;
     #[cfg(desktop)]
@@ -4296,7 +4371,7 @@ mod tests {
     let original = "{ broken json";
     std::fs::write(&store_path, original).unwrap();
 
-    let mgr = SessionManager::new(temp_dir.clone());
+    let mgr = SessionManager::new(temp_dir.clone()).await;
     let snap = mgr.get_snapshot().await;
     assert!(snap.notice.is_some(), "损坏配置启动后应有提示");
 
@@ -4336,7 +4411,7 @@ mod tests {
     .unwrap();
     std::fs::write(&store_path, &original).unwrap();
 
-    let mgr = SessionManager::new(temp_dir.clone());
+    let mgr = SessionManager::new(temp_dir.clone()).await;
     let res = mgr
       .resolve_uuid_conflict("muse", "00000000-0000-4000-8000-000000000001")
       .await;
@@ -4353,7 +4428,7 @@ mod tests {
     let original = "{ broken json";
     std::fs::write(&store_path, original).unwrap();
 
-    let mgr = SessionManager::new(temp_dir.clone());
+    let mgr = SessionManager::new(temp_dir.clone()).await;
     let res = mgr.persist().await;
     assert!(res.is_err(), "persist_blocked 时 persist() 应返回 Err");
     assert_eq!(std::fs::read_to_string(&store_path).unwrap(), original);
@@ -4377,7 +4452,7 @@ mod tests {
     let store_path = temp_dir.join("accounts.json");
     std::fs::write(&store_path, "{ broken json").unwrap();
 
-    let mgr = SessionManager::new(temp_dir.clone());
+    let mgr = SessionManager::new(temp_dir.clone()).await;
     let _ = mgr.dismiss_notice().await;
     assert!(mgr.persist().await.is_err(), "只关掉提示不能解除写盘阻止");
     let _ = std::fs::remove_dir_all(&temp_dir);
@@ -4390,7 +4465,7 @@ mod tests {
     let store_path = temp_dir.join("accounts.json");
     std::fs::write(&store_path, "{ broken json").unwrap();
 
-    let mgr = SessionManager::new(temp_dir.clone());
+    let mgr = SessionManager::new(temp_dir.clone()).await;
     let snap = mgr.continue_with_empty_config().await.unwrap();
     assert!(!snap.persist_blocked);
     assert!(snap.notice.is_none());
@@ -4439,12 +4514,12 @@ mod tests {
     };
     save_store_atomic(&store_path, &initial).unwrap();
     // 第一次加载产生 accounts.json.bak（上一份可用配置）。
-    drop(SessionManager::new(temp_dir.clone()));
+    drop(SessionManager::new(temp_dir.clone()).await);
     assert!(temp_dir.join("accounts.json.bak").exists());
 
     // 配置损坏后重新启动：写盘被阻止。
     std::fs::write(&store_path, "{ broken json").unwrap();
-    let mgr = SessionManager::new(temp_dir.clone());
+    let mgr = SessionManager::new(temp_dir.clone()).await;
     assert!(mgr.get_snapshot().await.persist_blocked);
 
     let snap = mgr.restore_config_from_backup().await.unwrap();
@@ -4485,7 +4560,7 @@ mod tests {
     };
     save_store_atomic(&store_path, &initial).unwrap();
 
-    let mgr = SessionManager::new(temp_dir.clone());
+    let mgr = SessionManager::new(temp_dir.clone()).await;
     let before = std::fs::read(&store_path).unwrap();
     let res = mgr.restore_config_from_backup().await;
     assert!(
@@ -4501,7 +4576,7 @@ mod tests {
   async fn debounced_persist_coalesces_rapid_requests_into_one_write() {
     let temp_dir = std::env::temp_dir().join(format!("maam-debounce-test-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&temp_dir).unwrap();
-    let mgr = std::sync::Arc::new(SessionManager::new(temp_dir.clone()));
+    let mgr = std::sync::Arc::new(SessionManager::new(temp_dir.clone()).await);
     mgr.ensure_persist_writer_no_app();
 
     {
@@ -4516,7 +4591,10 @@ mod tests {
     // 300ms 静默窗口已过，再等 500ms 确认没有第二次写盘。
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     assert_eq!(mgr.persist_write_count.load(Ordering::SeqCst), 1);
-    let reloaded = SessionManager::new(temp_dir.clone()).get_snapshot().await;
+    let reloaded = SessionManager::new(temp_dir.clone())
+      .await
+      .get_snapshot()
+      .await;
     assert!(reloaded.settings.minimize_to_tray);
 
     // 第二轮：再改一次并请求一次，应再写一次。
@@ -4526,7 +4604,10 @@ mod tests {
     }
     mgr.request_persist();
     wait_for_persist_writes(&mgr, 2).await;
-    let reloaded = SessionManager::new(temp_dir.clone()).get_snapshot().await;
+    let reloaded = SessionManager::new(temp_dir.clone())
+      .await
+      .get_snapshot()
+      .await;
     assert!(!reloaded.settings.minimize_to_tray);
 
     let _ = std::fs::remove_dir_all(&temp_dir);
@@ -4552,7 +4633,7 @@ mod tests {
   async fn debounced_persist_failure_writes_notice_and_retries() {
     let temp_dir = std::env::temp_dir().join(format!("maam-debounce-fail-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&temp_dir).unwrap();
-    let mgr = std::sync::Arc::new(SessionManager::new(temp_dir.clone()));
+    let mgr = std::sync::Arc::new(SessionManager::new(temp_dir.clone()).await);
     mgr.ensure_persist_writer_no_app();
 
     // 先成功写一次，确认写线程在工作。
@@ -4591,7 +4672,10 @@ mod tests {
     std::fs::remove_dir(&store_path).unwrap();
     mgr.request_persist();
     wait_for_persist_writes(&mgr, 2).await;
-    let reloaded = SessionManager::new(temp_dir.clone()).get_snapshot().await;
+    let reloaded = SessionManager::new(temp_dir.clone())
+      .await
+      .get_snapshot()
+      .await;
     assert!(!reloaded.settings.minimize_to_tray);
 
     let _ = std::fs::remove_dir_all(&temp_dir);

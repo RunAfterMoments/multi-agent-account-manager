@@ -928,3 +928,153 @@ tooltip 按平台显示：macOS `⌘\`，其余 `Ctrl+\`（`IS_MAC`，
   Safari 打开下载），但 `.ipa` 照常签署上传。
 - 未验证：真实发布流程（未触发 publish）；首次带签名的公开 Release 需用户点头。
 
+## 十五、v6.3 PR-F 密钥库真加固（2026-11-27，闭环 MAAM-H-06）
+
+### 改动总览
+
+- `key_vault.rs` 全量重写（270 行 → 约 800 行）：`store_key` /
+  `load_key` / `delete_key` 改为 `async fn`，`load_key` 返回
+  `Option<Zeroizing<String>>`（内存 Key 用完即清零）。后端检测
+  缓存一次：桌面 keyring（Keyring）→ 文件（File，仅 Windows
+  DPAPI）；移动端插件桥接（Bridge）；测试专用内存后端（Memory，
+  `#[cfg(test)]`）。
+- `store_key` 不再静默写明文：keyring/DPAPI/桥接全部失败时返回
+  `Err`，中文报错说清原因与出路。`store_key` 的 keyring 分支删了
+  `.or_else(|_| self.store_file(...))` 静默回退。
+- `load_key` 保留旧明文 `api-keys.json` 只读迁移路径：读到旧条目
+  时，若安全后端可用立即迁移（写安全后端、删旧条目）；安全后端
+  不可用则照常返回旧值（不断现有功能）。迁移完文件为空时删文件。
+
+### 桌面：Windows DPAPI 回退
+
+- keyring 不可用时，回退文件存 `dpapi:<base64(CryptProtectData 密文)>`，
+  读时 `CryptUnprotectData` 解密；CurrentUser 作用域 +
+  `CRYPTPROTECT_UI_FORBIDDEN`。文件仍走 `write_bytes_atomic_0600`
+  原子写盘。
+- 旧明文值（无 `dpapi:` 前缀）在 load 时读到即迁移：写 DPAPI 密文、
+  删明文条目。
+- API 逐项对照 vendored windows 0.62.2 源码核实
+  （`~/.cargo/registry/src/*/windows-0.62.2/src/Windows/Win32/Security/Cryptography/mod.rs`）：
+  `CRYPT_INTEGER_BLOB`（8986 行）、`CryptProtectData`（1659 行，
+  `PCWSTR::null()` 作空描述）、`CryptUnprotectData`（1872 行）、
+  `CRYPTPROTECT_UI_FORBIDDEN = 1`（8271 行）；`LocalFree` 在
+  `Win32::Foundation`，`HLOCAL` 包的是 `*mut c_void`（不是 isize，
+  构造时要 `HLOCAL(output.pbData as *mut core::ffi::c_void)`）。
+  另补了 Cargo.toml 的 `Win32_Security_Cryptography` feature（原只
+  有 `Win32_Security`）与 `base64 = "0.23"` 依赖（与 reqwest/hyper-util
+  共用 0.23.1）。
+- 空输入加密直接拒绝（Err）；解密失败返回 None，不抛错。
+
+### 移动端：插件桥接（keyring 不编译）
+
+- account-session 插件新增三个命令（命名照现有 `fetchText` /
+  `downloadApk` 风格），Rust 侧经 `MobileSessionBridge::run_mobile_plugin_async`
+  调用（`plugins/account-session/src/lib.rs` 新增 `store_api_key` /
+  `load_api_key` / `delete_api_key`，`#[cfg(mobile)]`）。
+- Android（Kotlin）：AndroidKeyStore 生成 AES/GCM/NoPadding 主密钥
+  （alias 固定 `maam-api-key`），每条值随机 12 字节 IV（`cipher.iv`），
+  (IV + 密文) Base64(NO_WRAP) 后存应用私有 SharedPreferences
+  （名 `maam-api-keys`，MODE_PRIVATE，key 即 keyRef）。无新依赖。
+  load 查无条目返回 `{"value": null}`（`JSONObject.NULL` 显式放）；
+  load 只取密钥不新建（新密钥解不开旧密文），解密失败只 reject、
+  不删数据。
+- iOS（Swift）：Keychain，kSecClassGenericPassword，service =
+  `multi-agent-account-manager`（与 Rust `KEYRING_SERVICE` 同值），
+  account = keyRef，SecItemAdd（已存在 → SecItemUpdate）/
+  SecItemCopyMatching（查无 → `value: null`）/ SecItemDelete（查无
+  也算成功）。`import Security` 新增。
+- 移动端 `probe_keyring` 改为走桥接（桥接失败即后端不可用）。
+- 决策（与用户原提议的出入，已在 v6.2 披露过同类取舍）：Android
+  验签在 Rust 做是因 JCA 限制；此处 Keystore/Keychain 的加解密本身
+  必须在原生侧（Rust 侧无 Keystore/Keychain 绑定），故三命令放
+  Kotlin/Swift，Rust 只做桥接调用。
+
+### 调用方异步化（Option A，逐字实现）
+
+- `migrate_agent_keys_to_vault` → `pub async fn`，改传 `&ApiKeyVault`
+  （不再每次新建一个，用 setup 注入的实例，移动端才能走桥接）；
+  `load_or_migrate_store` → `pub async fn`；`SessionManager::new` →
+  `pub async fn` + `new_with_app(dir, app)`（setup 用）+ 共享
+  `new_inner`；setup（同步闭包）用
+  `tauri::async_runtime::block_on(SessionManager::new_with_app(...))`
+  包起来（setup 在主线程跑，不在 runtime worker 内，block_on 安全；
+  保留启动时迁移语义，不 defer，避免群聊轮次在 Key 恢复前 401）。
+- `ApiKeyVault` 新增 `app_handle: Mutex<Option<AppHandle>>` +
+  `set_app_handle()`（换 handle 后失效后端缓存）；`SessionManager`
+  构造时把 AppHandle 交给 vault。
+- `delete_key` 也改为 async（移动端桥接删除是异步的，三个插件命令
+  本就包含 delete）。group_chat.rs 三处（upsert 回滚、kind 改 local_cli、
+  删除 agent）全部补 `.await`；第二处回滚分支最初漏了一个
+  `delete_key` 未 await，被 clippy 的 unused_must_use 抓出。
+- `SessionManager::new` 在生产侧已无调用，改为 `#[cfg(test)]`；
+  `VaultBackend` 与三个测试构造器改为 `pub(crate)`（`new_with_backend`
+  的 `pub fn` + 私有枚举曾报 private-in-public）。
+
+### 行为变化：Linux 无 secret service 时新 Key 存不进（fail-closed）
+
+- 以前：`store_key` 在 keyring 不可用时静默写明文 `api-keys.json`，
+  功能照常用。
+- 现在：**新 Key 存不进**。`store_key` 返回 Err，界面走原有
+  “保存 API Key 到系统凭据库失败：{e}” 报错链。提示文案（Linux）：
+  > 系统凭据库（Secret Service）不可用，无法安全保存 API Key；
+  > 请安装并启动 GNOME Keyring 或 KWallet 等 Secret Service 后重试
+  > （本版本不再把明文 Key 写到回退文件）
+  macOS 文案对应为“系统钥匙串不可用……请确认钥匙串访问正常后重试”；
+  移动端桥接失败为“移动端安全存储（Keystore/Keychain）不可用……
+  请重试”。
+- **旧 Key 不受影响**：已存在 `api-keys.json` 明文条目的用户，
+  load 时照常读回；有安全后端时当场迁移走（写安全后端、删旧条目、
+  文件空了就删文件），无安全后端时条目保留、下次启动重试迁移。
+  磁盘配置在迁移成功后剥离明文、只留 `apiKeyRef`。
+- Windows 不受此变化影响：keyring 不可用时回退文件改存 DPAPI 密文，
+  新 Key 照常能存。
+
+### 测试
+
+- `cargo test --lib` 117/117（基线 113；旧 `file_fallback_roundtrip_and_0600_perms`
+  被按后端分情况断言的 `store_key_fails_closed_without_secure_backend`
+  取代，-1；新增 5 个，+5）。
+- 新增：① `store_key_fails_closed_without_secure_backend`（按检测到
+  的后端分情况断言：Keyring 则往返，File 则报错含“凭据库/安全”且
+  不写回退文件、load 为 None）；② `store_key_errors_when_no_secure_backend`
+  （强制 File 后端：非 Windows 报错，Linux 断言含 "Secret Service"；
+  Windows 上 File 后端即 DPAPI，断言存成功且文件为 `dpapi:` 值——
+  最初版本未分平台，在 Windows 交叉 clippy 下既报 `err` 未使用，
+  `unwrap_err()` 也会在 Windows 上 panic）；③
+  `legacy_plaintext_file_migrates_on_load`（手写旧明文文件；Keyring
+  分支断言迁移 + keyring 含 Key，File 分支断言条目保留）；④
+  `memory_backend_roundtrip_for_tests`；⑤ `#[cfg(windows)]`
+  `dpapi_encrypt_decrypt_roundtrip`（含空输入拒绝）与
+  `dpapi_file_value_roundtrip`（DPAPI 文件值 + 旧明文读时改写）；
+  ⑥ storage `load_or_migrate_store_keeps_config_when_vault_unavailable`
+  （无论迁移成败内存 Key 不丢；按 startup_notice 是否含“未能迁移”
+  分情况断言磁盘保留原配置或已剥离明文）。
+- 其余 5 个调 `load_or_migrate_store` 的 storage 测试改为
+  `#[tokio::test]` + 真实 vault + `.await`（迁移对它们是 no-op）。
+- session_manager 两个 vault 测试与 A2A 防环测试注入共享内存 vault：
+  `set_test_vault`（`#[cfg(test)]`，async，换 vault 后按生产迁移逻辑
+  重跑一次——构造时用的真实 vault 可能没能把磁盘 `api_key_ref`
+  恢复进内存，换 vault 后需补跑；最初版本只换不重跑，重启恢复断言
+  失败）。roundtrip 测试的 mgr/mgr2/mgr3 共用同一 `Arc<Mutex<BTreeMap>>`。
+- `load_key` 返回 `Option<Zeroizing<String>>` 后，测试里 6 处
+  `.as_deref()` 需补 `.map(String::as_str)`（`as_deref()` 得
+  `Option<&String>` 而非 `Option<&str>`），另 1 处 `load_keyring`
+  同理；均由编译器报错逐个抓出。
+
+### 验证（v6.3）
+
+- fmt、clippy（Linux/Windows）`--all-targets -- -D warnings` 全绿；
+  `cargo test --lib` 117/117；`cargo check --target aarch64-linux-android --lib`
+  0 错误（44 条 mobile 警告，与基线一致——中途曾因 `VaultBackend::Keyring`
+  在移动端永不构造多出 1 条，已用 `cfg_attr(allow(dead_code))` 压回）；
+  npm build、test:js 全绿。
+- 中途虚拟机又换了一次（第 6 次，apt 包全丢）：`cargo test` 链接报缺
+  `-lgdk_pixbuf-2.0` / `-lgtk-3`，跑 `restore-build-env.sh` 恢复（GTK OK）。
+- Kotlin 与 Swift 均为草稿先行、逐项对照现有文件与官方 API 核实后落地：
+  Kotlin（676 → 815 行，+139）与 Swift（430 → 540 行，+110），
+  均未改其他文件。Swift 草稿的 service 值已与 `KEYRING_SERVICE`
+  逐字核对一致。
+- 未验证：iOS Swift 本机编不到（无 Apple 工具链），Windows DPAPI
+  本机跑不到（只有交叉 clippy 编过），Kotlin 本机编不到（无 Android
+  SDK）——三项均靠 CI（check Windows 跑 DPAPI 测试、release Android
+  构建编 Kotlin、macOS/iOS 构建编 Swift）。

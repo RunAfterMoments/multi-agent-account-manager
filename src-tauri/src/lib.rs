@@ -694,7 +694,9 @@ pub fn run() {
   builder
     .setup(|app| {
       let app_data_dir = app.path().app_data_dir()?;
-      let session_mgr = Arc::new(SessionManager::new(app_data_dir));
+      let session_mgr = Arc::new(tauri::async_runtime::block_on(
+        SessionManager::new_with_app(app_data_dir, app.handle().clone()),
+      ));
       app.manage(Arc::clone(&session_mgr));
 
       #[cfg(desktop)]

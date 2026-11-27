@@ -344,3 +344,56 @@ pub async fn install_apk(
     .await
     .map_err(|e| e.to_string())
 }
+
+#[cfg(mobile)]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MobileApiKeyResponse {
+  #[serde(default)]
+  pub value: Option<String>,
+}
+
+/// 移动端 API Key 存入系统安全存储（Android Keystore / iOS Keychain）。
+#[cfg(mobile)]
+pub async fn store_api_key(app: &AppHandle, key_ref: &str, key: &str) -> Result<(), String> {
+  let bridge = app.state::<MobileSessionBridge<tauri::Wry>>();
+  bridge
+    .0
+    .run_mobile_plugin_async::<serde_json::Value>(
+      "storeApiKey",
+      serde_json::json!({ "keyRef": key_ref, "key": key }),
+    )
+    .await
+    .map(|_| ())
+    .map_err(|e| e.to_string())
+}
+
+/// 移动端从系统安全存储取 API Key；不存在返回 Ok(None)。
+#[cfg(mobile)]
+pub async fn load_api_key(app: &AppHandle, key_ref: &str) -> Result<Option<String>, String> {
+  let bridge = app.state::<MobileSessionBridge<tauri::Wry>>();
+  let res: MobileApiKeyResponse = bridge
+    .0
+    .run_mobile_plugin_async(
+      "loadApiKey",
+      serde_json::json!({ "keyRef": key_ref }),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+  Ok(res.value)
+}
+
+/// 移动端从系统安全存储删 API Key；不存在也算成功。
+#[cfg(mobile)]
+pub async fn delete_api_key(app: &AppHandle, key_ref: &str) -> Result<(), String> {
+  let bridge = app.state::<MobileSessionBridge<tauri::Wry>>();
+  bridge
+    .0
+    .run_mobile_plugin_async::<serde_json::Value>(
+      "deleteApiKey",
+      serde_json::json!({ "keyRef": key_ref }),
+    )
+    .await
+    .map(|_| ())
+    .map_err(|e| e.to_string())
+}

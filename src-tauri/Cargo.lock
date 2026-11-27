@@ -2522,6 +2522,7 @@ name = "multi-agent-account-manager"
 version = "0.1.10"
 dependencies = [
  "arboard",
+ "base64 0.23.1",
  "block2",
  "keyring",
  "libc",
@@ -2548,6 +2549,7 @@ dependencies = [
  "webview2-com",
  "windows",
  "wry",
+ "zeroize",
 ]
 
 [[package]]

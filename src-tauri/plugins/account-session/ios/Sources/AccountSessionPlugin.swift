@@ -1,4 +1,5 @@
 import Foundation
+import Security
 import Tauri
 import UIKit
 import WebKit
@@ -57,6 +58,19 @@ private struct FetchTextArgs: Decodable {
   let accept: String?
 }
 
+private struct StoreApiKeyArgs: Decodable {
+  let keyRef: String
+  let key: String
+}
+
+private struct LoadApiKeyArgs: Decodable {
+  let keyRef: String
+}
+
+private struct DeleteApiKeyArgs: Decodable {
+  let keyRef: String
+}
+
 private struct CapabilitiesResult: Encodable {
   let multiProfileSupported: Bool
   let profileNames: [String]
@@ -65,6 +79,10 @@ private struct CapabilitiesResult: Encodable {
 private struct FetchTextResult: Encodable {
   let status: UInt16
   let body: String
+}
+
+private struct LoadApiKeyResult: Encodable {
+  let value: String?
 }
 
 @_cdecl("init_plugin_account_session")
@@ -386,6 +404,98 @@ public class AccountSessionPlugin: Plugin {
       task.resume()
     } catch {
       invoke.reject("解析网络请求参数失败")
+    }
+  }
+
+  @objc public func storeApiKey(_ invoke: Invoke) {
+    do {
+      let args = try invoke.parseArgs(StoreApiKeyArgs.self)
+      guard let data = args.key.data(using: .utf8) else {
+        invoke.reject("保存 API Key 失败")
+        return
+      }
+      // service 与 Rust 侧 KEYRING_SERVICE（key_vault.rs）同值。
+      let query: [String: Any] = [
+        kSecClass as String: kSecClassGenericPassword,
+        kSecAttrService as String: "multi-agent-account-manager",
+        kSecAttrAccount as String: args.keyRef,
+        kSecValueData as String: data
+      ]
+      let status = SecItemAdd(query as CFDictionary, nil)
+      if status == errSecSuccess {
+        invoke.resolve()
+        return
+      }
+      guard status == errSecDuplicateItem else {
+        invoke.reject("保存 API Key 失败 (错误码 \(status))")
+        return
+      }
+      let updateQuery: [String: Any] = [
+        kSecClass as String: kSecClassGenericPassword,
+        kSecAttrService as String: "multi-agent-account-manager",
+        kSecAttrAccount as String: args.keyRef
+      ]
+      let updateAttrs: [String: Any] = [
+        kSecValueData as String: data
+      ]
+      let updateStatus = SecItemUpdate(updateQuery as CFDictionary, updateAttrs as CFDictionary)
+      if updateStatus == errSecSuccess {
+        invoke.resolve()
+      } else {
+        invoke.reject("保存 API Key 失败 (错误码 \(updateStatus))")
+      }
+    } catch {
+      invoke.reject("保存 API Key 参数无效")
+    }
+  }
+
+  @objc public func loadApiKey(_ invoke: Invoke) {
+    do {
+      let args = try invoke.parseArgs(LoadApiKeyArgs.self)
+      let query: [String: Any] = [
+        kSecClass as String: kSecClassGenericPassword,
+        kSecAttrService as String: "multi-agent-account-manager",
+        kSecAttrAccount as String: args.keyRef,
+        kSecReturnData as String: true,
+        kSecMatchLimit as String: kSecMatchLimitOne
+      ]
+      var item: CFTypeRef?
+      let status = SecItemCopyMatching(query as CFDictionary, &item)
+      if status == errSecItemNotFound {
+        invoke.resolve(LoadApiKeyResult(value: nil))
+        return
+      }
+      guard status == errSecSuccess else {
+        invoke.reject("读取 API Key 失败 (错误码 \(status))")
+        return
+      }
+      guard let data = item as? Data,
+            let value = String(data: data, encoding: .utf8) else {
+        invoke.reject("读取到的 API Key 数据无效")
+        return
+      }
+      invoke.resolve(LoadApiKeyResult(value: value))
+    } catch {
+      invoke.reject("读取 API Key 参数无效")
+    }
+  }
+
+  @objc public func deleteApiKey(_ invoke: Invoke) {
+    do {
+      let args = try invoke.parseArgs(DeleteApiKeyArgs.self)
+      let query: [String: Any] = [
+        kSecClass as String: kSecClassGenericPassword,
+        kSecAttrService as String: "multi-agent-account-manager",
+        kSecAttrAccount as String: args.keyRef
+      ]
+      let status = SecItemDelete(query as CFDictionary)
+      if status == errSecSuccess || status == errSecItemNotFound {
+        invoke.resolve()
+      } else {
+        invoke.reject("删除 API Key 失败 (错误码 \(status))")
+      }
+    } catch {
+      invoke.reject("删除 API Key 参数无效")
     }
   }
 
