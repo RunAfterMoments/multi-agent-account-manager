@@ -415,8 +415,11 @@ impl SessionManager {
       #[cfg(target_os = "macos")]
       {
         platform::raise_macos_webview_to_front(&mgr_wv);
-        if let Some(loading_label) = active_loading_label.filter(|_| right_phys > 1) {
-          if let Some(loading_wv) = app.get_webview(&loading_label) {
+        // 注意用 as_ref().filter(...)：直接 filter 会 move 掉
+        // active_loading_label，后面的循环还要借用它（macOS 专属，
+        // Linux/Windows 编不到这段，CI 的 macOS job 抓出来的）。
+        if let Some(loading_label) = active_loading_label.as_ref().filter(|_| right_phys > 1) {
+          if let Some(loading_wv) = app.get_webview(loading_label) {
             let _ = loading_wv.set_bounds(tauri::Rect {
               position: tauri::PhysicalPosition::new(left_phys as i32, 0).into(),
               size: tauri::PhysicalSize::new(right_phys, height_phys).into(),
