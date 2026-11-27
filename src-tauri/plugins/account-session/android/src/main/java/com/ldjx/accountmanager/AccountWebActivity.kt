@@ -101,6 +101,7 @@ class AccountWebActivity : AppCompatActivity() {
     private var downloadBannerHideRunnable: Runnable? = null
     private var lastDownloadedUri: Uri? = null
     private var lastDownloadedMime: String = "*/*"
+    private var lastDownloadedFilename: String = ""
     private var lastDownloadedFallbackDir: File? = null
 
     private data class BlobInitMeta(
@@ -504,7 +505,7 @@ class AccountWebActivity : AppCompatActivity() {
             "png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "ico",
             "mp4", "mov", "webm", "mkv", "avi", "mp3", "wav", "m4a", "ogg", "flac",
             "csv", "tsv", "json", "txt", "md", "xml", "yaml", "yml",
-            "doc", "docx", "xls", "xlsx", "ppt", "pptx", "apk",
+            "doc", "docx", "xls", "xlsx", "ppt", "pptx",
         )
 
         private fun sanitizeAndroidUserAgent(raw: String): String {
@@ -801,7 +802,8 @@ class AccountWebActivity : AppCompatActivity() {
                             }
                           }
                         }
-                        const aid = window.__maamSubActionId || '40e0249eeae158685b6a8d0c3b203f53dd4f2c7d63';
+                        // 未从页面脚本里扫到 action id 时不调未知 server action，只用已缓存的额度。
+                        const aid = window.__maamSubActionId || '';
                         if (callServerFn && aid && typeof window.__maamMapSub === 'function') {
                           const res = await callServerFn(aid, [{ includeAgreement: true }]);
                           const mapped = window.__maamMapSub(res);
@@ -1827,7 +1829,8 @@ class AccountWebActivity : AppCompatActivity() {
         runCatching {
             val cm = WebViewCompat.getProfile(wv).cookieManager
             cm.setAcceptCookie(true)
-            cm.setAcceptThirdPartyCookies(wv, true)
+            // 第三方 Cookie 默认关闭：登录流程如需再按指定域名放开。
+            cm.setAcceptThirdPartyCookies(wv, false)
         }
         if (applyInitialSettings) {
             wv.settings.apply {
@@ -1839,7 +1842,8 @@ class AccountWebActivity : AppCompatActivity() {
                 allowFileAccess = false
                 allowContentAccess = false
                 mediaPlaybackRequiresUserGesture = false
-                mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
+                // 混合内容一律禁止：http 子资源不得以明文发出同域 Cookie。
+                mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
                 val cleanUa = sanitizeAndroidUserAgent(userAgentString)
                 if (cleanUa != userAgentString) {
                     userAgentString = cleanUa
@@ -1878,14 +1882,10 @@ class AccountWebActivity : AppCompatActivity() {
     }
 
     private fun handleWebPermissionRequest(request: PermissionRequest) {
-        val protectedOnly = request.resources
-            ?.filter { it == PermissionRequest.RESOURCE_PROTECTED_MEDIA_ID }
-            ?.toTypedArray()
-        if (!protectedOnly.isNullOrEmpty()) {
-            request.grant(protectedOnly)
-        } else {
-            request.deny()
-        }
+        // 受保护媒体 ID（RESOURCE_PROTECTED_MEDIA_ID）是可用于追踪的设备标识，
+        // 此前无用户确认即自动放行；这里没有确认 UI，改为一律拒绝，
+        // 而不是静默放行。
+        request.deny()
     }
 
     private fun decideMainFrameOverride(
@@ -1916,6 +1916,18 @@ class AccountWebActivity : AppCompatActivity() {
                 "Google OAuth 按政策需使用系统浏览器，请使用邮箱/手机号登录，或在账号设置中通过「导入 Cookie」载入登录态",
             )
             return true
+        }
+        // http/https 先验 host 再谈下载：下载拦截不能绕过域名白名单，
+        // 否则聊天内容里的外站链接（如 https://evil.com/x.apk?download=1）
+        // 会被当作下载直接放行。blob:/data: 不走这里（blob 在上面已单独
+        // 验过内层 host，data: 仍走下载拦截）。合法附件不受影响，
+        // muse 的 allowedHosts 已含 CDN 域名。
+        val urlScheme = uri.scheme?.lowercase().orEmpty()
+        if (urlScheme == "https" || urlScheme == "http") {
+            if (!AccountSessionCoordinator.hostMatchesAllowed(uri, spec.allowedHosts)) {
+                if (isPopup) destroyPopupWebView()
+                return true
+            }
         }
         if (shouldInterceptUrlAsDownload(uri, isRedirect)) {
             handleDownloadRequest(
@@ -2005,12 +2017,16 @@ class AccountWebActivity : AppCompatActivity() {
             var conn: HttpURLConnection? = null
             try {
                 val initialParsed = URL(rawUrl)
+                // 下载仅允许 HTTPS：http 初始地址与 https→http 降级一律拒绝。
+                if (!initialParsed.protocol.equals("https", ignoreCase = true)) {
+                    throw IllegalArgumentException("下载仅允许 HTTPS")
+                }
                 var currentUrl = initialParsed
                 var activeConn: HttpURLConnection? = null
                 for (hop in 0 until 10) {
                     val scheme = currentUrl.protocol.lowercase()
-                    if (scheme != "https" && scheme != "http") {
-                        throw IllegalArgumentException("不支持的下载地址协议")
+                    if (scheme != "https") {
+                        throw IllegalStateException("下载重定向到非 HTTPS 地址已被拒绝")
                     }
                     val c = (currentUrl.openConnection() as HttpURLConnection).apply {
                         connectTimeout = 20_000
@@ -2049,6 +2065,11 @@ class AccountWebActivity : AppCompatActivity() {
                 if (status !in 200..299) {
                     throw IllegalStateException("服务器返回错误状态（HTTP $status）")
                 }
+                // HTTP 下载也要有大小上限（与 blob 下载的 256MB 上限对齐思路，
+                // 这里取 512MB）；流式复制里另有逐块累计上限兜底。
+                if (conn.contentLengthLong > 512L * 1024L * 1024L) {
+                    throw IllegalStateException("下载文件超过 512MB 上限")
+                }
                 val contentDisp = conn.getHeaderField("Content-Disposition")
                 val serverMime = conn.contentType ?: declaredMime
                 val rawName = parseContentDispositionFilename(contentDisp)
@@ -2058,7 +2079,7 @@ class AccountWebActivity : AppCompatActivity() {
                 val finalMime = resolveMimeType(finalName, serverMime)
                 val saved = conn.inputStream.use { input ->
                     saveStreamToPublicDownloads(finalName, finalMime) { out ->
-                        copyStreamWithCheck(input, out, sessionGen)
+                        copyStreamWithCheck(input, out, sessionGen, 512L * 1024L * 1024L)
                     }
                 }
                 onDownloadCompleted(sessionGen, saved)
@@ -2320,14 +2341,24 @@ class AccountWebActivity : AppCompatActivity() {
         }
     }
 
-    private fun copyStreamWithCheck(input: InputStream, output: OutputStream, sessionGen: Long) {
+    private fun copyStreamWithCheck(
+        input: InputStream,
+        output: OutputStream,
+        sessionGen: Long,
+        maxBytes: Long = Long.MAX_VALUE,
+    ) {
         val buf = ByteArray(16 * 1024)
+        var totalWritten = 0L
         while (true) {
             if (Thread.currentThread().isInterrupted || sessionGen != activeSessionGeneration.get()) {
                 throw InterruptedException("会话已切换")
             }
             val n = input.read(buf)
             if (n <= 0) break
+            totalWritten += n
+            if (totalWritten > maxBytes) {
+                throw IllegalStateException("下载文件超过大小上限")
+            }
             output.write(buf, 0, n)
         }
         output.flush()
@@ -2438,11 +2469,13 @@ class AccountWebActivity : AppCompatActivity() {
             if (isFinishing || isDestroyed || sessionGen != activeSessionGeneration.get()) return@post
             lastDownloadedUri = saved.openUri
             lastDownloadedMime = saved.mimeType
+            lastDownloadedFilename = saved.filename
             lastDownloadedFallbackDir = saved.fallbackDir
             val prefix = if (saved.publicDownloads) "已保存到「下载」" else "已保存（应用下载目录）"
             showDownloadStatus(
                 text = "$prefix：${saved.filename}",
-                canOpen = saved.openUri != null,
+                // APK 不给一键打开：即使 MIME 被谎报，isApkDownload 也会按文件名拦住。
+                canOpen = saved.openUri != null && !isApkDownload(),
                 showDir = saved.publicDownloads,
                 isError = false,
                 autoHide = true,
@@ -2454,6 +2487,7 @@ class AccountWebActivity : AppCompatActivity() {
         uiHandler.post {
             if (isFinishing || isDestroyed || sessionGen != activeSessionGeneration.get()) return@post
             lastDownloadedUri = null
+            lastDownloadedFilename = ""
             showDownloadStatus(
                 text = "下载失败：$reason",
                 canOpen = false,
@@ -2496,8 +2530,30 @@ class AccountWebActivity : AppCompatActivity() {
         downloadBannerRoot.visibility = View.GONE
     }
 
+    // 是否 APK 安装包：MIME 可能被服务端谎报（octet-stream、大小写、
+    // 带 ; 参数），只比精确 MIME 会被绕过；同时看文件名扩展名。
+    private fun isApkDownload(): Boolean {
+        val mime = lastDownloadedMime.substringBefore(';').trim().lowercase()
+        if (mime == "application/vnd.android.package-archive") return true
+        val name = lastDownloadedFilename.lowercase()
+        return name.endsWith(".apk") || name.endsWith(".apks") ||
+            name.endsWith(".xapk") || name.endsWith(".aab")
+    }
+
     private fun openLastDownloadedFile() {
         val uri = lastDownloadedUri ?: return
+        // 禁止一键打开 APK 安装包：下载的 APK 可能是仿冒更新/恶意文件，
+        // 必须由用户到下载目录手动点开安装（系统安装器会再确认一次）。
+        if (isApkDownload()) {
+            showDownloadStatus(
+                text = "APK 安装包请到下载目录手动打开安装",
+                canOpen = false,
+                showDir = true,
+                isError = false,
+                autoHide = true,
+            )
+            return
+        }
         val intent = Intent(Intent.ACTION_VIEW).apply {
             setDataAndType(uri, lastDownloadedMime)
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
@@ -2540,7 +2596,7 @@ class AccountWebActivity : AppCompatActivity() {
             val hint = lastDownloadedFallbackDir?.absolutePath ?: "系统「文件管理 -> 下载」"
             showDownloadStatus(
                 text = "请前往 $hint 查看已下载文件",
-                canOpen = lastDownloadedUri != null,
+                canOpen = lastDownloadedUri != null && !isApkDownload(),
                 showDir = false,
                 isError = false,
                 autoHide = true,

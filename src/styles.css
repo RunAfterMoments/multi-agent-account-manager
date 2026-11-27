@@ -220,6 +220,10 @@ body,
   color: #64748b;
 }
 
+.desktop-shell.sidebar-collapsed .middle-column {
+  display: none;
+}
+
 .middle-column {
   width: min(312px, calc(100% - 68px));
   min-width: 0;
@@ -419,6 +423,34 @@ body,
 
 .notice-bar > span {
   overflow-wrap: anywhere;
+}
+
+.persist-blocked-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.notice-actions {
+  display: flex;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.notice-action-btn {
+  border: 1px solid var(--warn-border);
+  background: #fff;
+  color: var(--warn-text);
+  cursor: pointer;
+  font-size: 12px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  white-space: nowrap;
+}
+
+.notice-action-btn:hover {
+  background: var(--warn-bg);
 }
 
 .notice-close {
@@ -1485,6 +1517,16 @@ body,
 .rail-util-btn:hover {
   background: var(--rail-hover);
   color: var(--text-main);
+}
+
+.rail-util-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.rail-util-btn:disabled:hover {
+  background: transparent;
+  color: var(--text-sub);
 }
 
 .rail-util-btn.has-update {

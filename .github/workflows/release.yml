@@ -17,9 +17,23 @@ on:
         type: boolean
         default: false
         required: false
+      maam_update_repo:
+        description: "更新源仓库（owner/repo，仅内部自测用；留空则更新检查关闭）"
+        type: string
+        default: ""
+        required: false
 
 permissions:
   contents: read
+
+env:
+  # 更新源：编译进二进制（updater.rs 经 option_env!("MAAM_UPDATE_REPO") 读取）。
+  # 默认留空（更新检查关闭）。Ed25519 验签已落地：updater.rs 用 minisign-verify
+  # 验签 latest.json.minisig 与安装包 .minisig（公钥编译进二进制，见 minisign.pub），
+  # publish job 签署全部资产 + latest.json。开启更新只需在仓库 Settings > Variables
+  # 里设 MAAM_UPDATE_REPO=<owner/repo> 再发版；内部自测可直接在 workflow_dispatch
+  # 输入里覆盖（见上面的 inputs.maam_update_repo）。
+  MAAM_UPDATE_REPO: ${{ inputs.maam_update_repo || vars.MAAM_UPDATE_REPO }}
 
 jobs:
   desktop:
@@ -45,17 +59,17 @@ jobs:
             artifact: windows-x64-nsis
             path: src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*-setup.exe
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: 22
           cache: npm
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           targets: ${{ matrix.targets }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: ./src-tauri -> target
       - run: npm ci
@@ -71,7 +85,7 @@ jobs:
           fi
           app_name=$(basename "$app_path")
           COPYFILE_DISABLE=1 tar -czf "$macos_dir/account-manager-macos-universal.app.tar.gz" -C "$macos_dir" "$app_name"
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.path }}
@@ -86,14 +100,14 @@ jobs:
       BUILD_TOOLS: 37.0.0
       APK_VARIANT: ${{ github.ref_type == 'tag' && 'release' || inputs.android_variant }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: 22
           cache: npm
-      - uses: actions/setup-java@v5
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
         with:
           distribution: temurin
           java-version: 17
@@ -101,14 +115,31 @@ jobs:
         run: |
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-36" "platforms;android-37.0" "build-tools;$BUILD_TOOLS" "ndk;$NDK_VERSION"
           echo "NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: ./src-tauri -> target
       - run: npm ci
       - run: npm run tauri -- android init --ci --skip-targets-install
+      # gen/android 由 init 生成且被 .gitignore 排除，无法入库改模板；
+      # 在此打补丁：禁止 Android 自动备份带走账号会话数据（cookie / WebView Profile）。
+      # 若模板已含该属性则改值，若无则插入；grep 校验失败即中断构建。
+      - name: Disable Android auto-backup (allowBackup=false)
+        run: |
+          manifest="src-tauri/gen/android/app/src/main/AndroidManifest.xml"
+          python3 - "$manifest" <<'PY'
+          import re, sys
+          path = sys.argv[1]
+          text = open(path, encoding="utf-8").read()
+          if 'android:allowBackup=' in text:
+              text = re.sub(r'android:allowBackup="[^"]*"', 'android:allowBackup="false"', text, count=1)
+          else:
+              text = text.replace("<application", '<application android:allowBackup="false"', 1)
+          open(path, "w", encoding="utf-8").write(text)
+          PY
+          grep -q 'android:allowBackup="false"' "$manifest" || { echo "allowBackup patch not applied" >&2; exit 1; }
       - name: Build test APK
         if: env.APK_VARIANT == 'debug'
         run: |
@@ -137,7 +168,7 @@ jobs:
             src-tauri/gen/android/app/build/outputs/apk/universal/release/*-unsigned.apk
       - name: Verify APK signature
         run: '"$ANDROID_HOME/build-tools/$BUILD_TOOLS/apksigner" verify "$RUNNER_TEMP"/account-manager-*.apk'
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: android-universal-${{ env.APK_VARIANT }}
           path: ${{ runner.temp }}/account-manager-*.apk
@@ -151,17 +182,17 @@ jobs:
       HOMEBREW_NO_AUTO_UPDATE: 1
       IPHONEOS_DEPLOYMENT_TARGET: "17.0"
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: 22
           cache: npm
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           targets: aarch64-apple-ios
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: ./src-tauri -> target
       - name: Ensure iOS CLI dependencies
@@ -172,7 +203,7 @@ jobs:
       - run: npm ci
       - name: Build unsigned iOS IPA
         run: bash scripts/build-ios-ipa.sh
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ios-unsigned-ipa
           path: src-tauri/target/ios/account-manager-ios-unsigned.ipa
@@ -186,23 +217,23 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           fetch-depth: 0
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: macos-universal-dmg
           path: ${{ runner.temp }}/artifacts/macos
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: windows-x64-nsis
           path: ${{ runner.temp }}/artifacts/windows
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: android-universal-release
           path: ${{ runner.temp }}/artifacts/android
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: ios-unsigned-ipa
           path: ${{ runner.temp }}/artifacts/ios
@@ -308,10 +339,19 @@ jobs:
 
           echo "RELEASE_TAG=$tag" >> "$GITHUB_ENV"
           printf '%s\n' "$notes" > "$pub_dir/release-notes.txt"
-      - name: Create or update GitHub Release
+      - name: Sign release assets with minisign
         env:
-          GH_TOKEN: ${{ github.token }}
+          MINISIGN_SECRET_KEY: ${{ secrets.MAAM_MINISIGN_SECRET_KEY }}
         run: |
+          set -eu
+          : "${MINISIGN_SECRET_KEY:?Missing MAAM_MINISIGN_SECRET_KEY secret}"
+          umask 077
+          key_file="$RUNNER_TEMP/minisign.key"
+          trap 'shred -u "$key_file" 2>/dev/null || rm -f "$key_file"' EXIT
+          printf '%s' "$MINISIGN_SECRET_KEY" > "$key_file"
+          chmod 600 "$key_file"
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq minisign
           pub_dir="$RUNNER_TEMP/publish"
           files=(
             "$pub_dir/account-manager-macos-universal.app.tar.gz"
@@ -320,6 +360,35 @@ jobs:
             "$pub_dir/account-manager-android-universal-release.apk"
             "$pub_dir/account-manager-ios-unsigned.ipa"
             "$pub_dir/latest.json"
+          )
+          for f in "${files[@]}"; do
+            # 私钥即使用空口令生成也经 scrypt 加密保存，minisign -S 每次都
+            # 要交互式问口令；CI 无 tty，喂一个空行即解密通过。
+            printf '\n' | minisign -S -H -s "$key_file" -m "$f"
+          done
+          # 自检：用仓库根目录的公钥文件逐个验签，验签失败即中断发布。
+          for f in "${files[@]}"; do
+            minisign -V -p minisign.pub -m "$f" -x "$f.minisig"
+          done
+          ls -la "$pub_dir"
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          pub_dir="$RUNNER_TEMP/publish"
+          files=(
+            "$pub_dir/account-manager-macos-universal.app.tar.gz"
+            "$pub_dir/account-manager-macos-universal.app.tar.gz.minisig"
+            "$pub_dir/account-manager-macos-universal.dmg"
+            "$pub_dir/account-manager-macos-universal.dmg.minisig"
+            "$pub_dir/account-manager-windows-x64-setup.exe"
+            "$pub_dir/account-manager-windows-x64-setup.exe.minisig"
+            "$pub_dir/account-manager-android-universal-release.apk"
+            "$pub_dir/account-manager-android-universal-release.apk.minisig"
+            "$pub_dir/account-manager-ios-unsigned.ipa"
+            "$pub_dir/account-manager-ios-unsigned.ipa.minisig"
+            "$pub_dir/latest.json"
+            "$pub_dir/latest.json.minisig"
           )
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release upload "$RELEASE_TAG" "${files[@]}" --clobber

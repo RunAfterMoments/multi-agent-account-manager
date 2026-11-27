@@ -7,6 +7,8 @@ import android.content.ClipboardManager
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.os.PersistableBundle
 import android.provider.Settings
 import androidx.core.content.FileProvider
@@ -98,6 +100,11 @@ class DownloadApkArgs {
     var sha256: String? = null
     var filename: String = ""
     var userAgent: String = ""
+}
+
+@InvokeArg
+class InstallApkArgs {
+    var path: String = ""
 }
 
 @TauriPlugin
@@ -262,6 +269,16 @@ class AccountSessionPlugin(private val activity: Activity) : Plugin(activity) {
                 }
                 clipboard.setPrimaryClip(clip)
                 invoke.resolve(JSObject())
+                // 60 秒后自动清理剪贴板：只在内容仍是本次复制的 Cookie 时才清。
+                Handler(Looper.getMainLooper()).postDelayed({
+                    try {
+                        val currentText = clipboard.primaryClip?.getItemAt(0)?.text?.toString()
+                        if (currentText == cookies) {
+                            clipboard.setPrimaryClip(ClipData.newPlainText("", ""))
+                        }
+                    } catch (_: Exception) {
+                    }
+                }, 60_000)
             } catch (error: Exception) {
                 invoke.reject("复制 Cookie 失败，请稍后重试")
             }
@@ -277,7 +294,11 @@ class AccountSessionPlugin(private val activity: Activity) : Plugin(activity) {
                     invoke.reject("系统 WebView 不支持 MULTI_PROFILE")
                     return@runOnUiThread
                 }
-                val cookieManager = ProfileStore.getInstance().getProfile(args.uuid)?.cookieManager
+                // 新账号从未打开过时 profile 还不存在（profile 由打开会话
+                // 的 WebViewCompat.setProfile 创建），getProfile 会返回 null
+                // 导致导入直接失败；用 getOrCreateProfile（webkit 1.18.0
+                // 已提供）按需创建。
+                val cookieManager = ProfileStore.getInstance().getOrCreateProfile(args.uuid)?.cookieManager
                 if (cookieManager == null) {
                     invoke.reject("无法访问该账号的隔离 Cookie 存储")
                     return@runOnUiThread
@@ -361,9 +382,9 @@ class AccountSessionPlugin(private val activity: Activity) : Plugin(activity) {
     }
 
     @Command
-    fun downloadAndInstallApk(invoke: Invoke) {
+    fun downloadApk(invoke: Invoke) {
         val args = invoke.parseArgs(DownloadApkArgs::class.java)
-        thread(name = "maam-update-apk") {
+        thread(name = "maam-update-apk-dl") {
             var conn: HttpURLConnection? = null
             val rawName = args.filename.substringAfterLast('/').substringAfterLast('\\').trim()
             val safeName = rawName
@@ -376,11 +397,22 @@ class AccountSessionPlugin(private val activity: Activity) : Plugin(activity) {
             val partFile = File(updatesDir, "$safeName.part")
             val expectedSha = args.sha256?.trim()?.lowercase()?.takeIf { it.isNotEmpty() }
 
+            // SHA-256 必填（P0）：缺失或格式非法时拒绝安装并删除已下载文件，
+            // 不复用旧文件、不调起安装器。Rust 侧已在调用前强制要求，这里是
+            // 纵深防御——绕开 Rust 命令直接调插件时也不能跳过校验。
+            if (expectedSha == null || !Regex("^[a-f0-9]{64}$").matches(expectedSha)) {
+                if (targetFile.exists()) targetFile.delete()
+                if (partFile.exists()) partFile.delete()
+                val errMsg = if (expectedSha == null) "缺少更新包 SHA-256，拒绝安装" else "SHA-256 格式无效，拒绝安装"
+                AccountSessionCoordinator.emitUpdateProgress("error", 0L, null, null, errMsg)
+                invoke.reject(errMsg)
+                return@thread
+            }
+
             try {
-                val canReuse = targetFile.exists() && targetFile.length() > 0L && (
-                    (expectedSha != null && computeSha256Hex(targetFile) == expectedSha) ||
-                        (expectedSha == null && lastDownloadedUrl == args.url && lastDownloadedPath == targetFile.absolutePath)
-                )
+                // 复用分支一律重算摘要，不再凭 URL 信任旧文件。
+                val canReuse = targetFile.exists() && targetFile.length() > 0L &&
+                    computeSha256Hex(targetFile) == expectedSha
 
                 if (!canReuse) {
                     AccountSessionCoordinator.emitUpdateProgress(
@@ -396,6 +428,12 @@ class AccountSessionPlugin(private val activity: Activity) : Plugin(activity) {
                         throw IllegalStateException("下载更新包失败（HTTP $status）")
                     }
                     val totalBytes = conn.contentLengthLong.takeIf { it > 0L }
+                    // 下载上限 512 MiB（与桌面 updater.rs 的 MAX_UPDATE_DOWNLOAD_BYTES
+                    // 一致）：服务端谎报/不报 Content-Length 时，流式循环里按已下载量硬停。
+                    val maxApkBytes = 512L * 1024L * 1024L
+                    if (totalBytes != null && totalBytes > maxApkBytes) {
+                        throw IllegalStateException("更新包超过 512 MiB 上限，拒绝下载")
+                    }
                     val digest = MessageDigest.getInstance("SHA-256")
                     var downloaded = 0L
                     var lastEmitTime = 0L
@@ -413,6 +451,9 @@ class AccountSessionPlugin(private val activity: Activity) : Plugin(activity) {
                                 output.write(buf, 0, n)
                                 digest.update(buf, 0, n)
                                 downloaded += n
+                                if (downloaded > maxApkBytes) {
+                                    throw IllegalStateException("更新包超过 512 MiB 上限，拒绝下载")
+                                }
                                 val pct = totalBytes?.let { ((downloaded * 100L) / it).toInt().coerceIn(0, 100) }
                                 val now = System.currentTimeMillis()
                                 if (now - lastEmitTime >= 150L || (pct != null && pct != lastEmitPercent)) {
@@ -439,7 +480,7 @@ class AccountSessionPlugin(private val activity: Activity) : Plugin(activity) {
                         message = "正在校验安装包完整性...",
                     )
                     val actualSha = digest.digest().joinToString("") { "%02x".format(it) }
-                    if (expectedSha != null && actualSha != expectedSha) {
+                    if (actualSha != expectedSha) {
                         partFile.delete()
                         throw IllegalStateException("安装包 SHA-256 校验失败，请重试")
                     }
@@ -466,61 +507,12 @@ class AccountSessionPlugin(private val activity: Activity) : Plugin(activity) {
                     lastDownloadedPath = targetFile.absolutePath
                 }
 
-                activity.runOnUiThread {
-                    try {
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !activity.packageManager.canRequestPackageInstalls()) {
-                            val permIntent = Intent(
-                                Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
-                                Uri.parse("package:${activity.packageName}"),
-                            ).apply {
-                                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                            }
-                            activity.startActivity(permIntent)
-                            val msg = "请先开启“允许安装未知来源应用”，开启后返回再次点击安装"
-                            AccountSessionCoordinator.emitUpdateProgress(
-                                stage = "needs_permission",
-                                downloaded = targetFile.length(),
-                                total = targetFile.length(),
-                                percent = 100,
-                                message = msg,
-                            )
-                            val ret = JSObject().apply {
-                                put("status", "needs_permission")
-                                put("message", msg)
-                            }
-                            invoke.resolve(ret)
-                            return@runOnUiThread
-                        }
-
-                        val apkUri = FileProvider.getUriForFile(
-                            activity,
-                            "${activity.packageName}.fileprovider",
-                            targetFile,
-                        )
-                        val installIntent = Intent(Intent.ACTION_VIEW).apply {
-                            setDataAndType(apkUri, "application/vnd.android.package-archive")
-                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                        }
-                        activity.startActivity(installIntent)
-                        val msg = "已调起系统安装器，请按提示完成覆盖更新"
-                        AccountSessionCoordinator.emitUpdateProgress(
-                            stage = "ready",
-                            downloaded = targetFile.length(),
-                            total = targetFile.length(),
-                            percent = 100,
-                            message = msg,
-                        )
-                        val ret = JSObject().apply {
-                            put("status", "installer_launched")
-                            put("message", msg)
-                        }
-                        invoke.resolve(ret)
-                    } catch (t: Throwable) {
-                        val err = t.message ?: "调起系统安装器失败"
-                        AccountSessionCoordinator.emitUpdateProgress("error", 0L, null, null, err)
-                        invoke.reject(err)
-                    }
+                val ret = JSObject().apply {
+                    put("status", "downloaded")
+                    put("message", "安装包已下载完成")
+                    put("path", targetFile.absolutePath)
                 }
+                invoke.resolve(ret)
             } catch (t: Throwable) {
                 if (partFile.exists()) {
                     partFile.delete()
@@ -534,6 +526,81 @@ class AccountSessionPlugin(private val activity: Activity) : Plugin(activity) {
         }
     }
 
+    @Command
+    fun installApk(invoke: Invoke) {
+        val args = invoke.parseArgs(InstallApkArgs::class.java)
+        thread(name = "maam-update-apk-install") {
+            val apkFile = File(args.path)
+            // 必须位于应用缓存 updates 目录下、是 .apk 文件、真实存在。
+            val updatesDir = File(activity.cacheDir, "updates")
+            val canonicalUpdates = updatesDir.canonicalFile
+            val canonicalApk = apkFile.canonicalFile
+            if (!canonicalApk.path.startsWith(canonicalUpdates.path + File.separator)
+                || !canonicalApk.name.endsWith(".apk", ignoreCase = true)
+                || !canonicalApk.isFile
+            ) {
+                invoke.reject("安装包路径不在应用缓存的 updates 目录下，拒绝安装")
+                return@thread
+            }
+            val targetFile = canonicalApk
+
+            activity.runOnUiThread {
+                try {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !activity.packageManager.canRequestPackageInstalls()) {
+                        val permIntent = Intent(
+                            Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                            Uri.parse("package:${activity.packageName}"),
+                        ).apply {
+                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        }
+                        activity.startActivity(permIntent)
+                        val msg = "请先开启“允许安装未知来源应用”，开启后返回再次点击安装"
+                        AccountSessionCoordinator.emitUpdateProgress(
+                            stage = "needs_permission",
+                            downloaded = targetFile.length(),
+                            total = targetFile.length(),
+                            percent = 100,
+                            message = msg,
+                        )
+                        val ret = JSObject().apply {
+                            put("status", "needs_permission")
+                            put("message", msg)
+                        }
+                        invoke.resolve(ret)
+                        return@runOnUiThread
+                    }
+
+                    val apkUri = FileProvider.getUriForFile(
+                        activity,
+                        "${activity.packageName}.fileprovider",
+                        targetFile,
+                    )
+                    val installIntent = Intent(Intent.ACTION_VIEW).apply {
+                        setDataAndType(apkUri, "application/vnd.android.package-archive")
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    }
+                    activity.startActivity(installIntent)
+                    val msg = "已调起系统安装器，请按提示完成覆盖更新"
+                    AccountSessionCoordinator.emitUpdateProgress(
+                        stage = "ready",
+                        downloaded = targetFile.length(),
+                        total = targetFile.length(),
+                        percent = 100,
+                        message = msg,
+                    )
+                    val ret = JSObject().apply {
+                        put("status", "installer_launched")
+                        put("message", msg)
+                    }
+                    invoke.resolve(ret)
+                } catch (t: Throwable) {
+                    val err = t.message ?: "调起系统安装器失败"
+                    AccountSessionCoordinator.emitUpdateProgress("error", 0L, null, null, err)
+                    invoke.reject(err)
+                }
+            }
+        }
+    }
     private fun openHttpConnection(
         rawUrl: String,
         userAgent: String,
@@ -543,6 +610,17 @@ class AccountSessionPlugin(private val activity: Activity) : Plugin(activity) {
         var currentUrl = URL(rawUrl)
         if (!currentUrl.protocol.equals("https", ignoreCase = true)) {
             throw IllegalArgumentException("仅允许 HTTPS 更新地址")
+        }
+        // 重定向白名单（与 Rust updater.rs 的 is_allowed_redirect_target 一致）：
+        // 初始地址与每一跳都必须是这四个精确主机，不含子域名。
+        val allowedHosts = setOf(
+            "github.com",
+            "api.github.com",
+            "objects.githubusercontent.com",
+            "release-assets.githubusercontent.com"
+        )
+        if (!allowedHosts.contains(currentUrl.host.lowercase())) {
+            throw IllegalStateException("重定向目标主机不在白名单内")
         }
         for (hop in 0 until 10) {
             val conn = (currentUrl.openConnection() as HttpURLConnection).apply {
@@ -571,6 +649,9 @@ class AccountSessionPlugin(private val activity: Activity) : Plugin(activity) {
                 val nextUrl = URL(currentUrl, location)
                 if (!nextUrl.protocol.equals("https", ignoreCase = true)) {
                     throw IllegalStateException("重定向到非 HTTPS 地址已被拒绝")
+                }
+                if (!allowedHosts.contains(nextUrl.host.lowercase())) {
+                    throw IllegalStateException("重定向目标主机不在白名单内")
                 }
                 currentUrl = nextUrl
                 continue

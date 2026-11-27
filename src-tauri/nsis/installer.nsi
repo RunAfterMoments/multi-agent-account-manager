@@ -54,6 +54,11 @@ ${StrLoc}
 !define MAINBINARYNAME "{{main_binary_name}}"
 !define MAINBINARYSRCPATH "{{main_binary_path}}"
 !define BUNDLEID "{{bundle_id}}"
+; 卸载时递归删除 $APPDATA\${BUNDLEID} 与 $LOCALAPPDATA\${BUNDLEID}：
+; BUNDLEID 为空时 RmDir /r 会删错目录，编译期直接报错，绝不放行。
+!if "${BUNDLEID}" == ""
+  !error "BUNDLEID must not be empty (recursive uninstall paths depend on it)"
+!endif
 !define COPYRIGHT "{{copyright}}"
 !define OUTFILE "{{out_file}}"
 !define ARCH "{{arch}}"
@@ -372,10 +377,22 @@ Function PageLeaveReinstall
     ${Else}
       ReadRegStr $4 SHCTX "${MANUPRODUCTKEY}" ""
       ReadRegStr $R1 SHCTX "${UNINSTKEY}" "UninstallString"
-      ${IfThen} $UpdateMode = 1 ${|} StrCpy $R1 "$R1 /UPDATE" ${|} ; append /UPDATE
-      ${IfThen} $PassiveMode = 1 ${|} StrCpy $R1 "$R1 /P" ${|} ; append /P
-      StrCpy $R1 "$R1 _?=$4" ; append uninstall directory
-      ExecWait '$R1' $0
+      ; 注册表里的安装目录不可盲信：目录下必须同时有本应用的
+      ; uninstall.exe 与主程序，否则视为被篡改——跳过旧版卸载
+      ;（$R1 置空）与目录清理（$4 置空），按全新安装继续。
+      ${IfNot} ${FileExists} "$4\uninstall.exe"
+      ${OrIfNot} ${FileExists} "$4\${MAINBINARYNAME}.exe"
+        StrCpy $4 ""
+        StrCpy $R1 ""
+      ${EndIf}
+      ${If} $R1 != ""
+        ${IfThen} $UpdateMode = 1 ${|} StrCpy $R1 "$R1 /UPDATE" ${|} ; append /UPDATE
+        ${IfThen} $PassiveMode = 1 ${|} StrCpy $R1 "$R1 /P" ${|} ; append /P
+        StrCpy $R1 "$R1 _?=$4" ; append uninstall directory
+        ExecWait '$R1' $0
+      ${Else}
+        StrCpy $0 0 ; 无可信的旧版卸载器，直接按全新安装继续
+      ${EndIf}
     ${EndIf}
 
     BringToFront

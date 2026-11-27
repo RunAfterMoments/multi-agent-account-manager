@@ -2,9 +2,9 @@ use crate::providers::ProviderId;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
-use std::fs::{self, File};
+use std::fs;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
@@ -38,6 +38,18 @@ pub struct AppSettings {
   pub global_shortcut: String,
   #[serde(default)]
   pub auto_approve: bool,
+  /// 禁用自动更新检查。默认 false（配置了更新源时保持自动检查）；
+  /// 未配置更新源时无论此开关如何都不检查更新。
+  #[serde(default)]
+  pub disable_auto_update_check: bool,
+  // 允许自动批准命令执行类审批（执行命令 / shell / bash / 终端）。
+  // 独立开关，默认关闭；开启后仍受 DANGER_RE 拦截危险命令。
+  #[serde(default)]
+  pub auto_approve_commands: bool,
+  /// 折叠左侧账号栏：只留 68px 服务栏，账号 WebView 多出 312px。
+  /// 旧版 accounts.json 没有该字段时默认 false，无需升 STORE_VERSION。
+  #[serde(default)]
+  pub sidebar_collapsed: bool,
 }
 
 impl Default for AppSettings {
@@ -46,6 +58,9 @@ impl Default for AppSettings {
       minimize_to_tray: true,
       global_shortcut: default_global_shortcut(),
       auto_approve: false,
+      disable_auto_update_check: false,
+      auto_approve_commands: false,
+      sidebar_collapsed: false,
     }
   }
 }
@@ -181,6 +196,17 @@ pub enum ExternalAgentKind {
   LocalCli,
 }
 
+/// 本地 CLI / OpenAI API 成员的默认总超时：600 秒（原先写死的 120 秒
+/// 对跑工具循环的 agent 太短）。
+pub fn default_agent_timeout_secs() -> u64 {
+  600
+}
+
+/// 默认空闲超时：N 秒无任何输出才判超时（与总超时分开算）。
+pub fn default_agent_idle_timeout_secs() -> u64 {
+  60
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExternalAgentRecord {
@@ -189,8 +215,38 @@ pub struct ExternalAgentRecord {
   pub name: String,
   #[serde(default)]
   pub base_url: String,
-  #[serde(default)]
+  /// 仅内存：永不序列化落盘（见 `crate::key_vault`）。
+  #[serde(default, skip_serializing)]
   pub api_key: String,
+  /// 系统凭据库 / 回退文件中的引用 id，序列化为 `apiKeyRef`。
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub api_key_ref: Option<String>,
+  #[serde(default)]
+  pub model: String,
+  #[serde(default)]
+  pub command: String,
+  #[serde(default)]
+  pub args: Vec<String>,
+  #[serde(default)]
+  pub workdir: Option<String>,
+  #[serde(default = "default_agent_timeout_secs")]
+  pub timeout_secs: u64,
+  #[serde(default = "default_agent_idle_timeout_secs")]
+  pub idle_timeout_secs: u64,
+  #[serde(default)]
+  pub created_at_ms: u64,
+}
+
+/// 下发给前端的外部成员视图：不含明文 Key，只给 `hasApiKey`。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalAgentView {
+  pub id: String,
+  pub kind: ExternalAgentKind,
+  pub name: String,
+  #[serde(default)]
+  pub base_url: String,
+  pub has_api_key: bool,
   #[serde(default)]
   pub model: String,
   #[serde(default)]
@@ -201,6 +257,37 @@ pub struct ExternalAgentRecord {
   pub workdir: Option<String>,
   #[serde(default)]
   pub created_at_ms: u64,
+}
+
+impl ExternalAgentView {
+  pub fn from_record(record: &ExternalAgentRecord) -> Self {
+    Self {
+      id: record.id.clone(),
+      kind: record.kind,
+      name: record.name.clone(),
+      base_url: record.base_url.clone(),
+      has_api_key: !record.api_key.trim().is_empty(),
+      model: record.model.clone(),
+      command: record.command.clone(),
+      args: record.args.clone(),
+      workdir: record.workdir.clone(),
+      created_at_ms: record.created_at_ms,
+    }
+  }
+
+  /// 与 `ExternalAgentRecord::account_key` 同款派生键。
+  /// 仅测试调用（快照里的 View 取键断言）；lib 目标的死代码检查
+  /// 看不到 `#[cfg(test)]` 调用方，故此处显式 allow。
+  #[allow(dead_code)]
+  pub fn account_key(&self) -> AccountKey {
+    AccountKey {
+      provider_id: match self.kind {
+        ExternalAgentKind::OpenaiApi => ProviderId::api(),
+        ExternalAgentKind::LocalCli => ProviderId::cli(),
+      },
+      uuid: self.id.clone(),
+    }
+  }
 }
 
 impl ExternalAgentRecord {
@@ -280,6 +367,12 @@ pub struct AccountsStoreFile {
   pub external_agents: Vec<ExternalAgentRecord>,
   #[serde(default)]
   pub settings: AppSettings,
+  /// 未知 / 非内置 provider 的账号原始 JSON。
+  /// 加载时保留、保存时由 `save_store_atomic` 原样写回，
+  /// 避免新版才认识的 provider 让整份配置加载失败后丢失。
+  /// 不参与 serde：磁盘往返只走 `save_store_atomic` 的合并逻辑。
+  #[serde(default, skip)]
+  pub unknown_accounts: Vec<Value>,
 }
 
 impl Default for AccountsStoreFile {
@@ -292,6 +385,7 @@ impl Default for AccountsStoreFile {
       group_chats: Vec::new(),
       external_agents: Vec::new(),
       settings: AppSettings::default(),
+      unknown_accounts: Vec::new(),
     }
   }
 }
@@ -300,6 +394,11 @@ pub struct LoadedAccountsStore {
   pub store: AccountsStoreFile,
   pub conflicts: Vec<ConflictItem>,
   pub startup_notice: Option<String>,
+  /// 加载失败或配置版本过高时为 true：`SessionManager::persist` 必须拒绝写盘，
+  /// 直到用户明确选择「以空配置继续」或「从备份恢复」。
+  pub persist_blocked: bool,
+  /// 配置 `version` 高于当前 `STORE_VERSION` 时为 true：只读，永不写回。
+  pub read_only: bool,
 }
 
 pub fn now_ms() -> u64 {
@@ -310,7 +409,9 @@ pub fn now_ms() -> u64 {
 }
 
 pub fn normalize_uuid(raw: &str) -> Option<String> {
-  Uuid::parse_str(raw.trim()).ok().map(|u| u.hyphenated().to_string())
+  Uuid::parse_str(raw.trim())
+    .ok()
+    .map(|u| u.hyphenated().to_string())
 }
 
 pub fn detect_conflicts(accounts: &[AccountRecord]) -> Vec<ConflictItem> {
@@ -380,34 +481,48 @@ fn migrate_from_value(root: Value) -> Result<(AccountsStoreFile, bool), String> 
   }
 
   let mut accounts = Vec::new();
+  let mut unknown_accounts: Vec<Value> = Vec::new();
 
   if let Some(arr) = obj.get("accounts").and_then(|v| v.as_array()) {
     for item in arr {
       let item_obj = item
         .as_object()
         .ok_or_else(|| "账号条目格式错误".to_string())?;
+      // 未知 / 非内置 provider 的账号：保留原始 JSON，整份配置不失败。
+      // 覆盖未来版本的新 provider、已下线的 custom-*、以及 accounts 里的 api/cli。
+      if let Some(s) = item_obj
+        .get("providerId")
+        .or_else(|| item_obj.get("provider_id"))
+        .and_then(|v| v.as_str())
+      {
+        match ProviderId::parse(s) {
+          Some(p) if p.is_builtin() => {}
+          _ => {
+            dirty = true;
+            unknown_accounts.push(item.clone());
+            continue;
+          }
+        }
+      }
       let raw_uuid = item_obj
         .get("uuid")
         .or_else(|| item_obj.get("id"))
         .and_then(|v| v.as_str())
         .ok_or_else(|| "账号缺少 UUID".to_string())?;
       let uuid = normalize_uuid(raw_uuid).ok_or_else(|| "账号 UUID 非法".to_string())?;
-      let provider_id = match item_obj.get("providerId").or_else(|| item_obj.get("provider_id")) {
+      let provider_id = match item_obj
+        .get("providerId")
+        .or_else(|| item_obj.get("provider_id"))
+      {
         Some(v) => {
           let s = v.as_str().ok_or_else(|| "providerId 非法".to_string())?;
-          if s.trim().to_ascii_lowercase().starts_with("custom-") {
-            dirty = true;
-            continue;
-          }
-          ProviderId::parse(s).ok_or_else(|| format!("未知服务标识: {s}"))?
+          ProviderId::parse(s)
+            .filter(|p| p.is_builtin())
+            .ok_or_else(|| format!("未知服务标识: {s}"))?
         }
         None if is_legacy => ProviderId::muse(),
         None => return Err("新版配置账号缺少 providerId".to_string()),
       };
-      if !provider_id.is_builtin() {
-        dirty = true;
-        continue;
-      }
       let alias = item_obj
         .get("alias")
         .or_else(|| item_obj.get("name"))
@@ -561,6 +676,20 @@ fn migrate_from_value(root: Value) -> Result<(AccountsStoreFile, bool), String> 
     {
       settings.auto_approve = auto_approve;
     }
+    if let Some(disable_auto_update_check) = settings_obj
+      .get("disableAutoUpdateCheck")
+      .or_else(|| settings_obj.get("disable_auto_update_check"))
+      .and_then(|v| v.as_bool())
+    {
+      settings.disable_auto_update_check = disable_auto_update_check;
+    }
+    if let Some(auto_approve_commands) = settings_obj
+      .get("autoApproveCommands")
+      .or_else(|| settings_obj.get("auto_approve_commands"))
+      .and_then(|v| v.as_bool())
+    {
+      settings.auto_approve_commands = auto_approve_commands;
+    }
   }
 
   let mut external_agents = Vec::new();
@@ -609,12 +738,26 @@ fn migrate_from_value(root: Value) -> Result<(AccountsStoreFile, bool), String> 
         .and_then(|v| v.as_str())
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
-      let api_key = ext_obj
+      // 旧明文 Key：只留内存，记引用 id，标记 dirty 以便重写去明文；
+      // 已迁移的记录只有 apiKeyRef，内存 Key 由 vault 在加载时补。
+      let legacy_key = ext_obj
         .get("apiKey")
         .or_else(|| ext_obj.get("api_key"))
         .and_then(|v| v.as_str())
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
+      let stored_ref = ext_obj
+        .get("apiKeyRef")
+        .or_else(|| ext_obj.get("api_key_ref"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+      let (api_key, api_key_ref) = if !legacy_key.is_empty() {
+        dirty = true;
+        (legacy_key, Some(crate::key_vault::api_key_ref_for(&ext_id)))
+      } else {
+        (String::new(), stored_ref)
+      };
       let model = ext_obj
         .get("model")
         .and_then(|v| v.as_str())
@@ -648,16 +791,32 @@ fn migrate_from_value(root: Value) -> Result<(AccountsStoreFile, bool), String> 
         .or_else(|| ext_obj.get("created_at_ms"))
         .and_then(|v| v.as_u64())
         .unwrap_or_else(now_ms);
+      // 旧配置没有这两个字段时按默认值补齐；越界值视为损坏，按默认处理。
+      let timeout_secs = ext_obj
+        .get("timeoutSecs")
+        .or_else(|| ext_obj.get("timeout_secs"))
+        .and_then(|v| v.as_u64())
+        .filter(|v| (30..=3600).contains(v))
+        .unwrap_or_else(default_agent_timeout_secs);
+      let idle_timeout_secs = ext_obj
+        .get("idleTimeoutSecs")
+        .or_else(|| ext_obj.get("idle_timeout_secs"))
+        .and_then(|v| v.as_u64())
+        .filter(|v| (10..=600).contains(v))
+        .unwrap_or_else(default_agent_idle_timeout_secs);
       external_agents.push(ExternalAgentRecord {
         id: ext_id,
         kind,
         name: ext_name,
         base_url,
         api_key,
+        api_key_ref,
         model,
         command,
         args,
         workdir,
+        timeout_secs,
+        idle_timeout_secs,
         created_at_ms: ext_created,
       });
     }
@@ -1037,24 +1196,97 @@ fn migrate_from_value(root: Value) -> Result<(AccountsStoreFile, bool), String> 
       group_chats,
       external_agents,
       settings,
+      unknown_accounts,
     },
     dirty,
   ))
+}
+
+fn corrupt_backup_path(path: &Path, timestamp_ms: u64, attempt: u32) -> PathBuf {
+  let file_name = path
+    .file_name()
+    .map(|n| n.to_string_lossy().into_owned())
+    .unwrap_or_else(|| "accounts.json".to_string());
+  let suffix = if attempt == 0 {
+    format!("corrupt-{timestamp_ms}")
+  } else {
+    format!("corrupt-{timestamp_ms}-{attempt}")
+  };
+  path.with_file_name(format!("{file_name}.{suffix}"))
+}
+
+/// 加载失败时把原文件复制为 `accounts.json.corrupt-<unix_ms>`。
+/// 已有同名备份时追加序号，永不覆盖；复制失败返回 None 并写日志。
+fn backup_corrupt_file(path: &Path) -> Option<PathBuf> {
+  let timestamp_ms = now_ms();
+  for attempt in 0..1000u32 {
+    let candidate = corrupt_backup_path(path, timestamp_ms, attempt);
+    if candidate.exists() {
+      continue;
+    }
+    return match fs::copy(path, &candidate) {
+      Ok(_) => Some(candidate),
+      Err(err) => {
+        eprintln!("[叠号] 备份损坏配置失败: {err}");
+        None
+      }
+    };
+  }
+  eprintln!("[叠号] 备份损坏配置失败：无法找到未占用的备份文件名");
+  None
+}
+
+/// 成功加载后把刚加载过的文件滚动备份为 `accounts.json.bak`（单份滚动覆盖）。
+/// 失败只写日志，不影响加载结果。
+fn backup_last_good_file(path: &Path) {
+  let Some(file_name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+    return;
+  };
+  let bak = path.with_file_name(format!("{file_name}.bak"));
+  if let Err(err) = fs::copy(path, &bak) {
+    eprintln!("[叠号] 滚动备份配置失败: {err}");
+  }
+}
+
+fn backup_file_name(path: &Path) -> String {
+  path
+    .file_name()
+    .map(|n| n.to_string_lossy().into_owned())
+    .unwrap_or_else(|| "accounts.json.corrupt-?".to_string())
 }
 
 pub fn save_store_atomic(path: &Path, store: &AccountsStoreFile) -> Result<(), String> {
   if let Some(parent) = path.parent() {
     fs::create_dir_all(parent).map_err(|e| format!("创建配置目录失败: {e}"))?;
   }
-  let bytes = serde_json::to_vec_pretty(store).map_err(|e| format!("序列化配置失败: {e}"))?;
-  let tmp_name = format!(
-    ".accounts.json.tmp.{}",
-    Uuid::new_v4().simple()
-  );
+  // 未知 provider 的账号不参与结构体序列化，在此原样拼回 accounts，
+  // 使「加载→保存」不丢条目。没有未知条目时输出与原来完全一致。
+  let mut value = serde_json::to_value(store).map_err(|e| format!("序列化配置失败: {e}"))?;
+  if !store.unknown_accounts.is_empty() {
+    if let Some(arr) = value.get_mut("accounts").and_then(|v| v.as_array_mut()) {
+      arr.extend(store.unknown_accounts.iter().cloned());
+    }
+  }
+  let bytes = serde_json::to_vec_pretty(&value).map_err(|e| format!("序列化配置失败: {e}"))?;
+  let tmp_name = format!(".accounts.json.tmp.{}", Uuid::new_v4().simple());
   let tmp_path = path.with_file_name(tmp_name);
 
   {
-    let mut file = File::create(&tmp_path).map_err(|e| format!("创建临时配置文件失败: {e}"))?;
+    // P1-7：临时文件按 0600 创建（Unix），最终文件经 rename 继承该权限；
+    // 原子写流程（临时文件 → sync_all → rename）本身不变。
+    #[cfg(unix)]
+    let mut file = {
+      use std::os::unix::fs::OpenOptionsExt;
+      fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp_path)
+        .map_err(|e| format!("创建临时配置文件失败: {e}"))?
+    };
+    #[cfg(not(unix))]
+    let mut file = fs::File::create(&tmp_path).map_err(|e| format!("创建临时配置文件失败: {e}"))?;
     file
       .write_all(&bytes)
       .map_err(|e| format!("写入临时配置文件失败: {e}"))?;
@@ -1069,22 +1301,48 @@ pub fn save_store_atomic(path: &Path, store: &AccountsStoreFile) -> Result<(), S
   })
 }
 
+/// 异步版 `save_store_atomic`：序列化与写盘在 `spawn_blocking` 中进行，
+/// 不占用异步运行时的工作线程。调用者须在调用前克隆好 store；
+/// 防抖写线程在写盘期间不持有 `SessionManager::inner` 锁
+/// （`persist_locked` 在写盘期间仍持锁，见其文档）。
+pub async fn save_store_atomic_async(
+  path: PathBuf,
+  store: AccountsStoreFile,
+) -> Result<(), String> {
+  tokio::task::spawn_blocking(move || save_store_atomic(&path, &store))
+    .await
+    .map_err(|e| format!("写盘任务中断: {e}"))?
+}
+
 pub fn load_or_migrate_store(path: &Path) -> LoadedAccountsStore {
   if !path.exists() {
     return LoadedAccountsStore {
       store: AccountsStoreFile::default(),
       conflicts: Vec::new(),
       startup_notice: None,
+      persist_blocked: false,
+      read_only: false,
     };
   }
 
   let raw = match fs::read_to_string(path) {
     Ok(content) => content,
     Err(err) => {
+      let notice = match backup_corrupt_file(path) {
+        Some(backup) => format!(
+          "读取 accounts.json 失败，已备份为 {}，写盘已被阻止，请选择「以空配置继续」或「从备份恢复」: {err}",
+          backup_file_name(&backup)
+        ),
+        None => format!(
+          "读取 accounts.json 失败，且备份也失败了，写盘已被阻止，请勿手动修改 accounts.json: {err}"
+        ),
+      };
       return LoadedAccountsStore {
         store: AccountsStoreFile::default(),
         conflicts: Vec::new(),
-        startup_notice: Some(format!("读取 accounts.json 失败，已回退管理页: {err}")),
+        startup_notice: Some(notice),
+        persist_blocked: true,
+        read_only: false,
       };
     }
   };
@@ -1092,21 +1350,52 @@ pub fn load_or_migrate_store(path: &Path) -> LoadedAccountsStore {
   let parsed: Value = match serde_json::from_str(&raw) {
     Ok(v) => v,
     Err(_) => {
+      let notice = match backup_corrupt_file(path) {
+        Some(backup) => format!(
+          "本地 accounts.json 配置损坏，已备份为 {}，写盘已被阻止，请选择「以空配置继续」或「从备份恢复」",
+          backup_file_name(&backup)
+        ),
+        None => "本地 accounts.json 配置损坏，且备份失败，写盘已被阻止，请勿手动修改 accounts.json".to_string(),
+      };
       return LoadedAccountsStore {
         store: AccountsStoreFile::default(),
         conflicts: Vec::new(),
-        startup_notice: Some("本地 accounts.json 配置损坏，已回退管理页".to_string()),
+        startup_notice: Some(notice),
+        persist_blocked: true,
+        read_only: false,
       };
     }
   };
 
+  // 高版本配置只读：先记下，迁移成功也不写回，绝不降级覆盖。
+  let file_version = parsed
+    .get("version")
+    .and_then(|v| v.as_u64())
+    .map(|v| v as u32)
+    .unwrap_or(1);
+  let future_version = file_version > STORE_VERSION;
+
   let (mut store, migrated) = match migrate_from_value(parsed) {
     Ok(res) => res,
     Err(reason) => {
+      let backup = backup_corrupt_file(path);
+      let backup_hint = backup
+        .as_ref()
+        .map(|p| format!("已备份为 {}，", backup_file_name(p)))
+        .unwrap_or_else(|| "备份失败，".to_string());
+      let notice = if future_version {
+        format!(
+          "配置版本（v{file_version}）高于当前版本（v{STORE_VERSION}），且解析失败（{reason}），{backup_hint}写盘已被阻止"
+        )
+      } else {
+        format!("解析 accounts.json 失败（{reason}），{backup_hint}写盘已被阻止，请选择「以空配置继续」或「从备份恢复」")
+      };
       return LoadedAccountsStore {
         store: AccountsStoreFile::default(),
         conflicts: Vec::new(),
-        startup_notice: Some(format!("解析 accounts.json 失败（{reason}），已回退管理页")),
+        startup_notice: Some(notice),
+        persist_blocked: true,
+        read_only: future_version,
       };
     }
   };
@@ -1114,34 +1403,402 @@ pub fn load_or_migrate_store(path: &Path) -> LoadedAccountsStore {
   let conflicts = detect_conflicts(&store.accounts);
   if !conflicts.is_empty() {
     store.last_committed = None;
+    backup_last_good_file(path);
     return LoadedAccountsStore {
       store,
       conflicts,
       startup_notice: Some("检测到账号 UUID 归属冲突，已停留在管理页等待处理".to_string()),
+      persist_blocked: false,
+      read_only: false,
+    };
+  }
+
+  if future_version {
+    backup_last_good_file(path);
+    return LoadedAccountsStore {
+      store,
+      conflicts: Vec::new(),
+      startup_notice: Some(format!(
+        "配置版本（v{file_version}）高于当前版本（v{STORE_VERSION}），已设为只读，写盘已被阻止；请升级应用，或选择「以空配置继续」"
+      )),
+      persist_blocked: true,
+      read_only: true,
+    };
+  }
+
+  // P1-7：API Key vault 迁移（仅成功加载路径）。见 migrate_agent_keys_to_vault。
+  let vault_dir = path
+    .parent()
+    .map(|p| p.to_path_buf())
+    .unwrap_or_else(|| PathBuf::from("."));
+  let key_migration_failed = !migrate_agent_keys_to_vault(&mut store, &vault_dir);
+  if key_migration_failed {
+    return LoadedAccountsStore {
+      store,
+      conflicts: Vec::new(),
+      startup_notice: Some("API Key 未能迁移到系统凭据库，已保留原配置，下次启动重试".to_string()),
+      persist_blocked: false,
+      read_only: false,
     };
   }
 
   if migrated {
     if let Err(err) = save_store_atomic(path, &store) {
+      backup_last_good_file(path);
       return LoadedAccountsStore {
         store,
         conflicts: Vec::new(),
         startup_notice: Some(format!("旧版 Muse 配置原子迁移写盘失败: {err}")),
+        persist_blocked: false,
+        read_only: false,
       };
     }
   }
 
+  backup_last_good_file(path);
   LoadedAccountsStore {
     store,
     conflicts: Vec::new(),
     startup_notice: None,
+    persist_blocked: false,
+    read_only: false,
   }
+}
+
+/// 外部成员 API Key 的 vault 迁移/回填（load 与「从备份恢复」共用）：
+/// 含 apiKeyRef 且内存有明文 Key（旧备份）→ 写入 vault；含 apiKeyRef
+/// 但内存为空（v5/v6 备份，Key 只在 vault 里）→ 从 vault 取回内存。
+/// 返回 false 表示有写入失败：调用方不要把剥离了 Key 的配置写盘，
+/// 否则明文 Key 永久丢失（api_key 标了 skip_serializing，写盘即丢）。
+pub fn migrate_agent_keys_to_vault(store: &mut AccountsStoreFile, vault_dir: &Path) -> bool {
+  let vault = crate::key_vault::ApiKeyVault::new(vault_dir.to_path_buf());
+  let mut ok = true;
+  for agent in &mut store.external_agents {
+    if let Some(key_ref) = agent.api_key_ref.clone() {
+      if !agent.api_key.is_empty() {
+        if vault.store_key(&key_ref, &agent.api_key).is_err() {
+          ok = false;
+        }
+      } else {
+        agent.api_key = vault.load_key(&key_ref).unwrap_or_default();
+      }
+    }
+  }
+  ok
+}
+
+/// 仅内存解析候选配置文本（供「从备份恢复」校验用）：不读盘、不写盘、
+/// 不做损坏备份、不做 vault 迁移、不做迁移写回。成功返回可直接写回的
+/// LoadedAccountsStore；失败返回原因。未来版本拒绝恢复（重写会丢
+/// 未知字段）；账号 UUID 冲突的仍可恢复（last_committed 置空，UI 侧处理）。
+pub fn parse_store_str(raw: &str) -> Result<LoadedAccountsStore, String> {
+  let parsed: Value = serde_json::from_str(raw).map_err(|e| format!("配置 JSON 解析失败: {e}"))?;
+  let file_version = parsed
+    .get("version")
+    .and_then(|v| v.as_u64())
+    .map(|v| v as u32)
+    .unwrap_or(1);
+  if file_version > STORE_VERSION {
+    return Err(format!(
+      "配置版本（v{file_version}）高于当前版本（v{STORE_VERSION}），无法恢复"
+    ));
+  }
+  let (mut store, _migrated) =
+    migrate_from_value(parsed).map_err(|reason| format!("解析 accounts.json 失败（{reason}）"))?;
+  let conflicts = detect_conflicts(&store.accounts);
+  if !conflicts.is_empty() {
+    store.last_committed = None;
+  }
+  Ok(LoadedAccountsStore {
+    store,
+    conflicts,
+    startup_notice: None,
+    persist_blocked: false,
+    read_only: false,
+  })
 }
 
 #[cfg(test)]
 mod tests {
   use super::migrate_from_value;
+  use super::{load_or_migrate_store, save_store_atomic};
   use serde_json::json;
+  use std::path::PathBuf;
+  use uuid::Uuid;
+
+  fn temp_store_dir(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("maam-storage-{tag}-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+  }
+
+  fn corrupt_backups(dir: &std::path::Path) -> Vec<PathBuf> {
+    std::fs::read_dir(dir)
+      .unwrap()
+      .filter_map(|e| e.ok())
+      .map(|e| e.path())
+      .filter(|p| {
+        p.file_name()
+          .and_then(|n| n.to_str())
+          .is_some_and(|n| n.starts_with("accounts.json.corrupt-"))
+      })
+      .collect()
+  }
+
+  fn make_bench_store(groups: usize, msgs_per_group: usize) -> super::AccountsStoreFile {
+    use super::{GroupChatMessage, GroupChatRecord, GroupReplyStatus, GroupWorkflowMode};
+    let mut group_chats = Vec::new();
+    for g in 0..groups {
+      let messages = (0..msgs_per_group)
+        .map(|m| GroupChatMessage {
+          id: format!("m-{g}-{m}"),
+          role: "assistant".to_string(),
+          sender: None,
+          sender_name: "bench".to_string(),
+          content: "这是一条用于写盘基准测试的群聊消息，内容包含中文与标点符号。".repeat(2),
+          created_at_ms: 1_700_000_000_000 + m as u64,
+          status: GroupReplyStatus::Done,
+          targets: Vec::new(),
+          error: None,
+          stage_label: None,
+          hop_depth: 0,
+          auto_routed_channel: None,
+        })
+        .collect();
+      group_chats.push(GroupChatRecord {
+        id: format!("g-{g}"),
+        name: format!("基准群 {g}"),
+        members: Vec::new(),
+        created_at_ms: 1,
+        messages,
+        shared_context: String::new(),
+        shared_skills: Vec::new(),
+        member_roles: Vec::new(),
+        workflow_mode: GroupWorkflowMode::Parallel,
+        max_relay_hops: 2,
+        thread_bindings: Vec::new(),
+      });
+    }
+    super::AccountsStoreFile {
+      version: super::STORE_VERSION,
+      accounts: Vec::new(),
+      last_committed: None,
+      pending_cleanup: Vec::new(),
+      group_chats,
+      external_agents: Vec::new(),
+      settings: super::AppSettings::default(),
+      unknown_accounts: Vec::new(),
+    }
+  }
+
+  #[test]
+  fn external_agent_record_serialization_never_contains_api_key() {
+    let rec = super::ExternalAgentRecord {
+      id: "00000000-0000-4000-8000-000000000051".to_string(),
+      kind: super::ExternalAgentKind::OpenaiApi,
+      name: "DeepSeek-R".to_string(),
+      base_url: "https://api.deepseek.com/v1".to_string(),
+      api_key: "sk-secret-123".to_string(),
+      api_key_ref: Some("maam-api-key:00000000-0000-4000-8000-000000000051".to_string()),
+      model: "deepseek-chat".to_string(),
+      command: String::new(),
+      args: Vec::new(),
+      workdir: None,
+      timeout_secs: super::default_agent_timeout_secs(),
+      idle_timeout_secs: super::default_agent_idle_timeout_secs(),
+      created_at_ms: 1,
+    };
+    let text = serde_json::to_string(&rec).expect("serialize record");
+    assert!(
+      !text.contains("sk-secret-123"),
+      "明文 API Key 不得出现在序列化结果中: {text}"
+    );
+    let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert!(
+      value.get("apiKey").is_none(),
+      "序列化结果不得含 apiKey 字段"
+    );
+    assert_eq!(
+      value.get("apiKeyRef").and_then(|v| v.as_str()),
+      Some("maam-api-key:00000000-0000-4000-8000-000000000051")
+    );
+    // 反序列化仍能读旧明文（兼容直接读盘的旧文件），但再序列化即丢弃。
+    let legacy: super::ExternalAgentRecord = serde_json::from_value(json!({
+      "id": "00000000-0000-4000-8000-000000000051",
+      "kind": "openai_api",
+      "name": "DeepSeek-R",
+      "baseUrl": "https://api.deepseek.com/v1",
+      "apiKey": "sk-legacy",
+      "model": "deepseek-chat"
+    }))
+    .unwrap();
+    assert_eq!(legacy.api_key, "sk-legacy");
+  }
+
+  #[test]
+  fn migrate_legacy_plaintext_api_key_gets_key_ref() {
+    let raw = json!({
+      "version": 2,
+      "accounts": [],
+      "externalAgents": [
+        {
+          "id": "00000000-0000-4000-8000-000000000051",
+          "kind": "openai_api",
+          "name": "DeepSeek-R",
+          "baseUrl": "https://api.deepseek.com/v1",
+          "apiKey": "sk-test",
+          "model": "deepseek-chat"
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000052",
+          "kind": "openai_api",
+          "name": "NoKey",
+          "baseUrl": "https://api.example.com/v1",
+          "model": "m1"
+        }
+      ]
+    });
+    let (store, dirty) = migrate_from_value(raw).expect("migrate");
+    assert!(dirty, "含旧明文 Key 应标记 dirty 以便重写去明文");
+    assert_eq!(store.external_agents.len(), 2);
+    assert_eq!(store.external_agents[0].api_key, "sk-test");
+    assert_eq!(
+      store.external_agents[0].api_key_ref.as_deref(),
+      Some("maam-api-key:00000000-0000-4000-8000-000000000051")
+    );
+    assert!(store.external_agents[1].api_key_ref.is_none());
+    // 整库序列化后不得含明文。
+    let text = serde_json::to_string(&store).unwrap();
+    assert!(!text.contains("sk-test"));
+    // 已迁移的记录（只有 apiKeyRef）再次迁移不再 dirty，
+    // 且内存 Key 为空（由 vault 在加载时补）。
+    let round = serde_json::to_value(&store).unwrap();
+    let (store2, dirty2) = migrate_from_value(round).unwrap();
+    assert!(!dirty2);
+    assert_eq!(
+      store2.external_agents[0].api_key_ref,
+      store.external_agents[0].api_key_ref
+    );
+    assert!(store2.external_agents[0].api_key.is_empty());
+  }
+
+  #[test]
+  fn load_or_migrate_store_moves_legacy_api_key_to_vault() {
+    let dir = std::env::temp_dir().join(format!("maam-load-migrate-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("accounts.json");
+    std::fs::write(
+      &path,
+      serde_json::to_string_pretty(&json!({
+        "version": 2,
+        "accounts": [],
+        "externalAgents": [{
+          "id": "00000000-0000-4000-8000-000000000051",
+          "kind": "openai_api",
+          "name": "DeepSeek-R",
+          "baseUrl": "https://api.deepseek.com/v1",
+          "apiKey": "sk-legacy-999",
+          "model": "deepseek-chat"
+        }]
+      }))
+      .unwrap(),
+    )
+    .unwrap();
+
+    let loaded = super::load_or_migrate_store(&path);
+    assert_eq!(loaded.store.external_agents.len(), 1);
+    // 内存里仍有 Key（运行时调用要用）。
+    assert_eq!(loaded.store.external_agents[0].api_key, "sk-legacy-999");
+    assert!(loaded.store.external_agents[0].api_key_ref.is_some());
+    // 磁盘上的 accounts.json 已重写，不再含明文。
+    let on_disk = std::fs::read_to_string(&path).unwrap();
+    assert!(
+      !on_disk.contains("sk-legacy-999"),
+      "磁盘配置不得再含明文 Key"
+    );
+    assert!(on_disk.contains("apiKeyRef"), "磁盘配置应存引用 id");
+    // 再次加载：内存 Key 应从 vault 恢复。
+    let reloaded = super::load_or_migrate_store(&path);
+    assert_eq!(reloaded.store.external_agents[0].api_key, "sk-legacy-999");
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  #[test]
+  fn save_store_atomic_writes_0600_on_unix() {
+    let dir = std::env::temp_dir().join(format!("maam-save-0600-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("accounts.json");
+    let store = super::AccountsStoreFile::default();
+    super::save_store_atomic(&path, &store).unwrap();
+    #[cfg(unix)]
+    {
+      use std::os::unix::fs::PermissionsExt;
+      let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+      assert_eq!(mode, 0o600, "accounts.json 应为 0600，不得用默认权限落盘");
+    }
+    // 覆盖写（rename 替换）后权限仍为 0600。
+    super::save_store_atomic(&path, &store).unwrap();
+    #[cfg(unix)]
+    {
+      use std::os::unix::fs::PermissionsExt;
+      let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+      assert_eq!(mode, 0o600);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  #[tokio::test]
+  async fn bench_save_store_async_50k_matches_sync() {
+    let dir = std::env::temp_dir().join(format!("maam-bench-async-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let p_sync = dir.join("a.json");
+    let p_async = dir.join("b.json");
+
+    let store = make_bench_store(1, 50_000);
+    let start = std::time::Instant::now();
+    super::save_store_atomic(&p_sync, &store).unwrap();
+    let sync_elapsed = start.elapsed();
+    let start = std::time::Instant::now();
+    super::save_store_atomic_async(p_async.clone(), store)
+      .await
+      .unwrap();
+    let async_elapsed = start.elapsed();
+    let b_sync = std::fs::read(&p_sync).unwrap();
+    let b_async = std::fs::read(&p_async).unwrap();
+    assert_eq!(b_sync, b_async, "异步写盘结果应与同步逐字节一致");
+    eprintln!(
+      "BENCH save 1x50000 sync: {sync_elapsed:?} ({} bytes); async: {async_elapsed:?}",
+      b_sync.len()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  #[test]
+  fn bench_save_store_50k_messages_reports_timing() {
+    let dir = std::env::temp_dir().join(format!("maam-bench-save-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("accounts.json");
+
+    // 最坏情况：1 群 5 万条消息（直接构造 store，绕过加载时每群 120 条的截断）。
+    let store = make_bench_store(1, 50_000);
+    let start = std::time::Instant::now();
+    super::save_store_atomic(&path, &store).unwrap();
+    let elapsed = start.elapsed();
+    let bytes = std::fs::metadata(&path).unwrap().len();
+    eprintln!("BENCH save_store_atomic 1x50000 msgs: {elapsed:?} ({bytes} bytes)");
+
+    //  realistic 情况：500 群 x 100 条（加载后每群不超过 120 条的上界附近）。
+    let store2 = make_bench_store(500, 100);
+    let start = std::time::Instant::now();
+    super::save_store_atomic(&path, &store2).unwrap();
+    let elapsed2 = start.elapsed();
+    let bytes2 = std::fs::metadata(&path).unwrap().len();
+    eprintln!("BENCH save_store_atomic 500x100 msgs: {elapsed2:?} ({bytes2} bytes)");
+
+    // 写出的文件必须是合法 JSON，且确实包含 5 万条消息量级的内容。
+    assert!(bytes > 1_000_000, "50k 消息文件应大于 1MB，实际 {bytes}");
+    let _ = std::fs::remove_dir_all(&dir);
+  }
 
   #[test]
   fn migrate_proxy_url_accepts_camel_snake_and_malformed_types() {
@@ -1178,8 +1835,14 @@ mod tests {
 
     let (store, _) = migrate_from_value(raw).expect("migrate should tolerate malformed proxyUrl");
     assert_eq!(store.accounts.len(), 4);
-    assert_eq!(store.accounts[0].proxy_url.as_deref(), Some("http://127.0.0.1:7890"));
-    assert_eq!(store.accounts[1].proxy_url.as_deref(), Some("http://127.0.0.1:8888"));
+    assert_eq!(
+      store.accounts[0].proxy_url.as_deref(),
+      Some("http://127.0.0.1:7890")
+    );
+    assert_eq!(
+      store.accounts[1].proxy_url.as_deref(),
+      Some("http://127.0.0.1:8888")
+    );
     assert_eq!(store.accounts[2].proxy_url, None);
     assert_eq!(store.accounts[3].proxy_url, None);
     assert!(store.settings.minimize_to_tray);
@@ -1224,7 +1887,8 @@ mod tests {
       ]
     });
 
-    let (store, dirty) = migrate_from_value(raw).expect("legacy custom provider store should migrate cleanly");
+    let (store, dirty) =
+      migrate_from_value(raw).expect("legacy custom provider store should migrate cleanly");
     assert!(dirty);
     assert!(store.last_committed.is_none());
     assert_eq!(store.accounts.len(), 1);
@@ -1266,7 +1930,10 @@ mod tests {
 
     let (store, _) = migrate_from_value(raw).expect("migrate cookie expiry should succeed");
     assert_eq!(store.accounts.len(), 3);
-    assert_eq!(store.accounts[0].cookie_expires_at_ms, Some(1_800_000_000_000));
+    assert_eq!(
+      store.accounts[0].cookie_expires_at_ms,
+      Some(1_800_000_000_000)
+    );
     assert!(!store.accounts[0].cookie_session_only);
     assert_eq!(store.accounts[1].cookie_expires_at_ms, None);
     assert!(store.accounts[1].cookie_session_only);
@@ -1447,15 +2114,28 @@ mod tests {
     assert_eq!(g.workflow_mode, GroupWorkflowMode::Review);
     assert_eq!(g.max_relay_hops, 3);
     assert_eq!(g.thread_bindings.len(), 1);
-    assert_eq!(g.thread_bindings[0].thread_url, "https://muse.ai/c/thread-123");
+    assert_eq!(
+      g.thread_bindings[0].thread_url,
+      "https://muse.ai/c/thread-123"
+    );
     assert_eq!(g.messages[0].stage_label.as_deref(), Some("交叉评审"));
     assert_eq!(g.messages[0].hop_depth, 1);
 
     let reserialized = serde_json::to_value(&store).expect("serialize store");
+    assert!(
+      !reserialized.to_string().contains("sk-test"),
+      "序列化后不得含明文 Key"
+    );
     let (roundtrip, dirty2) = migrate_from_value(reserialized).expect("roundtrip migrate");
     assert!(!dirty2);
-    assert_eq!(roundtrip.external_agents, store.external_agents);
-    assert_eq!(roundtrip.group_chats[0].workflow_mode, GroupWorkflowMode::Review);
+    // JSON 往返不携带内存 Key（由 vault 在加载时恢复），其余字段应一致。
+    let mut expected_agents = store.external_agents.clone();
+    expected_agents[0].api_key.clear();
+    assert_eq!(roundtrip.external_agents, expected_agents);
+    assert_eq!(
+      roundtrip.group_chats[0].workflow_mode,
+      GroupWorkflowMode::Review
+    );
     assert_eq!(roundtrip.group_chats[0].thread_bindings, g.thread_bindings);
     assert!(!roundtrip.settings.auto_approve);
 
@@ -1464,8 +2144,165 @@ mod tests {
       "accounts": [],
       "settings": { "minimizeToTray": false, "autoApprove": true }
     });
-    let (migrated_auto, _) = migrate_from_value(with_auto).expect("migrate settings with autoApprove");
+    let (migrated_auto, _) =
+      migrate_from_value(with_auto).expect("migrate settings with autoApprove");
     assert!(!migrated_auto.settings.minimize_to_tray);
     assert!(migrated_auto.settings.auto_approve);
+    // 旧配置里没有命令执行开关时默认关闭。
+    assert!(!migrated_auto.settings.auto_approve_commands);
+    assert!(!roundtrip.settings.auto_approve_commands);
+
+    let with_cmd = serde_json::json!({
+      "version": 1,
+      "accounts": [],
+      "settings": { "autoApprove": true, "autoApproveCommands": true }
+    });
+    let (migrated_cmd, _) =
+      migrate_from_value(with_cmd).expect("migrate settings with autoApproveCommands");
+    assert!(migrated_cmd.settings.auto_approve);
+    assert!(migrated_cmd.settings.auto_approve_commands);
+  }
+  #[test]
+  fn corrupt_json_load_keeps_original_and_writes_corrupt_backup() {
+    let dir = temp_store_dir("corrupt");
+    let path = dir.join("accounts.json");
+    let original = "{ this is not json, missing quote";
+    std::fs::write(&path, original).unwrap();
+
+    let loaded = load_or_migrate_store(&path);
+
+    // 原文件必须原样保留，不能被空配置覆盖。
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    // 必须留下一份 .corrupt-* 备份，内容与原文件一致。
+    let backups = corrupt_backups(&dir);
+    assert_eq!(backups.len(), 1, "应恰好产生一份 .corrupt-* 备份");
+    assert_eq!(std::fs::read_to_string(&backups[0]).unwrap(), original);
+    assert!(loaded.persist_blocked, "损坏配置加载后必须阻止写盘");
+    assert!(loaded
+      .startup_notice
+      .as_deref()
+      .unwrap_or_default()
+      .contains("备份"));
+    assert!(loaded.store.accounts.is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  #[test]
+  fn unreadable_config_load_is_persist_blocked() {
+    let dir = temp_store_dir("unreadable");
+    let path = dir.join("accounts.json");
+    std::fs::create_dir(&path).unwrap();
+
+    let loaded = load_or_migrate_store(&path);
+
+    assert!(loaded.persist_blocked, "读取失败后必须阻止写盘");
+    assert!(loaded.startup_notice.is_some());
+    assert!(path.is_dir(), "原路径不应被删除或覆盖");
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  #[test]
+  fn unknown_provider_account_survives_load_save_roundtrip() {
+    let dir = temp_store_dir("unknown-provider");
+    let path = dir.join("accounts.json");
+    let raw = json!({
+      "version": 2,
+      "accounts": [
+        {
+          "providerId": "muse",
+          "uuid": "00000000-0000-4000-8000-000000000001",
+          "alias": "m1"
+        },
+        {
+          "providerId": "futurechat",
+          "uuid": "00000000-0000-4000-8000-000000000002",
+          "alias": "未来服务账号",
+          "customField": "keep-me"
+        }
+      ]
+    });
+    std::fs::write(&path, serde_json::to_string_pretty(&raw).unwrap()).unwrap();
+
+    let loaded = load_or_migrate_store(&path);
+    assert_eq!(loaded.store.accounts.len(), 1);
+    assert_eq!(loaded.store.accounts[0].alias, "m1");
+    assert!(
+      !loaded.persist_blocked,
+      "未知 provider 不应导致整份配置失败"
+    );
+
+    save_store_atomic(&path, &loaded.store).unwrap();
+    let saved: serde_json::Value =
+      serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let accounts = saved.get("accounts").and_then(|v| v.as_array()).unwrap();
+    assert_eq!(accounts.len(), 2, "未知 provider 条目在保存后不应丢失");
+    let kept = accounts
+      .iter()
+      .find(|a| a.get("providerId").and_then(|v| v.as_str()) == Some("futurechat"))
+      .expect("未知 provider 条目应原样写回");
+    assert_eq!(
+      kept.get("alias").and_then(|v| v.as_str()),
+      Some("未来服务账号")
+    );
+    assert_eq!(
+      kept.get("customField").and_then(|v| v.as_str()),
+      Some("keep-me"),
+      "未知条目未知字段也应原样保留"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  #[test]
+  fn future_version_store_is_read_only() {
+    let dir = temp_store_dir("future-version");
+    let path = dir.join("accounts.json");
+    let raw = json!({
+      "version": 99,
+      "accounts": [
+        {
+          "providerId": "muse",
+          "uuid": "00000000-0000-4000-8000-000000000001",
+          "alias": "m1"
+        }
+      ]
+    });
+    let original = serde_json::to_string_pretty(&raw).unwrap();
+    std::fs::write(&path, &original).unwrap();
+
+    let loaded = load_or_migrate_store(&path);
+
+    assert!(loaded.read_only, "version 高于 STORE_VERSION 时应视为只读");
+    assert!(loaded.persist_blocked, "只读配置必须阻止写盘");
+    assert_eq!(loaded.store.accounts.len(), 1);
+    assert_eq!(loaded.store.accounts[0].alias, "m1");
+    // 加载本身绝不能把高版本配置降级写回磁盘。
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  #[test]
+  fn successful_load_writes_rolling_bak() {
+    let dir = temp_store_dir("bak");
+    let path = dir.join("accounts.json");
+    let raw = json!({
+      "version": 2,
+      "accounts": [
+        {
+          "providerId": "muse",
+          "uuid": "00000000-0000-4000-8000-000000000001",
+          "alias": "m1"
+        }
+      ]
+    });
+    let original = serde_json::to_string_pretty(&raw).unwrap();
+    std::fs::write(&path, &original).unwrap();
+
+    let loaded = load_or_migrate_store(&path);
+
+    assert!(!loaded.persist_blocked);
+    let bak = dir.join("accounts.json.bak");
+    assert!(bak.exists(), "成功加载后应滚动备份 accounts.json.bak");
+    assert_eq!(std::fs::read_to_string(&bak).unwrap(), original);
+    let _ = std::fs::remove_dir_all(&dir);
   }
 }

@@ -250,9 +250,17 @@ public class AccountSessionPlugin: Plugin {
               continue
             }
             let domain = cookie.domain.trimmingCharacters(in: CharacterSet(charactersIn: ".")).lowercased()
-            if domain.isEmpty || entryHost == domain || entryHost.hasSuffix("." + domain) {
-              pairs.append("\(cookie.name)=\(cookie.value)")
+            guard domain.isEmpty || entryHost == domain || entryHost.hasSuffix("." + domain) else {
+              continue
             }
+            // 与 macOS 对齐：只复制路径适用于入口地址的 Cookie。
+            let cookiePath = cookie.path
+            let entryPath = entryUrl.path
+            let pathApplies = cookiePath == "/" || entryPath == cookiePath || entryPath.hasPrefix(cookiePath + "/")
+            guard pathApplies else {
+              continue
+            }
+            pairs.append("\(cookie.name)=\(cookie.value)")
           }
           if pairs.isEmpty {
             invoke.reject("该账号暂无可复制的 Cookie，请先登录")
@@ -261,7 +269,7 @@ public class AccountSessionPlugin: Plugin {
           let header = pairs.joined(separator: "; ")
           UIPasteboard.general.setItems(
             [["public.utf8-plain-text": header]],
-            options: [.localOnly: true]
+            options: [.localOnly: true, .expirationDate: Date(timeIntervalSinceNow: 60)]
           )
           invoke.resolve()
         }
@@ -397,16 +405,10 @@ public class AccountSessionPlugin: Plugin {
   }
 
   private static func resolveTargetUrl(fromSetCookieHeader header: String, fallback: URL) -> URL {
-    for part in header.split(separator: ";").dropFirst() {
-      let kv = part.trimmingCharacters(in: .whitespacesAndNewlines)
-      if kv.lowercased().hasPrefix("domain=") {
-        let rawDomain = String(kv.dropFirst("domain=".count))
-          .trimmingCharacters(in: CharacterSet(charactersIn: " .\""))
-        if !rawDomain.isEmpty, let url = URL(string: "https://\(rawDomain)/") {
-          return url
-        }
-      }
-    }
+    // 不再从 Set-Cookie 头里解析 Domain 作目标 URL：那等于用头部自己的
+    // Domain 为自己背书，注入的 Domain 可能把 Cookie 种进别的域。
+    // 一律用 Rust 侧已校验过的入口 URL（fallback）作目标。
+    _ = header
     return fallback
   }
 }

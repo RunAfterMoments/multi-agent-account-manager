@@ -86,9 +86,7 @@ pub enum MobileSessionEvent {
     reason: String,
   },
   #[serde(rename_all = "camelCase")]
-  RecreateRequested {
-    previous_switch_seq: u64,
-  },
+  RecreateRequested { previous_switch_seq: u64 },
   #[serde(rename_all = "camelCase")]
   UpdateProgress {
     stage: String,
@@ -296,23 +294,51 @@ pub async fn fetch_text(
 }
 
 #[cfg(target_os = "android")]
-pub async fn download_and_install_apk(
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AndroidDownloadApkResponse {
+  pub status: String,
+  pub message: String,
+  #[serde(default)]
+  pub path: Option<String>,
+}
+
+#[cfg(target_os = "android")]
+pub async fn download_apk(
   app: &AppHandle,
   url: &str,
   sha256: Option<&str>,
   filename: &str,
   user_agent: &str,
-) -> Result<AndroidInstallApkResponse, String> {
+) -> Result<AndroidDownloadApkResponse, String> {
   let bridge = app.state::<MobileSessionBridge<tauri::Wry>>();
   bridge
     .0
     .run_mobile_plugin_async(
-      "downloadAndInstallApk",
+      "downloadApk",
       serde_json::json!({
         "url": url,
         "sha256": sha256,
         "filename": filename,
         "userAgent": user_agent,
+      }),
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+#[cfg(target_os = "android")]
+pub async fn install_apk(
+  app: &AppHandle,
+  path: &str,
+) -> Result<AndroidInstallApkResponse, String> {
+  let bridge = app.state::<MobileSessionBridge<tauri::Wry>>();
+  bridge
+    .0
+    .run_mobile_plugin_async(
+      "installApk",
+      serde_json::json!({
+        "path": path,
       }),
     )
     .await

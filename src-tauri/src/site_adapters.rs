@@ -214,8 +214,8 @@ fn parse_overrides_str(raw: &str) -> Result<Vec<SiteAdapterConfig>, String> {
   } else {
     return Err("站点适配 JSON 必须是数组或包含 adapters 数组的对象".to_string());
   };
-  let mut parsed: Vec<SiteAdapterConfig> = serde_json::from_value(list_val)
-    .map_err(|e| format!("站点适配字段格式无效: {e}"))?;
+  let mut parsed: Vec<SiteAdapterConfig> =
+    serde_json::from_value(list_val).map_err(|e| format!("站点适配字段格式无效: {e}"))?;
   for item in &mut parsed {
     item.id = item.id.trim().to_string();
     item.name = item.name.trim().to_string();
@@ -232,12 +232,22 @@ fn parse_overrides_str(raw: &str) -> Result<Vec<SiteAdapterConfig>, String> {
 pub fn merge_adapters(overrides: Vec<SiteAdapterConfig>) -> Vec<SiteAdapterConfig> {
   let mut result = builtin_site_adapters();
   for ov in overrides {
-    if let Some(pos) = result.iter().position(|b| b.id == ov.id) {
-      result[pos] = ov;
-    } else if let Some(generic_pos) = result.iter().position(|b| b.id == "generic") {
-      result.insert(generic_pos, ov);
-    } else {
-      result.push(ov);
+    let mut effective_ov = ov;
+    // 任何 override 都不得带通配符 "*"：覆盖内置 id 时去掉 "*" 后若为空，
+    // 保留内置的 hostPatterns；新增 id 去掉 "*" 后若为空，整条丢弃，
+    // 否则一条自定义规则就能通配接管全部域名。
+    effective_ov.host_patterns.retain(|p| p != "*");
+    if let Some(pos) = result.iter().position(|b| b.id == effective_ov.id) {
+      if effective_ov.host_patterns.is_empty() {
+        effective_ov.host_patterns = result[pos].host_patterns.clone();
+      }
+      result[pos] = effective_ov;
+    } else if !effective_ov.host_patterns.is_empty() {
+      if let Some(generic_pos) = result.iter().position(|b| b.id == "generic") {
+        result.insert(generic_pos, effective_ov);
+      } else {
+        result.push(effective_ov);
+      }
     }
   }
   result
@@ -322,8 +332,7 @@ pub fn validate_and_save_overrides(
     let mut f = File::create(&tmp_path).map_err(|e| format!("创建临时规则文件失败: {e}"))?;
     f.write_all(&pretty)
       .map_err(|e| format!("写入规则文件失败: {e}"))?;
-    f.sync_all()
-      .map_err(|e| format!("同步规则文件失败: {e}"))?;
+    f.sync_all().map_err(|e| format!("同步规则文件失败: {e}"))?;
   }
   fs::rename(&tmp_path, &path).map_err(|e| {
     let _ = fs::remove_file(&tmp_path);
@@ -354,6 +363,14 @@ pub const NET_HOOK_INIT_JS: &str = r#"(() => {
       esText: ''
     };
     window.__maamNet = state;
+
+    // 响应体只在主站（muse.ai / hark.com）的聊天 API 上读取。主框可能
+    // 加载 Apple ID / Facebook 等登录页，那些页面的 POST 响应体绝不能读。
+    // 非主站、非聊天接口只记录 URL / 方法 / 状态，不读响应体。
+    const initHost = (location.hostname || '').toLowerCase();
+    const isPrimaryHost = initHost === 'muse.ai' || initHost.endsWith('.muse.ai') || initHost === 'hark.com' || initHost === 'app.hark.com' || initHost.endsWith('.hark.com');
+    const CHAT_API_PATTERNS = ['/api/', '/events', '/chat', '/view', '/api/messages/send', '/api/messages/', '/api/chat', '/conversation', '/completion', '/generate', '/stream'];
+    const isChatApiUrl = (u) => { try { const p = new URL(u, location.href).pathname.toLowerCase(); return CHAT_API_PATTERNS.some((pat) => p.includes(pat)); } catch (_) { return false; } };
 
     const TELEMETRY_RE = /google-analytics|googletagmanager|\/_mp\/|\/cdn-cgi\/rum|\/otlp\/|\/pixel\/|\/billing\/summary|\/unread-count|\/consent\/status|\/client-ip|\.(?:js|css|png|jpg|jpeg|svg|woff2?|ico)(?:\?|$)/i;
     const pushEntry = (entry) => {
@@ -502,7 +519,7 @@ pub const NET_HOOK_INIT_JS: &str = r#"(() => {
               entry.elapsedMs = nowTs - startedAt;
               const ct = (resp.headers && resp.headers.get ? (resp.headers.get('content-type') || '') : '').toLowerCase();
               entry.contentType = ct;
-              if (entry.status >= 400 && resp.clone) {
+              if (isPrimaryHost && isChatApiUrl(url) && entry.status >= 400 && resp.clone) {
                 resp.clone().text().then((t) => {
                   entry.errorSnippet = (t || '').replace(/\s+/g, ' ').trim().slice(0, 240);
                   entry.done = true;
@@ -512,7 +529,7 @@ pub const NET_HOOK_INIT_JS: &str = r#"(() => {
               }
               const looksStream = ct.includes('event-stream') || ct.includes('ndjson') || ct.includes('stream');
               const looksChatPost = method === 'POST' && (ct.includes('json') || ct.includes('text') || looksStream);
-              if (resp.ok && resp.clone && method === 'POST' && (looksStream || looksChatPost)) {
+              if (isPrimaryHost && isChatApiUrl(url) && resp.ok && resp.clone && method === 'POST' && (looksStream || looksChatPost)) {
                 entry.isStream = looksStream;
                 void consumeStream(resp.clone(), entry);
               } else {
@@ -538,7 +555,7 @@ pub const NET_HOOK_INIT_JS: &str = r#"(() => {
       window.EventSource = new Proxy(OrigES, {
         construct(target, args, newTarget) {
           const es = Reflect.construct(target, args, newTarget);
-          try {
+          if (isPrimaryHost) try {
             const u = String(args && args[0] ? args[0] : '');
             if (!TELEMETRY_RE.test(u)) {
               es.addEventListener('message', (ev) => {
@@ -564,7 +581,7 @@ pub const NET_HOOK_INIT_JS: &str = r#"(() => {
       window.WebSocket = new Proxy(OrigWS, {
         construct(target, args, newTarget) {
           const ws = Reflect.construct(target, args, newTarget);
-          try {
+          if (isPrimaryHost) try {
             const u = String(args && args[0] ? args[0] : '');
             if (!TELEMETRY_RE.test(u)) {
               ws.addEventListener('message', (ev) => {
@@ -584,6 +601,12 @@ pub const NET_HOOK_INIT_JS: &str = r#"(() => {
         }
       });
     }
+    try {
+      const d = Object.getOwnPropertyDescriptor(window, '__maamNet');
+      if (!d || d.configurable) {
+        Object.defineProperty(window, '__maamNet', { value: state, writable: false, configurable: false });
+      }
+    } catch (_) {} // Sealing raises the bar only; Rust must not trust page-provided values.
   } catch (_) {}
 })()"#;
 
@@ -607,7 +630,10 @@ mod tests {
     assert_eq!(resolve_adapter_for_host(&dir, "muse.ai").id, "muse");
     assert_eq!(resolve_adapter_for_host(&dir, "sub.muse.ai").id, "muse");
     assert_eq!(resolve_adapter_for_host(&dir, "app.hark.com").id, "hark");
-    assert_eq!(resolve_adapter_for_host(&dir, "unknown.example.org").id, "generic");
+    assert_eq!(
+      resolve_adapter_for_host(&dir, "unknown.example.org").id,
+      "generic"
+    );
     let _ = fs::remove_dir_all(&dir);
   }
 
@@ -638,18 +664,103 @@ mod tests {
 
     let snap = validate_and_save_overrides(&dir, custom_json).expect("save valid overrides");
     assert!(snap.has_overrides);
-    assert_eq!(resolve_adapter_for_host(&dir, "www.example.com").id, "custom_web");
+    assert_eq!(
+      resolve_adapter_for_host(&dir, "www.example.com").id,
+      "custom_web"
+    );
     let muse = resolve_adapter_for_host(&dir, "muse.ai");
     assert_eq!(muse.name, "Muse Custom");
-    assert_eq!(muse.composer_selectors, vec!["#custom-muse-box".to_string()]);
+    assert_eq!(
+      muse.composer_selectors,
+      vec!["#custom-muse-box".to_string()]
+    );
     assert!(muse.prefer_enter_submit);
-    assert_eq!(resolve_adapter_for_host(&dir, "other.example.net").id, "generic");
+    assert_eq!(
+      resolve_adapter_for_host(&dir, "other.example.net").id,
+      "generic"
+    );
 
     let reset_snap = reset_overrides(&dir).expect("reset overrides");
     assert!(!reset_snap.has_overrides);
-    assert_eq!(resolve_adapter_for_host(&dir, "www.example.com").id, "generic");
-    assert_eq!(resolve_adapter_for_host(&dir, "muse.ai").name, "Muse · Meta");
+    assert_eq!(
+      resolve_adapter_for_host(&dir, "www.example.com").id,
+      "generic"
+    );
+    assert_eq!(
+      resolve_adapter_for_host(&dir, "muse.ai").name,
+      "Muse · Meta"
+    );
     assert!(!get_adapters_snapshot(&dir).has_overrides);
+    let _ = fs::remove_dir_all(&dir);
+  }
+
+  #[test]
+  fn overrides_cannot_widen_builtin_host_patterns_to_wildcard() {
+    let dir = temp_dir("widen-guard");
+    let custom_json = r##"
+      [
+        {
+          "id": "muse",
+          "name": "Widened Muse",
+          "hostPatterns": ["*"]
+        }
+      ]
+    "##;
+    let snap = validate_and_save_overrides(&dir, custom_json).expect("save overrides");
+    assert_eq!(resolve_adapter_for_host(&dir, "muse.ai").id, "muse");
+    assert_eq!(
+      resolve_adapter_for_host(&dir, "evil.example.com").id,
+      "generic"
+    );
+    let muse_adapter = snap
+      .adapters
+      .iter()
+      .find(|a| a.id == "muse")
+      .expect("muse exists");
+    assert!(!muse_adapter.host_patterns.iter().any(|p| p == "*"));
+    let _ = fs::remove_dir_all(&dir);
+  }
+
+  #[test]
+  fn new_custom_adapter_with_wildcard_only_is_dropped() {
+    let dir = temp_dir("wildcard-new-id");
+    let custom_json = r##"
+      [
+        {
+          "id": "my_override",
+          "name": "My Override",
+          "hostPatterns": ["*"]
+        }
+      ]
+    "##;
+    let snap = validate_and_save_overrides(&dir, custom_json).expect("save overrides");
+    assert!(!snap.adapters.iter().any(|a| a.id == "my_override"));
+    assert_eq!(
+      resolve_adapter_for_host(&dir, "evil.example.com").id,
+      "generic"
+    );
+    let _ = fs::remove_dir_all(&dir);
+  }
+
+  #[test]
+  fn new_custom_adapter_keeps_non_wildcard_patterns() {
+    let dir = temp_dir("wildcard-mixed");
+    let custom_json = r##"
+      [
+        {
+          "id": "my_override",
+          "name": "My Override",
+          "hostPatterns": ["*", "example.com"]
+        }
+      ]
+    "##;
+    let snap = validate_and_save_overrides(&dir, custom_json).expect("save overrides");
+    let adapter = snap
+      .adapters
+      .iter()
+      .find(|a| a.id == "my_override")
+      .expect("my_override exists");
+    assert_eq!(adapter.host_patterns, vec!["example.com".to_string()]);
     let _ = fs::remove_dir_all(&dir);
   }
 }
