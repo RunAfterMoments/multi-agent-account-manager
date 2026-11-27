@@ -657,6 +657,7 @@ fn emit_progress(
 /// 流式循环里按已下载量硬停，避免无限下载撑满磁盘。清单里声明的
 /// size 仅作展示，不作为放行依据。
 const MAX_UPDATE_DOWNLOAD_BYTES: u64 = 512 * 1024 * 1024;
+#[cfg(desktop)]
 /// 文本型更新响应（清单 / .minisig）的字节上限，与移动端 fetchText 一致。
 const MAX_UPDATE_TEXT_BYTES: usize = 2 * 1024 * 1024;
 

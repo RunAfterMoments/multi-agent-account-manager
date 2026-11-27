@@ -1078,3 +1078,116 @@ tooltip 按平台显示：macOS `⌘\`，其余 `Ctrl+\`（`IS_MAC`，
   本机跑不到（只有交叉 clippy 编过），Kotlin 本机编不到（无 Android
   SDK）——三项均靠 CI（check Windows 跑 DPAPI 测试、release Android
   构建编 Kotlin、macOS/iOS 构建编 Swift）。
+
+## 十六、v6.3.2 复审小补丁（2026-11-27，用户评 9.0/10 后的收口）
+
+用户逐行复审 v6.3.1（对照 v6.1.7，3,140 行 diff）打分 **9.0/10**：
+初版审计 9 条 HIGH（MAAM-H-01~H-09）至此全部闭环。本轮抓出 4 个细节，
+收进小补丁 v6.3.2（未 commit，工作树改动待复核；10 文件 +221/-61）。
+实现代码未改设计，逐项按用户给的修法落地。
+
+### 1. 移动端启动防死锁 + 失败探测不永久缓存（key_vault.rs / storage.rs / session_manager.rs）
+
+- `detect_backend()` 只缓存成功探测到的安全后端（`Keyring` /
+  `Bridge`）；探测返回 `File` 时不写缓存，下次调用重新探测。
+  代价是 keyring 不可用时每次 store/load 多一次探测（Linux 上一次
+  D-Bus 往返），调用本身低频，可接受；未加 TTL 之类复杂机制。
+  移动端启动期插件尚未就绪、Linux 用户事后启动 Secret Service，
+  进程内都可恢复。
+- 移动端迁移延后：`load_or_migrate_store` 新增 `migrate_keys: bool`
+  参数；`SessionManager::new_inner` 传 `cfg!(desktop)`——桌面仍在
+  setup 的 `block_on` 里同步迁移（行为完全不变：keyring 是同步调用，
+  无插件调用，安全）；移动端传 `false`，迁移改由 `run_startup_tasks`
+  开头的 `#[cfg(mobile)]` 块跑（已是 `spawn` 的异步任务，不占主线程，
+  在自动切账号/任何 API 轮次之前）。迁移失败立同款 notice
+  （"API Key 未能迁移到系统凭据库，已保留原配置，下次启动重试"），
+  下次启动重试。
+- 延后时关键细节：`migrate_keys=false` 不只跳过迁移，还连同
+  `migrated` 的写回一并跳过（`if migrated && migrate_keys`）——明文
+  Key 尚未进 vault，此时写盘会把 `api_key`（`skip_serializing`）剥离，
+  若在启动任务执行前崩溃 Key 即永久丢失。磁盘原文件不动，等启动任务
+  迁移成功后，有旧明文 Key 才 `request_persist()` 写盘剥离明文；
+  无旧明文时迁移只是从 vault 回填内存，不写盘。
+- 测试：原有 `load_or_migrate_store` 调用点全部传 `true`（桌面行为）；
+  新增 `load_or_migrate_store_defers_key_migration_when_flag_false`
+  覆盖延后路径（load 不碰 vault、不写盘、内存 Key 保留；补跑迁移后
+  Key 进 vault）。`run_startup_tasks` 的 mobile 块是 `#[cfg(mobile)]`，
+  本机编不到，靠 CI 的 Android/iOS 构建验编译。
+
+### 2. iOS Keychain 备份属性 & Android Keystore 并发/落盘（Swift / Kotlin）
+
+- Swift（`AccountSessionPlugin.swift` 的 store/load/deleteApiKey）：
+  `SecItemAdd` 与 `SecItemUpdate` 都显式加
+  `kSecAttrAccessibleWhenUnlockedThisDeviceOnly`，API Key 永不随
+  iCloud / 加密备份离开本机；三处都补 `guard !args.keyRef.isEmpty`
+  （与 Kotlin 对齐，空 keyRef 直接 reject）。
+- Kotlin（`AccountSessionPlugin.kt`）：新增 `private val apiKeyLock = Any()`；
+  store 的 `getOrCreateApiKey()` + 加密 + 写 SharedPreferences 整段包进
+  `synchronized(apiKeyLock)`，load 的取密钥+解密也同步（防与 store 的
+  密钥轮换竞态），delete 的 prefs remove 也同步。store 与 delete 的异步
+  `.apply()` 改同步 `.commit()` 并校验返回 `true`（失败抛错进 reject，
+  避免 resolve 后崩溃丢 Key）。AAD：store 在 `init(ENCRYPT_MODE)` 后、
+  `doFinal` 前调 `cipher.updateAAD(keyRef UTF-8)`；load 在
+  `init(DECRYPT_MODE)` 后、`doFinal` 前用同一 keyRef 调 `updateAAD`，
+  密文被换到别的条目时解密失败。
+
+### 3. Zeroizing 贯通到长驻内存 + DPAPI 解密缓冲清零
+
+- 核实（vendored zeroize 1.9.1，
+  `~/.cargo/registry/src/*/zeroize-1.9.1/src/lib.rs`）：
+  `Zeroizing<Z>` 有 `Debug` 实现（601 行，`finish_non_exhaustive()`，
+  **不打印内容**，derive Debug 不会泄 Key）、`Clone`（619 行，要求
+  `Z: Clone`）、`Deserialize`（721 行，`serde` feature 下，要求
+  `Z: Zeroize + Deserialize`，`String` 满足）与 `Serialize`（707 行）。
+  `ExternalAgentRecord` 的 `Debug/Clone/PartialEq/Eq/Serialize/Deserialize`
+  六个 derive 全部直接兼容，无需手写。`Cargo.toml` 改为
+  `zeroize = { version = "1", features = ["serde"] }`；`Cargo.lock`
+  只多 3 行（zeroize 依赖加 `serde`，serde 本已在锁内）。
+- `ExternalAgentRecord.api_key: String` → `Zeroizing<String>`（仍
+  `#[serde(default, skip_serializing)]`，只留内存，绝不落盘、不下发
+  前端；快照仍只给 `hasApiKey`）。适配点：`storage.rs` 旧配置解析
+  （`Zeroizing::new(api_key)`）、迁移回填（`.map(|k| k.to_string())`
+  直接去掉，`load_key` 本就返回 `Zeroizing<String>`）、
+  `group_transport.rs` 两处构造（`normalize_external_agent_input` 的
+  OpenaiApi/LocalCli 分支）与两处测试 helper、`group_chat.rs` 的
+  `prev_api_key: Option<Zeroizing<String>>`（回滚 `store_key` 靠 Deref
+  到 `&str`）；其余 `.trim()` / `.is_empty()` / `.clear()` /
+  `bearer_auth(...)` 均靠 `Deref`/`DerefMut` 链零改动。测试里的
+  `assert_eq!(rec.api_key, "...")` 改为 `.as_str()` 比较。
+- `dpapi_decrypt` 返回 `Zeroizing<Vec<u8>>`；`LocalFree` 之前先对
+  `from_raw_parts_mut(output.pbData, output.cbData as usize)` 做
+  `zeroize::Zeroize::zeroize`（`impl Zeroize for [Z]` 在 lib.rs:452 行，
+  切片清零成立），再释放。调用方 `decrypt_file_value` 用
+  `std::mem::take(&mut *plain)` 取出原 `Vec` 再 `String::from_utf8`，
+  不多一次拷贝。
+- **偏差说明**：用户修法写的 `plain.into_inner()` 在 zeroize 1.9.1
+  里**不存在**（`Zeroizing` 只有 `new`，无 `into_inner`，已 grep 核实）；
+  改用 `mem::take` 达到同样效果（取出原 Vec，空壳 drop 时零化空 Vec），
+  设计意图不变。
+
+### 4. 两个极小边角
+
+- `key_vault.rs`：`ApiKeyVault` 加 `file_lock: Mutex<()>`（三个构造器
+  都初始化），`write_file_entry` / `delete_file_entry` 的读-改-写全程
+  持锁；`load_file_migrating` 里调 `delete_file_entry` 的路径也被覆盖；
+  两个函数都是同步的，锁内无 await，无嵌套持锁。
+- `updater.rs`：`MAX_UPDATE_TEXT_BYTES` 加 `#[cfg(desktop)]`（只在桌面
+  分支用，537/547 行均在 `#[cfg(desktop)]` 块内）；Android check 的
+  mobile 警告由 44 条降到 43 条，少的正是这条 `dead_code`。
+
+### 验证（本机逐项，2026-11-27）
+
+- `cargo fmt --check` 通过；`cargo fmt` 后重 grep 确认各点位。
+- `cargo clippy --all-targets -- -D warnings`（Linux）通过（仅 1 条
+  基线 manifest 警告：unused dependency `tauri-plugin-account-session`）。
+- `cargo clippy --target x86_64-pc-windows-gnu --all-targets -- -D warnings`
+  通过（DPAPI 改动：`Zeroize::zeroize` 切片调用与 `mem::take` 均编过）。
+- `cargo test --lib`：**118/118**（117 + 新增延后迁移测试 1 个，单独重跑
+  通过）。
+- `cargo check --target aarch64-linux-android --lib`：0 错误，43 条警告
+  （基线 44，少 1 条即 `MAX_UPDATE_TEXT_BYTES` 的 `dead_code`，已核实
+  剩余 `dead_code` note 行只是通用提示，无该常量警告）。
+- `npm run build`、`npm run test:js` 通过。
+- 未验证：iOS Swift 本机编不到（无 Apple 工具链），Kotlin 本机编不到
+  （无 Android SDK）——两项靠 CI（release Android 构建编 Kotlin、
+  macOS/iOS 构建编 Swift）。Windows DPAPI 测试靠 CI Windows check 真跑。

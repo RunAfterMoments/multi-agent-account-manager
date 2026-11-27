@@ -49,6 +49,9 @@ pub struct ApiKeyVault {
   /// 移动端桥接用的 AppHandle（setup 时由 SessionManager 注入；
   /// 桌面端不用）。注入后失效已缓存的后端探测结果。
   app_handle: Mutex<Option<tauri::AppHandle>>,
+  /// 回退文件（api-keys.json）读-改-写的互斥锁：并发写两个 Key 时
+  /// 不互相覆盖；仅同步函数内持锁，锁内不 await。
+  file_lock: Mutex<()>,
   /// 仅测试：内存后端的数据；用 Arc 以便跨 SessionManager 实例
   /// 共享同一份数据，模拟重启后从同一后端恢复。
   #[cfg(test)]
@@ -61,6 +64,7 @@ impl ApiKeyVault {
       dir,
       backend: Mutex::new(None),
       app_handle: Mutex::new(None),
+      file_lock: Mutex::new(()),
       #[cfg(test)]
       memory: std::sync::Arc::new(Mutex::new(BTreeMap::new())),
     }
@@ -73,6 +77,7 @@ impl ApiKeyVault {
       dir,
       backend: Mutex::new(Some(backend)),
       app_handle: Mutex::new(None),
+      file_lock: Mutex::new(()),
       memory: std::sync::Arc::new(Mutex::new(BTreeMap::new())),
     }
   }
@@ -95,6 +100,7 @@ impl ApiKeyVault {
       dir,
       backend: Mutex::new(Some(VaultBackend::Memory)),
       app_handle: Mutex::new(None),
+      file_lock: Mutex::new(()),
       memory: shared,
     }
   }
@@ -118,8 +124,13 @@ impl ApiKeyVault {
     }
     // 探测时不持锁（桥接探测要 await）。
     let detected = self.probe_backend().await;
-    let mut slot = self.backend.lock().unwrap_or_else(|e| e.into_inner());
-    *slot = Some(detected);
+    // 只缓存成功探测到的安全后端（Keyring / Bridge）；探测失败返回
+    // File 时不写缓存，下次调用重新探测——移动端启动期插件尚未就
+    // 绪、或 Linux 用户事后启动 Secret Service 时，进程内仍可恢复。
+    if detected != VaultBackend::File {
+      let mut slot = self.backend.lock().unwrap_or_else(|e| e.into_inner());
+      *slot = Some(detected);
+    }
     detected
   }
 
@@ -366,8 +377,12 @@ impl ApiKeyVault {
     {
       if let Some(cipher_b64) = raw.strip_prefix(DPAPI_VALUE_PREFIX) {
         let cipher = base64_decode(cipher_b64)?;
-        let plain = dpapi_decrypt(&cipher)?;
-        return Some(Zeroizing::new(String::from_utf8(plain).ok()?));
+        let mut plain = dpapi_decrypt(&cipher)?;
+        // Zeroizing 1.9.1 没有 into_inner：用 mem::take 取出原 Vec
+        // 再转 String，不多一次拷贝；取出的空壳 drop 时零化空 Vec。
+        return Some(Zeroizing::new(
+          String::from_utf8(std::mem::take(&mut *plain)).ok()?,
+        ));
       }
     }
     #[cfg(not(windows))]
@@ -432,12 +447,14 @@ impl ApiKeyVault {
   /// 仅 Windows 使用（DPAPI 密文写盘 / 旧明文改写）。
   #[cfg(windows)]
   fn write_file_entry(&self, key_ref: &str, value: &str) -> Result<(), String> {
+    let _file_guard = self.file_lock.lock().unwrap_or_else(|e| e.into_inner());
     let mut map = self.read_file_map();
     map.insert(key_ref.to_string(), value.to_string());
     self.write_file_map(&map)
   }
 
   fn delete_file_entry(&self, key_ref: &str) {
+    let _file_guard = self.file_lock.lock().unwrap_or_else(|e| e.into_inner());
     let mut map = self.read_file_map();
     if map.remove(key_ref).is_none() {
       return;
@@ -510,7 +527,7 @@ fn dpapi_encrypt(plaintext: &str) -> Result<String, String> {
 /// Windows DPAPI 解密：空密文返回 None；失败返回 None（密文损坏、
 /// 换了用户或机器——调用方按“无此条目”处理，不丢其他功能）。
 #[cfg(windows)]
-fn dpapi_decrypt(cipher: &[u8]) -> Option<Vec<u8>> {
+fn dpapi_decrypt(cipher: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
   use windows::Win32::Foundation::{LocalFree, HLOCAL};
   use windows::Win32::Security::Cryptography::{
     CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
@@ -541,13 +558,19 @@ fn dpapi_decrypt(cipher: &[u8]) -> Option<Vec<u8>> {
       return None;
     }
     let b = std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec();
+    // 先清零 LocalAlloc 出来的明文缓冲，再释放——解密出的明文不得
+    // 残留在堆上。
+    zeroize::Zeroize::zeroize(std::slice::from_raw_parts_mut(
+      output.pbData,
+      output.cbData as usize,
+    ));
     LocalFree(Some(HLOCAL(output.pbData as *mut core::ffi::c_void)));
     b
   };
   if bytes.is_empty() {
     None
   } else {
-    Some(bytes)
+    Some(Zeroizing::new(bytes))
   }
 }
 
@@ -760,7 +783,7 @@ mod tests {
     assert!(!cipher.contains(plain), "密文不得含明文");
     let back =
       dpapi_decrypt(&base64_decode(&cipher).expect("base64 应合法")).expect("DPAPI 解密应成功");
-    assert_eq!(String::from_utf8(back).unwrap(), plain);
+    assert_eq!(back.as_slice(), plain.as_bytes());
     assert!(dpapi_encrypt("").is_err(), "空输入应拒绝");
     assert!(dpapi_decrypt(&[]).is_none(), "空密文应返回 None");
   }

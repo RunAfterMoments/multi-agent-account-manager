@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use url::Url;
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 #[cfg(desktop)]
 use serde_json::Value;
@@ -88,7 +89,7 @@ pub fn normalize_external_agent_input(
         kind,
         name: clean_name,
         base_url: parsed.to_string().trim_end_matches('/').to_string(),
-        api_key: api_key.trim().chars().take(512).collect(),
+        api_key: Zeroizing::new(api_key.trim().chars().take(512).collect()),
         api_key_ref: Some(crate::key_vault::api_key_ref_for(&clean_id)),
         model: clean_model,
         command: String::new(),
@@ -145,7 +146,7 @@ pub fn normalize_external_agent_input(
         kind,
         name: clean_name,
         base_url: String::new(),
-        api_key: String::new(),
+        api_key: Zeroizing::new(String::new()),
         api_key_ref: None,
         model: String::new(),
         command: clean_cmd.to_string(),
@@ -1482,7 +1483,7 @@ mod tests {
       kind: ExternalAgentKind::LocalCli,
       name: "cli-test".to_string(),
       base_url: String::new(),
-      api_key: String::new(),
+      api_key: zeroize::Zeroizing::new(String::new()),
       api_key_ref: None,
       model: String::new(),
       command: fake_cli_command(),
@@ -1763,7 +1764,7 @@ mod tests {
       kind: ExternalAgentKind::OpenaiApi,
       name: "api-test".to_string(),
       base_url: base_url.to_string(),
-      api_key: String::new(),
+      api_key: zeroize::Zeroizing::new(String::new()),
       api_key_ref: None,
       model: "test-model".to_string(),
       command: String::new(),

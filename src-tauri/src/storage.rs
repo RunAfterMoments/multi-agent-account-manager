@@ -7,6 +7,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 pub const STORE_VERSION: u32 = 2;
 
@@ -217,7 +218,7 @@ pub struct ExternalAgentRecord {
   pub base_url: String,
   /// 仅内存：永不序列化落盘（见 `crate::key_vault`）。
   #[serde(default, skip_serializing)]
-  pub api_key: String,
+  pub api_key: Zeroizing<String>,
   /// 系统凭据库 / 回退文件中的引用 id，序列化为 `apiKeyRef`。
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub api_key_ref: Option<String>,
@@ -809,7 +810,7 @@ fn migrate_from_value(root: Value) -> Result<(AccountsStoreFile, bool), String> 
         kind,
         name: ext_name,
         base_url,
-        api_key,
+        api_key: Zeroizing::new(api_key),
         api_key_ref,
         model,
         command,
@@ -1314,9 +1315,13 @@ pub async fn save_store_atomic_async(
     .map_err(|e| format!("写盘任务中断: {e}"))?
 }
 
+/// `migrate_keys=false`（移动端）：跳过 vault 迁移与写回，磁盘原文件
+/// 不动，等 `run_startup_tasks` 在异步任务里补跑迁移（setup 的
+/// `block_on` 里调插件会死锁）；桌面传 `true`，行为与之前完全一致。
 pub async fn load_or_migrate_store(
   path: &Path,
   vault: &crate::key_vault::ApiKeyVault,
+  migrate_keys: bool,
 ) -> LoadedAccountsStore {
   if !path.exists() {
     return LoadedAccountsStore {
@@ -1430,18 +1435,24 @@ pub async fn load_or_migrate_store(
   }
 
   // P1-7：API Key vault 迁移（仅成功加载路径）。见 migrate_agent_keys_to_vault。
-  let key_migration_failed = !migrate_agent_keys_to_vault(&mut store, vault).await;
-  if key_migration_failed {
-    return LoadedAccountsStore {
-      store,
-      conflicts: Vec::new(),
-      startup_notice: Some("API Key 未能迁移到系统凭据库，已保留原配置，下次启动重试".to_string()),
-      persist_blocked: false,
-      read_only: false,
-    };
+  // migrate_keys=false 时连同写回一并跳过：明文 Key 尚未进 vault，
+  // 此时写盘会把 api_key（skip_serializing）剥离，崩溃即丢 Key。
+  if migrate_keys {
+    let key_migration_failed = !migrate_agent_keys_to_vault(&mut store, vault).await;
+    if key_migration_failed {
+      return LoadedAccountsStore {
+        store,
+        conflicts: Vec::new(),
+        startup_notice: Some(
+          "API Key 未能迁移到系统凭据库，已保留原配置，下次启动重试".to_string(),
+        ),
+        persist_blocked: false,
+        read_only: false,
+      };
+    }
   }
 
-  if migrated {
+  if migrated && migrate_keys {
     if let Err(err) = save_store_atomic(path, &store) {
       backup_last_good_file(path);
       return LoadedAccountsStore {
@@ -1481,11 +1492,7 @@ pub async fn migrate_agent_keys_to_vault(
           ok = false;
         }
       } else {
-        agent.api_key = vault
-          .load_key(&key_ref)
-          .await
-          .map(|k| k.to_string())
-          .unwrap_or_default();
+        agent.api_key = vault.load_key(&key_ref).await.unwrap_or_default();
       }
     }
   }
@@ -1603,7 +1610,7 @@ mod tests {
       kind: super::ExternalAgentKind::OpenaiApi,
       name: "DeepSeek-R".to_string(),
       base_url: "https://api.deepseek.com/v1".to_string(),
-      api_key: "sk-secret-123".to_string(),
+      api_key: zeroize::Zeroizing::new("sk-secret-123".to_string()),
       api_key_ref: Some("maam-api-key:00000000-0000-4000-8000-000000000051".to_string()),
       model: "deepseek-chat".to_string(),
       command: String::new(),
@@ -1637,7 +1644,7 @@ mod tests {
       "model": "deepseek-chat"
     }))
     .unwrap();
-    assert_eq!(legacy.api_key, "sk-legacy");
+    assert_eq!(legacy.api_key.as_str(), "sk-legacy");
   }
 
   #[test]
@@ -1666,7 +1673,7 @@ mod tests {
     let (store, dirty) = migrate_from_value(raw).expect("migrate");
     assert!(dirty, "含旧明文 Key 应标记 dirty 以便重写去明文");
     assert_eq!(store.external_agents.len(), 2);
-    assert_eq!(store.external_agents[0].api_key, "sk-test");
+    assert_eq!(store.external_agents[0].api_key.as_str(), "sk-test");
     assert_eq!(
       store.external_agents[0].api_key_ref.as_deref(),
       Some("maam-api-key:00000000-0000-4000-8000-000000000051")
@@ -1711,10 +1718,13 @@ mod tests {
     .unwrap();
 
     let vault = crate::key_vault::ApiKeyVault::new_memory(dir.clone());
-    let loaded = super::load_or_migrate_store(&path, &vault).await;
+    let loaded = super::load_or_migrate_store(&path, &vault, true).await;
     assert_eq!(loaded.store.external_agents.len(), 1);
     // 内存里仍有 Key（运行时调用要用）。
-    assert_eq!(loaded.store.external_agents[0].api_key, "sk-legacy-999");
+    assert_eq!(
+      loaded.store.external_agents[0].api_key.as_str(),
+      "sk-legacy-999"
+    );
     assert!(loaded.store.external_agents[0].api_key_ref.is_some());
     // 磁盘上的 accounts.json 已重写，不再含明文。
     let on_disk = std::fs::read_to_string(&path).unwrap();
@@ -1724,8 +1734,11 @@ mod tests {
     );
     assert!(on_disk.contains("apiKeyRef"), "磁盘配置应存引用 id");
     // 再次加载：内存 Key 应从 vault 恢复。
-    let reloaded = super::load_or_migrate_store(&path, &vault).await;
-    assert_eq!(reloaded.store.external_agents[0].api_key, "sk-legacy-999");
+    let reloaded = super::load_or_migrate_store(&path, &vault, true).await;
+    assert_eq!(
+      reloaded.store.external_agents[0].api_key.as_str(),
+      "sk-legacy-999"
+    );
     let _ = std::fs::remove_dir_all(&dir);
   }
 
@@ -1758,9 +1771,12 @@ mod tests {
     .unwrap();
 
     let vault = crate::key_vault::ApiKeyVault::new(dir.clone());
-    let loaded = super::load_or_migrate_store(&path, &vault).await;
+    let loaded = super::load_or_migrate_store(&path, &vault, true).await;
     // 无论迁移成败，内存 Key 都不能丢。
-    assert_eq!(loaded.store.external_agents[0].api_key, "sk-legacy-888");
+    assert_eq!(
+      loaded.store.external_agents[0].api_key.as_str(),
+      "sk-legacy-888"
+    );
     let on_disk = std::fs::read_to_string(&path).unwrap();
     if loaded
       .startup_notice
@@ -1779,6 +1795,58 @@ mod tests {
       );
       assert!(on_disk.contains("apiKeyRef"), "磁盘配置应存引用 id");
     }
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// 移动端延后迁移路径：load 时 migrate_keys=false 不碰 vault 也不写盘，
+  /// 磁盘原文件不动、内存 Key 保留；随后补跑迁移，Key 进 vault。
+  #[tokio::test]
+  async fn load_or_migrate_store_defers_key_migration_when_flag_false() {
+    let dir = std::env::temp_dir().join(format!("maam-load-defer-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("accounts.json");
+    std::fs::write(
+      &path,
+      serde_json::to_string_pretty(&json!({
+        "version": 2,
+        "accounts": [],
+        "externalAgents": [{
+          "id": "00000000-0000-4000-8000-000000000053",
+          "kind": "openai_api",
+          "name": "DeepSeek-R",
+          "baseUrl": "https://api.deepseek.com/v1",
+          "apiKey": "sk-defer-777",
+          "model": "deepseek-chat"
+        }]
+      }))
+      .unwrap(),
+    )
+    .unwrap();
+
+    let vault = crate::key_vault::ApiKeyVault::new_memory(dir.clone());
+    let loaded = super::load_or_migrate_store(&path, &vault, false).await;
+    assert_eq!(
+      loaded.store.external_agents[0].api_key.as_str(),
+      "sk-defer-777"
+    );
+    assert!(loaded.startup_notice.is_none());
+    // 磁盘原文件不动（仍含旧明文），等启动任务迁移成功后再写盘剥离。
+    let on_disk = std::fs::read_to_string(&path).unwrap();
+    assert!(
+      on_disk.contains("sk-defer-777"),
+      "延后迁移时磁盘原文件应保留"
+    );
+    // 补跑迁移（run_startup_tasks 移动端分支同款调用）：Key 进 vault。
+    let mut store = loaded.store;
+    assert!(super::migrate_agent_keys_to_vault(&mut store, &vault).await);
+    assert_eq!(
+      vault
+        .load_key("maam-api-key:00000000-0000-4000-8000-000000000053")
+        .await
+        .as_deref()
+        .map(String::as_str),
+      Some("sk-defer-777")
+    );
     let _ = std::fs::remove_dir_all(&dir);
   }
 
@@ -2229,7 +2297,7 @@ mod tests {
     std::fs::write(&path, original).unwrap();
 
     let vault = crate::key_vault::ApiKeyVault::new(dir.clone());
-    let loaded = load_or_migrate_store(&path, &vault).await;
+    let loaded = load_or_migrate_store(&path, &vault, true).await;
 
     // 原文件必须原样保留，不能被空配置覆盖。
     assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
@@ -2254,7 +2322,7 @@ mod tests {
     std::fs::create_dir(&path).unwrap();
 
     let vault = crate::key_vault::ApiKeyVault::new(dir.clone());
-    let loaded = load_or_migrate_store(&path, &vault).await;
+    let loaded = load_or_migrate_store(&path, &vault, true).await;
 
     assert!(loaded.persist_blocked, "读取失败后必须阻止写盘");
     assert!(loaded.startup_notice.is_some());
@@ -2285,7 +2353,7 @@ mod tests {
     std::fs::write(&path, serde_json::to_string_pretty(&raw).unwrap()).unwrap();
 
     let vault = crate::key_vault::ApiKeyVault::new(dir.clone());
-    let loaded = load_or_migrate_store(&path, &vault).await;
+    let loaded = load_or_migrate_store(&path, &vault, true).await;
     assert_eq!(loaded.store.accounts.len(), 1);
     assert_eq!(loaded.store.accounts[0].alias, "m1");
     assert!(
@@ -2332,7 +2400,7 @@ mod tests {
     std::fs::write(&path, &original).unwrap();
 
     let vault = crate::key_vault::ApiKeyVault::new(dir.clone());
-    let loaded = load_or_migrate_store(&path, &vault).await;
+    let loaded = load_or_migrate_store(&path, &vault, true).await;
 
     assert!(loaded.read_only, "version 高于 STORE_VERSION 时应视为只读");
     assert!(loaded.persist_blocked, "只读配置必须阻止写盘");
@@ -2361,7 +2429,7 @@ mod tests {
     std::fs::write(&path, &original).unwrap();
 
     let vault = crate::key_vault::ApiKeyVault::new(dir.clone());
-    let loaded = load_or_migrate_store(&path, &vault).await;
+    let loaded = load_or_migrate_store(&path, &vault, true).await;
 
     assert!(!loaded.persist_blocked);
     let bak = dir.join("accounts.json.bak");

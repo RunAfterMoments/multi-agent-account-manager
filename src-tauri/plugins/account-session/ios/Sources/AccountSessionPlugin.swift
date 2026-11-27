@@ -410,15 +410,22 @@ public class AccountSessionPlugin: Plugin {
   @objc public func storeApiKey(_ invoke: Invoke) {
     do {
       let args = try invoke.parseArgs(StoreApiKeyArgs.self)
+      guard !args.keyRef.isEmpty else {
+        invoke.reject("API Key 标识不能为空")
+        return
+      }
       guard let data = args.key.data(using: .utf8) else {
         invoke.reject("保存 API Key 失败")
         return
       }
       // service 与 Rust 侧 KEYRING_SERVICE（key_vault.rs）同值。
+      // kSecAttrAccessibleWhenUnlockedThisDeviceOnly：Key 永不随
+      // iCloud / 加密备份离开本机。
       let query: [String: Any] = [
         kSecClass as String: kSecClassGenericPassword,
         kSecAttrService as String: "multi-agent-account-manager",
         kSecAttrAccount as String: args.keyRef,
+        kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
         kSecValueData as String: data
       ]
       let status = SecItemAdd(query as CFDictionary, nil)
@@ -436,6 +443,7 @@ public class AccountSessionPlugin: Plugin {
         kSecAttrAccount as String: args.keyRef
       ]
       let updateAttrs: [String: Any] = [
+        kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
         kSecValueData as String: data
       ]
       let updateStatus = SecItemUpdate(updateQuery as CFDictionary, updateAttrs as CFDictionary)
@@ -452,6 +460,10 @@ public class AccountSessionPlugin: Plugin {
   @objc public func loadApiKey(_ invoke: Invoke) {
     do {
       let args = try invoke.parseArgs(LoadApiKeyArgs.self)
+      guard !args.keyRef.isEmpty else {
+        invoke.reject("API Key 标识不能为空")
+        return
+      }
       let query: [String: Any] = [
         kSecClass as String: kSecClassGenericPassword,
         kSecAttrService as String: "multi-agent-account-manager",
@@ -483,6 +495,10 @@ public class AccountSessionPlugin: Plugin {
   @objc public func deleteApiKey(_ invoke: Invoke) {
     do {
       let args = try invoke.parseArgs(DeleteApiKeyArgs.self)
+      guard !args.keyRef.isEmpty else {
+        invoke.reject("API Key 标识不能为空")
+        return
+      }
       let query: [String: Any] = [
         kSecClass as String: kSecClassGenericPassword,
         kSecAttrService as String: "multi-agent-account-manager",

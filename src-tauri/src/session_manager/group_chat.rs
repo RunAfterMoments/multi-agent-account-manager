@@ -52,6 +52,7 @@ use tauri::AppHandle;
 use tauri::Manager;
 use url::Url;
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 impl SessionManager {
   #[cfg(any(desktop, test))]
@@ -741,7 +742,7 @@ impl SessionManager {
 
     // P1-7 缺陷修复：先记下编辑前的旧 Key 与旧 Key 引用——写盘失败时回滚 vault；
     // kind 改为 local_cli 后，旧 vault 条目成孤儿，保存成功后清理。
-    let prev_api_key: Option<String> =
+    let prev_api_key: Option<Zeroizing<String>> =
       existing_pos.map(|pos| locked.store.external_agents[pos].api_key.clone());
     let prev_key_ref: Option<String> =
       existing_pos.and_then(|pos| locked.store.external_agents[pos].api_key_ref.clone());

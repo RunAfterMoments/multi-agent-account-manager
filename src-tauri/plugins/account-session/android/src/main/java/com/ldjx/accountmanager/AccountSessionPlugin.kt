@@ -147,6 +147,11 @@ class AccountSessionPlugin(private val activity: Activity) : Plugin(activity) {
     @Volatile
     private var lastDownloadedPath: String? = null
 
+    // API Key 读写互斥：并发 store 时两个线程同时进 getOrCreateApiKey()
+    // 会互相覆盖 Keystore 里的 maam-api-key 主密钥，导致先写的密文
+    // 永久解不开；load 的取密钥+解密也同步，避免与 store 的密钥轮换竞态。
+    private val apiKeyLock = Any()
+
     @Command
     fun subscribeEvents(invoke: Invoke) {
         val args = invoke.parseArgs(SubscribeEventsArgs::class.java)
@@ -643,13 +648,20 @@ class AccountSessionPlugin(private val activity: Activity) : Plugin(activity) {
                     invoke.reject("API Key 标识不能为空")
                     return@thread
                 }
-                val secretKey = getOrCreateApiKey()
-                val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-                cipher.init(Cipher.ENCRYPT_MODE, secretKey)
-                val iv = cipher.iv ?: throw IllegalStateException("无法生成加密 IV")
-                val ciphertext = cipher.doFinal(args.key.toByteArray(Charsets.UTF_8))
-                val stored = Base64.encodeToString(iv + ciphertext, Base64.NO_WRAP)
-                apiKeyPrefs().edit().putString(args.keyRef, stored).apply()
+                synchronized(apiKeyLock) {
+                    val secretKey = getOrCreateApiKey()
+                    val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+                    cipher.init(Cipher.ENCRYPT_MODE, secretKey)
+                    // AAD 绑定 keyRef：防密文跨条目替换（load 用同一 keyRef 校验）。
+                    cipher.updateAAD(args.keyRef.toByteArray(Charsets.UTF_8))
+                    val iv = cipher.iv ?: throw IllegalStateException("无法生成加密 IV")
+                    val ciphertext = cipher.doFinal(args.key.toByteArray(Charsets.UTF_8))
+                    val stored = Base64.encodeToString(iv + ciphertext, Base64.NO_WRAP)
+                    // 同步 commit 并校验：异步 apply() 在 resolve 后崩溃可能丢 Key。
+                    if (!apiKeyPrefs().edit().putString(args.keyRef, stored).commit()) {
+                        throw IllegalStateException("写入 API Key 失败")
+                    }
+                }
                 invoke.resolve(JSObject())
             } catch (t: Throwable) {
                 invoke.reject("保存 API Key 失败")
@@ -681,13 +693,17 @@ class AccountSessionPlugin(private val activity: Activity) : Plugin(activity) {
                 }
                 // 注意：这里只取密钥、不新建。条目存在但密钥丢失时解密注定失败，
                 // 按设计直接 reject，不静默删数据、不重建密钥。
-                val secretKey = getApiKey()
-                    ?: throw IllegalStateException("Android Keystore 密钥不可用")
-                val iv = combined.copyOfRange(0, API_KEY_GCM_IV_BYTES)
-                val ciphertext = combined.copyOfRange(API_KEY_GCM_IV_BYTES, combined.size)
-                val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-                cipher.init(Cipher.DECRYPT_MODE, secretKey, GCMParameterSpec(API_KEY_GCM_TAG_BITS, iv))
-                val plaintext = cipher.doFinal(ciphertext)
+                val plaintext = synchronized(apiKeyLock) {
+                    val secretKey = getApiKey()
+                        ?: throw IllegalStateException("Android Keystore 密钥不可用")
+                    val iv = combined.copyOfRange(0, API_KEY_GCM_IV_BYTES)
+                    val ciphertext = combined.copyOfRange(API_KEY_GCM_IV_BYTES, combined.size)
+                    val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+                    cipher.init(Cipher.DECRYPT_MODE, secretKey, GCMParameterSpec(API_KEY_GCM_TAG_BITS, iv))
+                    // AAD 与 store 用同一 keyRef：密文被换到别的条目时解密失败。
+                    cipher.updateAAD(args.keyRef.toByteArray(Charsets.UTF_8))
+                    cipher.doFinal(ciphertext)
+                }
                 val ret = JSObject().apply {
                     put("value", String(plaintext, Charsets.UTF_8))
                 }
@@ -708,7 +724,12 @@ class AccountSessionPlugin(private val activity: Activity) : Plugin(activity) {
                     return@thread
                 }
                 // remove 不存在的 key 也是成功（SharedPreferences.Editor.remove 无此 key 时静默无操作）。
-                apiKeyPrefs().edit().remove(args.keyRef).apply()
+                // 同步 commit 并校验，与 store 对齐。
+                synchronized(apiKeyLock) {
+                    if (!apiKeyPrefs().edit().remove(args.keyRef).commit()) {
+                        throw IllegalStateException("删除 API Key 失败")
+                    }
+                }
                 invoke.resolve(JSObject())
             } catch (t: Throwable) {
                 invoke.reject("删除 API Key 失败")

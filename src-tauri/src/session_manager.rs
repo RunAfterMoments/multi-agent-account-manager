@@ -263,7 +263,10 @@ impl SessionManager {
       vault.set_app_handle(app);
     }
     let store_path = app_data_dir.join("accounts.json");
-    let loaded = load_or_migrate_store(&store_path, &vault).await;
+    // 桌面在 setup 里同步迁移（keyring 是同步调用，无插件调用，
+    // 安全）；移动端延后到 run_startup_tasks——setup 的 block_on
+    // 里调插件会死锁（iOS 插件调用要主队列调度）。
+    let loaded = load_or_migrate_store(&store_path, &vault, cfg!(desktop)).await;
     let initial_minimize = loaded.store.settings.minimize_to_tray;
     let initial_auto_approve = loaded.store.settings.auto_approve;
     let initial_auto_approve_commands = loaded.store.settings.auto_approve_commands;
@@ -396,6 +399,29 @@ impl SessionManager {
   pub async fn run_startup_tasks(self: &Arc<Self>, app: &AppHandle) {
     // 先启动防抖写线程，后续启动流程里的 `request_persist` 都会被接住。
     self.ensure_persist_writer(app);
+    #[cfg(mobile)]
+    {
+      // 移动端 vault 迁移延后到此：setup 的 block_on 里调插件会死锁
+      //（iOS 插件调用要主队列调度），这里已是 spawn 的异步任务。
+      // 有旧明文 Key 时迁移成功后 request_persist() 写盘剥离明文；
+      // 失败则立 notice，下次启动重试（磁盘原文件不动，Key 不丢）。
+      let has_legacy_plaintext = {
+        let locked = self.inner.lock().await;
+        locked
+          .store
+          .external_agents
+          .iter()
+          .any(|a| !a.api_key.is_empty())
+      };
+      let mut locked = self.inner.lock().await;
+      if !crate::storage::migrate_agent_keys_to_vault(&mut locked.store, &self.api_key_vault).await
+      {
+        locked.notice =
+          Some("API Key 未能迁移到系统凭据库，已保留原配置，下次启动重试".to_string());
+      } else if has_legacy_plaintext {
+        self.request_persist();
+      }
+    }
     #[cfg(desktop)]
     {
       let initial_shortcut = {
@@ -3573,7 +3599,7 @@ mod tests {
     let kept = mgr2.inner.lock().await.store.external_agents[0]
       .api_key
       .clone();
-    assert_eq!(kept, "sk-live-123", "留空编辑不得清空内存 Key");
+    assert_eq!(kept.as_str(), "sk-live-123", "留空编辑不得清空内存 Key");
 
     // 再次重启：Key 仍能从 vault 恢复。
     let mut mgr3 = SessionManager::new(temp_dir.clone()).await;
