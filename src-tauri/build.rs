@@ -46,27 +46,31 @@ const APP_COMMANDS: &[&str] = &[
 
 fn main() {
   let attributes = tauri_build::Attributes::new()
-    .app_manifest(tauri_build::AppManifest::new().commands(APP_COMMANDS));
+    .app_manifest(tauri_build::AppManifest::new().commands(APP_COMMANDS))
+    // Windows: 别让 tauri-build 再把清单嵌进 resource.rc——下面的 linker 清单
+    // 会覆盖全部产物（应用本体 + 测试程序），两处各嵌一份会在链接时报
+    // CVT1100 重复资源。关掉它之后，resource.rc 只剩图标和版本信息。
+    .windows_attributes(tauri_build::WindowsAttributes::new_without_app_manifest());
   tauri_build::try_build(attributes).expect("failed to run tauri-build");
 
-  // Windows: 测试程序也要带 Common-Controls v6 清单，否则加载器在任何测试
-  // 运行前就以 0xc0000139 拒绝它——tauri-runtime-wry 的对话框代码要调
-  // TaskDialogIndirect，而它只在 comctl32 v6 里才有，系统默认的 v5.82 没有。
-  // 应用本体由 tauri-winres 通过 resource.rc 嵌了同一份清单，测试程序不走
-  // 那条路，所以这里只给 tests 目标再补一份（内容与 tauri-build 默认清单
-  // 逐字相同，见 windows-app-manifest.xml）。只在 Windows 宿主上发 link.exe
-  // 参数：MinGW 交叉链接和 lld-link 都消化不了 /MANIFESTINPUT（后者还要
-  // 外挂 mt.exe）。
+  // Windows: 全部产物都要带 Common-Controls v6 清单，否则测试程序在任何
+  // 测试运行前就被加载器以 0xc0000139 拒绝——tauri-runtime-wry 的对话框
+  // 代码要调 TaskDialogIndirect，而它只在 comctl32 v6 里才有，系统默认的
+  // v5.82 没有。应用本体以前靠 tauri-winres 经 resource.rc 嵌这份清单，
+  // 测试程序不走那条路所以一直裸奔；现在改由 linker 经 /MANIFESTINPUT
+  // 统一嵌（内容与 tauri-build 默认清单逐字相同，见 windows-app-manifest.xml），
+  // 应用本体有效清单不变。
+  // 注：cargo:rustc-link-arg-tests 在此走不通——cargo 只认 tests/ 目录下的
+  // 集成测试目标，本 crate 只有 lib 内单元测试，v6.1.3 因此在 clippy 步
+  // 就被拒（invalid instruction）。只在 Windows 宿主上发 link.exe 参数：
+  // MinGW 交叉链接和 lld-link 都消化不了 /MANIFESTINPUT（后者还要外挂 mt.exe）。
   if cfg!(target_os = "windows") {
     let manifest = std::path::PathBuf::from(
       std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set by cargo"),
     )
     .join("windows-app-manifest.xml");
     println!("cargo:rerun-if-changed=windows-app-manifest.xml");
-    println!("cargo:rustc-link-arg-tests=/MANIFEST:EMBED");
-    println!(
-      "cargo:rustc-link-arg-tests=/MANIFESTINPUT={}",
-      manifest.display()
-    );
+    println!("cargo:rustc-link-arg=/MANIFEST:EMBED");
+    println!("cargo:rustc-link-arg=/MANIFESTINPUT={}", manifest.display());
   }
 }
