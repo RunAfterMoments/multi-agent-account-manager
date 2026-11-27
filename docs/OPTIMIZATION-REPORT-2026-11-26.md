@@ -1723,3 +1723,19 @@ check 上会多 3 条 `dead_code`/`unused import` 警告。全部补
 - Android 真机运行：签名 APK 仅在 CI 里编出并验签，未装机跑过——靠 Phase 4 真机验收。
 - 干跑编出的二进制更新检查是关闭的（`MAAM_UPDATE_REPO` 为空）；rc1 的真实更新检查需设变量后重新编。
 - 密钥方案 (a) 的"仓库级 + Environment 混合读取"结论来自 GitHub 文档行为，未在本次干跑里实测（publish job 被跳过）；rc1 发布时是第一次实测点。
+
+## 二十一、v1.0.0-rc1 发布（2026-11-27）
+
+### 1. 前置条件（用户定方案 (a)，父代理已用命令行落地，本轮只核实）
+
+- minisign 方案 (a)：`MAAM_MINISIGN_SECRET_KEY` 留在仓库级；`ANDROID_KEYSTORE_*` 四个已移入 Environment `release`，仓库级副本已删。核实：`gh secret list` 仓库级只剩 minisign 一个；`gh secret list --env release` 四个 Android 密钥都在（2026-11-27T09:07:50–53Z 设入）。
+- Environment `release` 已建：deployment branch policy 为 custom，含 main（branch）+ `v*`（tag）两条 policy，无 required reviewers。核实：`gh api .../environments/release` 返回 `protection_rules: [branch_policy]`，`deployment_branch_policy.custom_branch_policies: true`。
+- 仓库变量 `MAAM_UPDATE_REPO=RunAfterMoments/multi-agent-account-manager` 已设并核实（`gh api .../actions/variables/MAAM_UPDATE_REPO --jq .value`）。
+
+### 2. release.yml 加 environment（只改两行）
+
+- `android` job（约 97 行）与 `publish` job（约 218 行）的 job 层（与 `runs-on` 同级）各加 `environment: release`；`desktop`/`ios` 不读任何 secret，不加。
+- 核实：全仓库 grep `secrets\.` 只有五处——Android job 的四个 `ANDROID_KEYSTORE_*`（“Sign release APK”步骤）与 publish job 的 `MAAM_MINISIGN_SECRET_KEY`（“Sign release assets with minisign”步骤）；没有别的 job 读仓库级 Android secrets（仓库级已删，读了就会失败）。YAML 经 `yaml.safe_load` 校验通过。
+- 触发条件核实：`on.push.tags: ["v*"]`，push tag `v1.0.0-rc1` 即触发 release workflow；publish job 的 `if` 含 `github.ref_type == 'tag'`，tag 触发时 publish 一定跑。`MAAM_UPDATE_REPO` 取 `${{ inputs.maam_update_repo || vars.MAAM_UPDATE_REPO }}`，tag push 时 inputs 为空，回落到刚设的仓库变量——rc1 编出的二进制更新检查是开启的。
+
+### 3. 版本号与 tag（待补：run 结果与验签结论见 §4–5）

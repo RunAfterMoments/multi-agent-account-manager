@@ -94,6 +94,7 @@ jobs:
   android:
     name: Android
     runs-on: ubuntu-24.04
+    environment: release
     timeout-minutes: 70
     env:
       NDK_VERSION: 28.2.13676358
@@ -214,6 +215,7 @@ jobs:
     needs: [desktop, android, ios]
     if: github.ref_type == 'tag' || (github.event_name == 'workflow_dispatch' && inputs.publish_release == true && inputs.android_variant == 'release')
     runs-on: ubuntu-24.04
+    environment: release
     permissions:
       contents: write
     steps:
