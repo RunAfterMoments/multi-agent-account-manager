@@ -506,7 +506,7 @@ export function renderGroupRightStage(
               : "";
 
             const bodyContent = msg.content.trim()
-              ? `<div class="group-msg-text">${renderMessageTextWithMentions(msg.content, memberAliases)}</div>`
+              ? `<div class="group-msg-text" data-msg-text-id="${escapeHtml(msg.id)}">${renderMessageTextWithMentions(msg.content, memberAliases)}</div>`
               : msg.status === "queued"
                 ? `<div class="group-msg-pending">等待前序阶段或槽位释放后唤醒…</div>`
                 : msg.status === "sending" || msg.status === "streaming"
@@ -564,7 +564,7 @@ export function renderGroupRightStage(
                   : "";
 
             return `
-              <div class="group-msg assistant">
+              <div class="group-msg assistant" data-msg-id="${escapeHtml(msg.id)}">
                 <button class="group-msg-avatar-btn" type="button" title="${meta?.isExternal ? `点击编辑「${escapeHtml(senderDisplayName)}」配置` : `点击切换到「${escapeHtml(senderDisplayName)}」原生会话页`}" ${jumpAttrs}>
                   ${renderMemberAvatarNode(state, meta?.acc, senderDisplayName, "", meta?.ext?.kind)}
                 </button>

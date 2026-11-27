@@ -1450,3 +1450,142 @@ quota_sync.rs + a2a.rs + webview.rs + store.rs），核心 API
 - `HideSlotOp` 的移动端执行路径（`execute_hide_slot` →
   `close_active_session`）本机编不到移动端目标，只在
   `#[cfg(mobile)]` 分支内，靠 CI 移动端构建验证。
+
+## 十八、v6.4 Phase 1B 群聊增量流式（2026-11-27，Step 2 后半）
+
+### 1. 问题
+
+`update_group_message_state`（`group_chat.rs`）每 180ms 流式刷新都把
+整个 `ManagerSnapshot`（所有账号 + 所有群 + 每群 120 条消息）重新
+序列化发往 `manager-state-changed`，前端 `main.ts` 触发全量
+`root.innerHTML = ...` + `bindEvents`。多 Agent 并发流式时全量重绘是
+最大的体验瓶颈。
+
+### 2. 后端：稳态流式快路径（`group_chat.rs`，最小侵入）
+
+新增事件载荷（文件级，`#[cfg(any(desktop, test))]`）：
+
+```rust
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupMessageStreamEvent {
+  pub group_id: String,
+  pub msg_id: String,
+  pub content: String,
+}
+```
+
+**载荷形状选择：全量 `content`，不用 `delta + total_len`。** 单条消息
+全文每 180ms 一发，相对全量快照（数百 KB）仍是 99% 的削减；且彻底
+没有长度失步的可能，不需要回退拉全量的逻辑，少一条故障模式。
+
+快路径判定（纯函数 `is_stream_fast_path`，便于单测），五个条件全满足
+才走增量：
+
+- `status == Streaming`
+- `!persist`
+- `prev_status == Streaming`
+- `!prev_content_was_empty`（上一轮内容非空）
+- 本轮没有改动 `error` 字段（第 5 条是协调人补的收紧：调用方常传
+  `error_opt = Some(None)` 清错误，只看字段是否真的变了；error 变了
+  就走全量，避免前端错误框滞后）
+
+满足时：只改内存 `msg.content`，**不构造 `ManagerSnapshot`**，用
+`app.emit_to("manager", "group-msg-stream", evt)` 发事件（**绝不用
+全局 `emit`**；生产代码全局 `app.emit(` 保持 0 处，grep 核实）。
+
+**为何要求 `!prev_content_was_empty`**：首字到达时 DOM 要把
+`.group-msg-pending` 替换为 `.group-msg-text` 并渲染「沉淀到共享
+上下文」按钮。让「首字到达」和所有状态切换（Queued → Sending →
+Streaming → Done/Error/NeedsAuth）走一次全量快照，后续几百次流式
+分片全走增量快路径，既 100% 避免 UI 漏渲染按钮，又砍掉 99% 全量重绘。
+
+`update_group_message_state` 的其余行为原样保留：找不到群/消息返回
+`false`；无变化且非 persist 时直接返回 `true`（不发任何事件）；
+`persist` 时仍走 `request_persist()` + 全量快照。
+
+### 3. 前端（复用 `update-progress` 现成范式）
+
+- `group-chat.ts`：助手消息正文容器加稳定锚点
+  `data-msg-text-id="${escapeHtml(msg.id)}"`，外层 `.group-msg` 加
+  `data-msg-id`（用户消息分支不流式，不加）。
+- `src/group-stream.ts`（新增）：`applyGroupMessageStreamEvent(snapshot,
+  ev, doc, opts)`，三步：
+  1. 同步更新内存中 `snapshot.groupChats` 对应消息的 `content`
+     （防止后续任意 `render()` 把文本回闪成旧内容）；群/消息不存在
+     返回 `"ignored"`；
+  2. 仅当群聊页处于该群时，查找
+     `[data-msg-text-id="${CSS.escape(ev.msgId)}"]` 局部更新正文
+     （`renderMessageTextWithMentions` 渲染）；元素不存在时静默跳过，
+     下次全量快照纠正；
+  3. 仅在 `.group-messages` 原本距底 ≤64px 时才贴底滚动（先量后改，
+     `innerHTML` 会改变 `scrollHeight`），绝不打断用户向上翻阅历史
+     或选中文本。
+  该模块零运行时依赖（只 `import type`），便于 `node:test` 直接导入
+  测试；`renderText` 以参数注入，生产传
+  `renderMessageTextWithMentions`。
+- `main.ts`（`bootstrap()`，`update-progress` 监听旁）：新增
+  `listen<GroupMessageStreamEvent>("group-msg-stream", ...)` 薄封装：
+  快照为空或群不存在直接返回；用 `resolveMemberMeta` 算
+  `memberAliases`；`isGroupPageActive = modal.kind === "group" &&
+  snapshot.activeGroupId === ev.groupId`；调 helper。
+  注意：`snapshot` 是模块级 `let`，闭包内不收窄，先取
+  `const snap = snapshot` 再判空（tsc 曾报 TS2345，由此修复）。
+- `src/types.ts`：新增 `GroupMessageStreamEvent { groupId; msgId;
+  content }`（与 Rust `camelCase` 序列化一致）。
+
+### 4. cfg 说明（协调人复核抓出的 3 条移动端警告）
+
+`update_group_message_state` 本身是 `#[cfg(desktop)]`（群聊流式只在
+桌面跑），因此新增的 `GroupMessageStreamEvent`、`is_stream_fast_path`、
+`use tauri::Emitter`、`use serde::Serialize` 若不加 gate，在 Android
+check 上会多 3 条 `dead_code`/`unused import` 警告。全部补
+`#[cfg(any(desktop, test))]`（`Emitter` 只补 `#[cfg(desktop)]`，测试
+不用它），与文件既有写法一致。修后 Android 警告回到基线 43 条。
+（中途还抓到一处编译错：`emit_to` 需 `tauri::Emitter` trait 在作用域
+内，`E0599`，补 import 解决。）
+
+### 5. 回归单测
+
+- Rust（`group_chat.rs` 新增 `#[cfg(test)] mod tests`，此前该文件无
+  测试模块；`tauri::test::mock_app` 需改构建配置，故只测纯函数）：
+  `stream_fast_path_only_when_steady_streaming_non_empty`（6 条判定：
+  稳态真、首字假、状态切换假、persist 假、error 改动假、Done 假）、
+  `stream_event_serializes_to_camel_case`（`{groupId, msgId, content}`）。
+- JS（`tests/group_msg_stream.test.mjs`，`test:js` 改为同时跑两个
+  文件）：4 条——只更新目标 `[data-msg-text-id]` 且同步内存快照（不
+  动其他消息）、群/消息不存在返回 `ignored`、不在群聊页只同步内存、
+  距底 ≤64px 贴底 / 更远不打断。jsdom 的 `scrollHeight` 等用
+  `Object.defineProperty` 打桩；`CSS.escape` 用 jsdom 的 `window.CSS`
+  或最小 polyfill（助手函数调用时才读全局 `CSS`）。
+
+### 6. 验证结果（全部本机跑，逐项）
+
+- `cargo fmt --check`：通过。
+- `cargo clippy --all-targets -- -D warnings`（Linux）：通过（仅 1 条
+  基线 manifest 警告）。
+- `cargo clippy --target x86_64-pc-windows-gnu --all-targets -- -D warnings`：
+  通过。
+- `cargo test --lib`：**122/122**（120 + 2 个新流式单测）。
+- `cargo check --target aarch64-linux-android --lib`：0 错误，43 条警告
+  （= 基线；中途曾涨到 46，见 §4，已修回）。
+- `npm run build`（`tsc && vite build`）：通过（中途 tsc 报过
+  `main.ts` TS2345，见 §3 的 `snap` 修复）。
+- `npm run test:js`：**24/24**（20 个旧 auto_approve + 4 个新流式）。
+- grep 核实：生产代码全局 `app.emit(` 0 处；`group-msg-stream` 只有
+  两处接线（Rust `emit_to` + `main.ts` `listen`）。
+
+### 7. 实施说明
+
+- Gemini 当天不可用（direct REST：`gemini-4-hydrogen` 与
+  `gemini-4-neon` 均 429 免费额度耗尽；CLI：`service_unavailable`），
+  本轮代码由协调人按核实过的设计直接写（v6.2 已有先例，已在报告中
+  说明）；每处改动均对照真实源码逐行核实，验证全套重跑。
+- 1A 的文件逻辑只读未改（`store.rs` 的 `persist_now`、
+  `hide`/`vault` 拆分 0 行 diff）。
+
+### 8. 未验证
+
+- 流式在真机多 Agent 并发下的零卡顿/无输入抖动：靠 Phase 4 真机验收
+  （本机只有单测 + 构建验证，没有跑起来的多路流式）。
+- iOS Swift、Kotlin：本轮未改动，无需验证。

@@ -44,16 +44,51 @@ use crate::storage::{
   ExternalAgentKind, ExternalAgentRecord, GroupChatRecord, GroupMemberRole, GroupReplyStatus,
   GroupSharedSkill, GroupWorkflowMode,
 };
+#[cfg(any(desktop, test))]
+use serde::Serialize;
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tauri::AppHandle;
 #[cfg(desktop)]
+use tauri::Emitter;
+#[cfg(desktop)]
 use tauri::Manager;
 use url::Url;
 use uuid::Uuid;
 use zeroize::Zeroizing;
+
+/// 群聊流式增量事件：稳态 Streaming 时只发单条消息的当前全文，
+/// 不发全量 ManagerSnapshot。字段 camelCase，与前端
+/// `GroupMessageStreamEvent` 对应。
+#[cfg(any(desktop, test))]
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupMessageStreamEvent {
+  pub group_id: String,
+  pub msg_id: String,
+  pub content: String,
+}
+
+/// 稳态流式快路径判定（纯函数，便于单测）：仅当状态保持 Streaming、
+/// 非持久化、本轮之前已是 Streaming 且已有内容、且本轮没有改动
+/// error 字段时，才走增量事件。首字到达（之前内容为空）与任何状态
+/// 切换都走全量快照，避免前端漏渲染 pending 替换与操作按钮。
+#[cfg(any(desktop, test))]
+fn is_stream_fast_path(
+  status: GroupReplyStatus,
+  prev_status: GroupReplyStatus,
+  prev_content_was_empty: bool,
+  persist: bool,
+  error_changed: bool,
+) -> bool {
+  status == GroupReplyStatus::Streaming
+    && !persist
+    && prev_status == GroupReplyStatus::Streaming
+    && !prev_content_was_empty
+    && !error_changed
+}
 
 impl SessionManager {
   #[cfg(any(desktop, test))]
@@ -2349,7 +2384,7 @@ impl SessionManager {
     error_opt: Option<Option<String>>,
     persist: bool,
   ) -> bool {
-    let snap_opt = {
+    let (snap_opt, stream_opt) = {
       let mut locked = self.inner.lock().await;
       let Some(g) = locked
         .store
@@ -2362,6 +2397,8 @@ impl SessionManager {
       let Some(m) = g.messages.iter_mut().find(|m| m.id == msg_id) else {
         return false;
       };
+      let prev_status = m.status;
+      let prev_content_was_empty = m.content.is_empty();
       let mut changed = m.status != status;
       m.status = status;
       if let Some(content) = content_opt {
@@ -2370,10 +2407,12 @@ impl SessionManager {
           changed = true;
         }
       }
+      let mut error_changed = false;
       if let Some(err) = error_opt {
         if m.error != err {
           m.error = err;
           changed = true;
+          error_changed = true;
         }
       }
       if !changed && !persist {
@@ -2382,9 +2421,31 @@ impl SessionManager {
       if persist {
         self.request_persist();
       }
-      Some(Self::snapshot_from_locked(&locked))
+      // 稳态流式快路径：只发单条消息当前全文，不构造全量快照。
+      if is_stream_fast_path(
+        status,
+        prev_status,
+        prev_content_was_empty,
+        persist,
+        error_changed,
+      ) {
+        (
+          None,
+          Some(GroupMessageStreamEvent {
+            group_id: group_id.to_string(),
+            msg_id: msg_id.to_string(),
+            content: m.content.clone(),
+          }),
+        )
+      } else {
+        (Some(Self::snapshot_from_locked(&locked)), None)
+      }
     };
 
+    if let Some(evt) = stream_opt {
+      let _ = app.emit_to("manager", "group-msg-stream", evt);
+      return true;
+    }
     if let Some(snap) = snap_opt {
       self.emit_snapshot(app, &snap);
       true
@@ -4152,5 +4213,76 @@ impl SessionManager {
       )
       .await;
     None
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn stream_fast_path_only_when_steady_streaming_non_empty() {
+    // 稳态流式（之前已是 Streaming 且已有内容）：走增量。
+    assert!(is_stream_fast_path(
+      GroupReplyStatus::Streaming,
+      GroupReplyStatus::Streaming,
+      false,
+      false,
+      false
+    ));
+    // 首字到达（之前内容为空）：走全量，渲染 pending 替换与按钮。
+    assert!(!is_stream_fast_path(
+      GroupReplyStatus::Streaming,
+      GroupReplyStatus::Streaming,
+      true,
+      false,
+      false
+    ));
+    // 状态切换（Sending → Streaming）：走全量。
+    assert!(!is_stream_fast_path(
+      GroupReplyStatus::Streaming,
+      GroupReplyStatus::Sending,
+      false,
+      false,
+      false
+    ));
+    // 持久化：走全量。
+    assert!(!is_stream_fast_path(
+      GroupReplyStatus::Streaming,
+      GroupReplyStatus::Streaming,
+      false,
+      true,
+      false
+    ));
+    // 本轮改动了 error：走全量，避免前端错误框滞后。
+    assert!(!is_stream_fast_path(
+      GroupReplyStatus::Streaming,
+      GroupReplyStatus::Streaming,
+      false,
+      false,
+      true
+    ));
+    // 非 Streaming 状态：走全量。
+    assert!(!is_stream_fast_path(
+      GroupReplyStatus::Done,
+      GroupReplyStatus::Streaming,
+      false,
+      false,
+      false
+    ));
+  }
+
+  #[test]
+  fn stream_event_serializes_to_camel_case() {
+    let evt = GroupMessageStreamEvent {
+      group_id: "g1".to_string(),
+      msg_id: "m1".to_string(),
+      content: "hello".to_string(),
+    };
+    let value = serde_json::to_value(&evt).expect("事件应可序列化");
+    assert_eq!(
+      value,
+      serde_json::json!({"groupId": "g1", "msgId": "m1", "content": "hello"})
+    );
   }
 }

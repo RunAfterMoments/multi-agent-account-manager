@@ -78,6 +78,12 @@ export type GroupReplyStatus =
   | "needs_auth"
   | "error";
 
+export interface GroupMessageStreamEvent {
+  groupId: string;
+  msgId: string;
+  content: string;
+}
+
 export interface GroupSharedSkill {
   id: string;
   name: string;

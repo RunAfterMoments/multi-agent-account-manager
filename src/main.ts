@@ -5,6 +5,7 @@ import type {
   AccountKey,
   DownloadNoticeEvent,
   ExternalAgentKind,
+  GroupMessageStreamEvent,
   GroupWorkflowMode,
   InstallUpdateOutcome,
   ManagerSnapshot,
@@ -79,7 +80,9 @@ import {
   extractComposerAtMentions,
   formatComposerHintText,
   getLatestRoundCompletedReplies,
+  renderMessageTextWithMentions,
 } from "./group-chat";
+import { applyGroupMessageStreamEvent } from "./group-stream";
 
 // Theme wiring (was top-level in main.ts before the P2-11 split; kept here
 // because it touches the app snapshot and re-render in this module).
@@ -2543,6 +2546,26 @@ async function bootstrap(): Promise<void> {
     }
     setLastRenderedUpdateStage(evt.stage);
     rerenderPreservingScroll();
+  });
+
+  // 群聊流式增量（v6.4 1B）：稳态 Streaming 时后端只发单条消息全文，
+  // 这里只同步内存快照 + 局部更新正文容器，不触发全量 render。
+  await listen<GroupMessageStreamEvent>("group-msg-stream", (event) => {
+    const snap = snapshot;
+    if (!snap) return;
+    const ev = event.payload;
+    const group = snap.groupChats.find((g) => g.id === ev.groupId);
+    if (!group) return;
+    const memberAliases = group.members.map(
+      (m) => resolveMemberMeta(snap, m).alias,
+    );
+    const isGroupPageActive =
+      modal.kind === "group" && snap.activeGroupId === ev.groupId;
+    applyGroupMessageStreamEvent(snap, ev, document, {
+      isGroupPageActive,
+      memberAliases,
+      renderText: renderMessageTextWithMentions,
+    });
   });
 
   window.addEventListener("keydown", async (ev) => {
