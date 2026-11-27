@@ -2159,10 +2159,11 @@ pub fn lock_windows_manager_webview_zoom(webview: &tauri::Webview) {
   });
 }
 
-/// COM 单元初始化守卫（仅 Windows 文件定位用）：`CoInitializeEx` 返回
-/// `S_OK` 时由本次调用新建了 STA，Drop 里必须配对 `CoUninitialize()`；
-/// `S_FALSE`（调用线程已有同模型初始化，初始化不归我们）与失败时不碰，
-/// 绝不反初始化别人的 COM。
+/// COM 单元初始化守卫（仅 Windows 文件定位用）：`CoInitializeEx` 每次
+/// 成功调用（含返回 `S_FALSE`：调用线程已有同模型初始化）都必须配对
+/// 一次 `CoUninitialize()`（COM 文档的配对规则）；失败时不碰。
+/// 注意：`CoUninitialize` 只把本线程计数减一，计数归零才真正反初始化，
+/// 因此配对 `S_FALSE` 不会动别人的初始化。
 #[cfg(windows)]
 struct ComApartmentGuard(bool);
 
@@ -2179,13 +2180,12 @@ impl Drop for ComApartmentGuard {
 /// explorer.exe 命令行拼接（M-08 首选方案；API 签名对照 vendored
 /// windows 0.62.2 核实：SHOpenFolderAndSelectItems / ILCreateFromPathW /
 /// ILFindLastID 均需 Win32_UI_Shell_Common feature，CoTaskMemFree /
-/// CoInitializeEx / COINIT_APARTMENTTHREADED 需 Win32_System_Com，
-/// S_OK 需 Win32_Foundation）。任一步失败都回退到只打开父目录。
+/// CoInitializeEx / COINIT_APARTMENTTHREADED 需 Win32_System_Com）。
+/// 任一步失败都回退到只打开父目录。
 /// `clean` 是去掉 `\\?\` 前缀后的完整文件路径。
 #[cfg(windows)]
 fn reveal_with_shell_select(path: &Path, clean: &str) -> Result<(), String> {
   use windows::core::HSTRING;
-  use windows::Win32::Foundation::S_OK;
   use windows::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, COINIT_APARTMENTTHREADED};
   use windows::Win32::UI::Shell::{ILCreateFromPathW, ILFindLastID, SHOpenFolderAndSelectItems};
 
@@ -2193,13 +2193,16 @@ fn reveal_with_shell_select(path: &Path, clean: &str) -> Result<(), String> {
   // 本函数由 reveal_downloaded_file 在 Tokio worker 线程上直接调用，该线程
   // 通常未初始化 COM，未初始化时调 shell 会返回 CO_E_NOTINITIALIZED 而默默
   // 回退到只打开父目录、不选中文件。
-  // 配对规则（按 CoInitializeEx 返回值）：
+  // 配对规则（COM 文档：每次成功调用都要配对一次 CoUninitialize，
+  // 含返回 S_FALSE 的调用；is_ok() 即 S_OK 或 S_FALSE）：
   // - S_OK：本次调用新建了 STA，函数结束时 guard 配对 CoUninitialize()；
-  // - S_FALSE：线程已有同模型初始化，不归我们，绝不反初始化；
-  // - RPC_E_CHANGED_MODE 等其他错误：继续往下走，shell 失败时走现有回退。
+  // - S_FALSE：线程已有同模型初始化，本次调用仍使计数加一，guard 配对
+  //   减一，不会动别人的初始化（计数归零才真正反初始化）；
+  // - RPC_E_CHANGED_MODE 等其他错误：不配对，继续往下走，shell 失败时
+  //   走现有回退。
   // guard 在函数作用域内，任意返回路径（包括 early return）都会 Drop。
   let _com_guard =
-    ComApartmentGuard(unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) } == S_OK);
+    ComApartmentGuard(unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.is_ok());
 
   let open_parent = || {
     if let Some(parent) = path.parent().filter(|p| p.exists()) {

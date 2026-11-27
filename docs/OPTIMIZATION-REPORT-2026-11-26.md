@@ -1814,3 +1814,48 @@ check 上会多 3 条 `dead_code`/`unused import` 警告。全部补
 
 - COM 初始化真跑：靠 Phase 4 真机清单 M-08 高亮选中项。
 - prerelease 标志真跑：下一次 rc/beta 发布时才触发（v1.0.0 正式版不带 `-`，不受影响）；Release 已存在时的 edit 分支不翻 prerelease 状态。
+
+## 二十三、Windows Job Object 查杀加固（Phase 4 验收边角，2026-11-27 晚）
+
+用户在 Win11 实机（10.0.26200、125% DPI）上跑完 Windows 端验收：总评 GO，但抓出 1 条边角——标准 Win32 `node.exe` 经 `codex.cmd` 启动，点「停止」后 0 残留；Microsoft Store MSIX 版 `python.exe`（`%LOCALAPPDATA%\Microsoft\WindowsApps\...`）点「停止」后 `cmd.exe` 被杀、Store Python 子/孙进程存活。用户当时怀疑 MSIX 别名经系统服务激活、脱离 Job Object，另指出 `group_transport.rs` 在 `spawn()` 之后才 `AssignProcessToJobObject`、存在毫秒级派生竞态。用户决定：这条不留到 v1.0.1，现在修进 v1.0.0；顺手带上验收里提的 1 行 `CoInitializeEx(...).is_ok()`。
+
+### 1. 机制核实：MSIX 逃逸到底是竞态，不是 broker
+
+先查真实机制再动手，结论是**派生竞态**，不是 MSIX 别名走了 broker：
+
+- MSDN Job Objects 文档：Job 成员经 `CreateProcess` 创建的子进程默认也进 Job（`Win32_Process.Create` 创建的除外）；本仓库的 Job 未设 `BREAKAWAY_OK`，子进程无权自行脱离。
+- 别名解析发生在调用方进程内：`CreateProcessInternalW` 遇 AppExecLink 重解析点（`STATUS_IO_REPARSE_TAG_NOT_HANDLED`）时，在调用方（`cmd.exe`）进程内调 `LoadAppExecutionAliasInfoEx` 解析出包内真实路径，再以同一调用方 `NtCreateUserProcess` 创建——被激活的进程仍是 `cmd.exe` 的子进程，Job 继承照常适用（第三方逆向分析；微软 Inside MSIX 专栏称别名“激活”包应用，与 AUMID 激活同一机制）。
+- 佐证：Claude Code 的 MSIX issue（#91763）里，打包应用派生的 `git fsmonitor--daemon` 明确“继承了 AppX 容器 Job”（`IsProcessInJob = true`）——打包应用的子进程照样继承 Job。
+- 反例边界（AtomLane 文档也这么划）：经外部 broker 创建的进程（WSL、Docker、WMI、服务、计划任务）不继承 Job——别名激活不是 broker，不属此类。
+- 因此验收现象的唯一解释是竞态：`cmd.spawn()` 返回后、`AssignProcessToJobObject` 之前，`cmd.exe` 已派生出 `python.exe`；node  case 恰好落在窗口之后，是时序差异，不是机制差异。修竞态即堵住 MSIX 逃逸。
+
+### 2. 修复（group_transport.rs，Windows 专用）
+
+- **CREATE_SUSPENDED 出生**：`Command::creation_flags` 加 `CREATE_SUSPENDED`（与已有 `CREATE_NO_WINDOW` 并存）。子进程出生即挂起、一条指令都不跑，挂入 Job 后才恢复——出生与挂入之间不存在窗口。
+- **恢复**：`resume_suspended_process`——windows 0.62 的 crate 里没有 `NtResumeProcess`（ntdll 未导出绑定，对照 vendored 0.62.2 源码确认无此符号），改用 Toolhelp32 线程快照找该进程名下的线程并逐个 `ResumeThread`。挂起的进程只有一个主线程且跑不起来，不会在快照与恢复之间新建线程，因此这里没有竞态。恢复失败（理论上不应发生）则杀掉仍挂起的子进程并返回 Err，绝不让它无 Job 约束地跑起来；恢复在挂入后、stdin/stdout 读线程启动前执行，每条路径恰好一次。
+- **PPID 树兜底**：停止时 `TerminateJobObject`（或挂入失败回退的 `taskkill /T /F`）之后，再跑 `kill_descendant_tree`——一次 Toolhelp32 进程快照取全表，按 PPID 走出整棵树、自底向上 `TerminateProcess`。这道网覆盖 Job 之外的残留：挂入前窗口逃逸的派生、经 WMI（MSDN 明言不继承 Job）等方式派生的帮手。树遍历抽成纯函数 `collect_descendant_pids`（与平台无关，Linux 可单测）。
+- **保留原有回退**：Job 创建/挂入失败仍留空、杀灭时回退 `taskkill /T /F` 再加 PPID 兜底（fail-open 设计不变）；`KILL_ON_JOB_CLOSE` 不变。
+- **CoInitializeEx(...).is_ok()**（platform.rs，用户验收原话的 1 行）：`ComApartmentGuard(... == S_OK)` 改为 `... .is_ok()`。COM 文档的配对规则是每次成功调用都要配对一次 `CoUninitialize`，含返回 `S_FALSE` 的调用；旧代码只配对 `S_OK`，在调用线程已有同模型初始化时每调一次漏一个计数。`CoUninitialize` 只把本线程计数减一、归零才真正反初始化，因此配对 `S_FALSE` 不会动别人的初始化。`S_OK` 导入随之删除（未用会触发 clippy `-D warnings`）。
+
+### 3. 取舍与边界（诚实说明）
+
+- **MSIX 逃逸堵住了**——证据见 §1：机制是竞态，竞态已由出生挂起关掉；且 PPID 兜底即使对 Job 之外的残留也能杀（Windows 上父进程死后子进程 PPID 不变，快照仍找得到）。
+- **应用侧堵不住的两种情况**（已写进代码注释，不假装全能）：① 快照与杀灭之间新派生的进程不在表里；② 经外部 broker（服务、计划任务、WSL/Docker）创建、父进程不是被杀进程的进程。前者由原子性的挂起+挂入保证，后者超出应用进程树范畴。
+- **PID 复用**：快照与杀灭之间目标 PID 被无关进程复用的窗口只有毫秒级（Windows PID 不会立即复用刚释放的），与 `taskkill /T` 固有的风险相同，未另作处理。
+
+### 4. 验证（本机逐项重跑，全绿）
+
+- `cargo fmt --check`：通过（初版一处 `use` 换行被 fmt 指出，已跑 `cargo fmt` 修正）。
+- `cargo clippy --all-targets -- -D warnings`（Linux）：通过（仅 1 条基线 manifest 警告）。
+- `cargo clippy --target x86_64-pc-windows-gnu --all-targets -- -D warnings`：通过（抓出 1 处 `field_reassign_with_default`——`PROCESSENTRY32W::default()` 后再给 `dwSize` 赋值，Linux 编不到这段代码，改成 struct update 语法后通过；仅 1 条基线 manifest 警告）。
+- `cargo test --lib`：**130/130**（127 + 新增 `collect_descendant_pids` 3 条：整树、空表/缺 root、环不死循环，均单独跑过）。
+- `npm run build`：通过；`npm run test:js`：**30/30**。
+- 环境插曲：验证中途虚拟机替换，apt 装的 Tauri 系统库又丢了（链接报缺 `-lgtk-3` / `-lgdk_pixbuf-2.0`），按老办法跑 `restore-build-env.sh` 恢复，与代码无关。
+- Gemini 当天仍不可用（未再试，沿用 v6.2 先例）：本轮代码由协调人按核实过的设计直接写，每处改动均对照真实源码与 vendored API 逐行核实（`ResumeThread` / `OpenThread` / `CreateToolhelp32Snapshot` / `Process32FirstW` / `Thread32First` / `TerminateProcess` / `PROCESS_TERMINATE` / `CREATE_SUSPENDED` 均在 windows 0.62.2 vendored 源码中核对过签名与所在模块；`NtResumeProcess` 确认不存在）。
+- Cargo.toml 加了一个 windows feature：`Win32_System_Diagnostics_ToolHelp`（Toolhelp32 快照用；feature 名对照 windows 0.62.2 的 Cargo.toml 核实）。
+
+### 5. 已知未验证项
+
+- Windows 真机复测：MSIX 版 `python.exe` 的 `.cmd` 成员点「停止」后 0 残留（手工步骤已补进 `docs/hardening-notes-cli.md` 的 P1-5(b)），以及 Win32 `node.exe` 对照复测——需用户在 Win 机上跑（本机无 Windows）。
+- M-08 高亮选中（`CoInitializeEx(...).is_ok()` 的真跑验证）：等 v1.0.0 出来顺手验。
+- 未升版本号、未打 tag——v1.0.0 正式切版等 macOS/Android/iOS 三端验收都 Go；minisign 的事未碰（仍等用户定）。

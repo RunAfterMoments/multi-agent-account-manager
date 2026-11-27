@@ -949,6 +949,139 @@ impl Drop for CliJobGuard {
 #[cfg(all(desktop, windows))]
 unsafe impl Send for CliJobGuard {}
 
+/// 从 (pid, ppid) 列表里收集以 root 为根的全部后代 pid（不含 root 本身），
+/// 广度优先。纯函数，与平台无关，可在 Linux 上单测。
+/// 依赖：快照是一次性取的全表；Windows 上父进程死后子进程的 PPID 不变
+/// （不重定父进程），因此杀完父进程再按表杀子进程仍找得到。
+/// 仅 Windows 桌面构建与测试需要（调用方 kill_descendant_tree 是
+/// #[cfg(all(desktop, windows))]），其他平台不编译进来。
+#[cfg(any(test, all(desktop, windows)))]
+fn collect_descendant_pids(root: u32, entries: &[(u32, u32)]) -> Vec<u32> {
+  use std::collections::{HashMap, HashSet, VecDeque};
+  let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+  for &(pid, ppid) in entries {
+    children.entry(ppid).or_default().push(pid);
+  }
+  let mut out = Vec::new();
+  let mut seen = HashSet::new();
+  let mut queue = VecDeque::new();
+  seen.insert(root);
+  if let Some(first) = children.get(&root) {
+    for &pid in first {
+      if seen.insert(pid) {
+        queue.push_back(pid);
+      }
+    }
+  }
+  while let Some(pid) = queue.pop_front() {
+    out.push(pid);
+    if let Some(next) = children.get(&pid) {
+      for &child in next {
+        if seen.insert(child) {
+          queue.push_back(child);
+        }
+      }
+    }
+  }
+  out
+}
+
+/// Windows：恢复 CREATE_SUSPENDED 出生的子进程，返回恢复的线程数。
+/// windows 0.62 的 crate 里没有 NtResumeProcess（ntdll 未导出绑定），
+/// 因此用 Toolhelp32 线程快照找该进程名下的线程并逐个 ResumeThread。
+/// 挂起的进程只有一个主线程且一条指令都跑不了，不会在快照与恢复之间
+/// 新建线程，因此这里没有竞态；返回 0 表示一个线程都没找到。
+#[cfg(all(desktop, windows))]
+fn resume_suspended_process(pid: u32) -> usize {
+  use windows::Win32::Foundation::CloseHandle;
+  use windows::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
+  };
+  use windows::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
+  let snapshot = match unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) } {
+    Ok(h) => h,
+    Err(_) => return 0,
+  };
+  let mut resumed = 0usize;
+  // THREADENTRY32 没有 Default 实现（windows 0.62.2），逐字段填零；
+  // dwSize 必须按 API 要求设为结构体大小，否则 Thread32First 失败。
+  let mut entry = THREADENTRY32 {
+    dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
+    cntUsage: 0,
+    th32ThreadID: 0,
+    th32OwnerProcessID: 0,
+    tpBasePri: 0,
+    tpDeltaPri: 0,
+    dwFlags: 0,
+  };
+  // SAFETY：dwSize 已填；快照句柄在函数结束时关闭；线程句柄用完即关。
+  unsafe {
+    let mut next = Thread32First(snapshot, &mut entry);
+    while next.is_ok() {
+      if entry.th32OwnerProcessID == pid {
+        if let Ok(thread) = OpenThread(THREAD_SUSPEND_RESUME, false, entry.th32ThreadID) {
+          // ResumeThread 返回之前的挂起计数，0xFFFFFFFF 为失败；挂起
+          // 计数从 1 降到 0 即恢复成功。
+          if ResumeThread(thread) != u32::MAX {
+            resumed += 1;
+          }
+          let _ = CloseHandle(thread);
+        }
+      }
+      next = Thread32Next(snapshot, &mut entry);
+    }
+    let _ = CloseHandle(snapshot);
+  }
+  resumed
+}
+
+/// Windows：按 PPID 树兜底杀掉 root 的全部后代（不含 root 本身；root 由
+/// 调用方用 child.kill() 处理）。
+/// TerminateJobObject 只能杀 Job 里的进程，杀不到 Job 之外的残留——例如
+/// 挂入前窗口逃逸的派生，或 CLI 经 WMI（Win32_Process.Create，MSDN 明言
+/// 不继承 Job）等方式派生的帮手。快照一次取全表再按树杀，避免边杀边查。
+/// 尽力而为：快照失败或某个进程已退出都忽略。
+/// 边界（应用侧堵不住）：快照与杀灭之间新派生的进程不在表里；以及经
+/// 外部 broker（服务、计划任务、WSL/Docker）创建、父进程不是 root 的
+/// 进程。真正的原子性由 CREATE_SUSPENDED + 挂入 Job 保证（见
+/// execute_local_cli_turn），这里只是第二道网。
+#[cfg(all(desktop, windows))]
+fn kill_descendant_tree(root_pid: u32) {
+  use windows::Win32::Foundation::CloseHandle;
+  use windows::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+  };
+  use windows::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+  let snapshot = match unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) } {
+    Ok(h) => h,
+    Err(_) => return,
+  };
+  let mut entries: Vec<(u32, u32)> = Vec::new();
+  let mut entry = PROCESSENTRY32W {
+    dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+    ..Default::default()
+  };
+  // SAFETY：dwSize 已填；快照句柄在收集完后关闭。
+  unsafe {
+    let mut next = Process32FirstW(snapshot, &mut entry);
+    while next.is_ok() {
+      entries.push((entry.th32ProcessID, entry.th32ParentProcessID));
+      next = Process32NextW(snapshot, &mut entry);
+    }
+    let _ = CloseHandle(snapshot);
+  }
+  // 先杀最深的，再杀上层：父进程死后子进程的 PPID 不变，顺序不影响
+  // 覆盖面，只是让树自底向上消失。
+  for pid in collect_descendant_pids(root_pid, &entries).iter().rev() {
+    if let Ok(handle) = unsafe { OpenProcess(PROCESS_TERMINATE, false, *pid) } {
+      unsafe {
+        let _ = TerminateProcess(handle, 1);
+        let _ = CloseHandle(handle);
+      }
+    }
+  }
+}
+
 /// 超时/取消错误里附带的部分输出：最多取前 500 字，避免错误消息过长。
 /// 仅桌面 LocalCli 路径使用（execute_local_cli_turn 是 #[cfg(desktop)]）。
 #[cfg(desktop)]
@@ -1081,7 +1214,12 @@ where
   {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x08000000;
-    cmd.creation_flags(CREATE_NO_WINDOW);
+    // CREATE_SUSPENDED（0x00000004）：子进程出生即挂起，一条指令都不跑，
+    // 直到挂入 Job 后才恢复——关掉“spawn 后再挂入”之间的竞态窗口。
+    // 否则 cmd.exe 可能在挂入前就派生出孙进程（例如 MSIX 别名 python.exe），
+    // 孙进程不在 Job 里，TerminateJobObject 杀不掉（Phase 4 真机验收发现）。
+    const CREATE_SUSPENDED: u32 = 0x00000004;
+    cmd.creation_flags(CREATE_NO_WINDOW | CREATE_SUSPENDED);
   }
 
   #[cfg(unix)]
@@ -1097,9 +1235,12 @@ where
 
   let child_pid = child.id();
 
-  // Windows：启动后立即把子进程挂入 Job Object，超时/取消时一次杀整棵树。
+  // Windows：子进程出生即挂起（CREATE_SUSPENDED，见上），这里把它挂入
+  // Job Object，挂完才恢复运行——出生与挂入之间不存在窗口，cmd.exe
+  // 不可能在挂入前派生出 Job 之外的孙进程。超时/取消时一次杀整棵树。
   // 建 Job 时即设 KILL_ON_JOB_CLOSE：父进程崩溃、句柄关闭时整棵树也被
-  // 杀掉，不留孤儿进程。任一步失败都留空，杀灭时回退 taskkill /T /F。
+  // 杀掉，不留孤儿进程。任一步失败都留空，杀灭时回退 taskkill /T /F
+  // 再加 PPID 树兜底。
   #[cfg(windows)]
   let job_guard: Option<CliJobGuard> = (|| {
     use std::os::windows::io::AsRawHandle;
@@ -1139,6 +1280,17 @@ where
       }
     }
   })();
+
+  // Windows：子进程出生时是挂起的，挂入 Job（或挂入失败回退）后必须恢复，
+  // 且每条路径恰好恢复一次——挂起的进程不跑，超时/取消也等不到它退出。
+  // 恢复失败（理论上不应发生：挂起进程至少有一个主线程）则直接杀掉
+  // 仍挂起的子进程并报错，绝不让它无 Job 约束地跑起来。
+  #[cfg(windows)]
+  if resume_suspended_process(child_pid) == 0 {
+    let _ = child.kill();
+    let _ = child.wait();
+    return Err("启动本地 CLI 失败：无法恢复挂起的子进程".to_string());
+  }
 
   if let Some(mut stdin_handle) = child.stdin.take() {
     std::thread::spawn(move || {
@@ -1214,6 +1366,11 @@ where
                   .output();
               }
             }
+            // 兜底：按 PPID 树杀掉 Job 之外的残留后代——挂入前窗口逃逸的
+            // 进程（如 MSIX 别名派生），或经 WMI 等不继承 Job 的方式
+            // 派生的帮手。TerminateJobObject 杀不到它们，taskkill /T
+            // 覆盖不到已死的父进程，PPID 快照能。
+            kill_descendant_tree(child_pid);
           }
           let _ = child.kill();
           let _ = child.wait();
@@ -1620,6 +1777,33 @@ mod tests {
       std::thread::sleep(std::time::Duration::from_millis(50));
     }
     assert!(gone, "killpg 后孙进程 sleep 仍在运行（pid {grandchild}）");
+  }
+
+  #[test]
+  fn collect_descendant_pids_walks_full_tree() {
+    // 树：10 → {20, 30}，20 → {40}，40 → {50}；60 是无关进程。
+    let entries = vec![(10, 1), (20, 10), (30, 10), (40, 20), (50, 40), (60, 1)];
+    let mut got = super::collect_descendant_pids(10, &entries);
+    got.sort_unstable();
+    assert_eq!(got, vec![20, 30, 40, 50]);
+  }
+
+  #[test]
+  fn collect_descendant_pids_empty_and_missing_root() {
+    assert!(super::collect_descendant_pids(10, &[]).is_empty());
+    // root 不在表里、也没有子进程时返回空，不 panic。
+    assert!(super::collect_descendant_pids(99, &[(10, 1), (20, 10)]).is_empty());
+    // 只有 root 自己在表里时不含 root 本身。
+    assert!(super::collect_descendant_pids(10, &[(10, 1)]).is_empty());
+  }
+
+  #[test]
+  fn collect_descendant_pids_cycle_does_not_hang() {
+    // 手工喂一个环（正常快照里不可能出现：父进程一定先于子进程创建），
+    // visited 集保证函数仍返回，不死循环。
+    let entries = vec![(10, 20), (20, 10)];
+    let got = super::collect_descendant_pids(10, &entries);
+    assert_eq!(got, vec![20]);
   }
 
   #[test]

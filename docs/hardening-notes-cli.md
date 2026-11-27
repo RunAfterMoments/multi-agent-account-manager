@@ -42,11 +42,22 @@
   `.cmd` / `npx`）的孙进程会残留。
 - **修复：** Unix：`Command::process_group(0)` 让子进程自成进程组，
   超时/取消时 `killpg(pgid, SIGKILL)`，失败再回退 `child.kill()`。
-  Windows：子进程创建后挂入 Job Object（`windows` crate，
-  `CreateJobObjectW` / `AssignProcessToJobObject`），超时/取消时
-  `TerminateJobObject`，挂入失败则回退 `taskkill /T /F`。
+  Windows：子进程以 `CREATE_SUSPENDED` 出生，挂入 Job Object
+  （`windows` crate，`CreateJobObjectW` / `AssignProcessToJobObject`）
+  后经 Toolhelp32 线程快照 + `ResumeThread` 恢复运行——出生与挂入
+  之间不存在窗口，cmd.exe 不可能在挂入前派生出 Job 之外的孙进程；
+  超时/取消时 `TerminateJobObject`，再按 PPID 树兜底杀残留后代
+  （`kill_descendant_tree`），挂入失败则回退 `taskkill /T /F`。
+  恢复失败时杀掉仍挂起的子进程并报错，绝不让它无 Job 约束地跑起来。
 - **测试：** （待补：Unix 进程组杀灭的集成测试）
+  `collect_descendant_pids` 的树遍历是纯函数，已单测（整树、空表/
+  缺 root、环不死循环）。
 - **手工验证（Linux）：** （待补步骤）
+- **手工验证（Windows）：** 建一个跑 Store 版 python.exe 的 `.cmd`
+  成员（如 `python.exe child_worker.py`，child_worker 再起一个孙进程），
+  点 UI「停止」后任务管理器里 `cmd.exe` / `python.exe` / 孙进程应
+  全部消失；再用标准 Win32 `node.exe` 的 `.cmd` 复测一次作对照。
+  另：`CoInitializeEx(...).is_ok()` 的配对改动靠 M-08 高亮选中真跑验证。
 - **行为变化：** 超时或手动停止后，孙进程不再残留。
 
 ## P1-5(c) 120 秒总超时太短
