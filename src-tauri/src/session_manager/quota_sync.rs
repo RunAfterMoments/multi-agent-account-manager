@@ -13,17 +13,28 @@
 //! evaluation helpers live in `quota.rs`; this module is the sync/probe side.
 
 #[cfg(desktop)]
+use super::PendingExternalAuth;
+#[cfg(desktop)]
 use super::{DesktopProbeResult, IDENTITY_PROBE_JS};
-use super::{InnerState, ManagerSnapshot, PendingExternalAuth, SessionManager};
+use super::{InnerState, ManagerSnapshot, SessionManager};
+#[cfg(desktop)]
 use crate::platform;
-use crate::providers::{is_verified_callback_origin, resolve_provider};
-use crate::storage::{now_ms, AccountKey, AuthState, QuotaDetail};
+#[cfg(desktop)]
+use crate::providers::is_verified_callback_origin;
+use crate::providers::resolve_provider;
+#[cfg(desktop)]
+use crate::storage::now_ms;
+use crate::storage::{normalize_avatar_url, AccountKey, AuthState, QuotaDetail};
+#[cfg(desktop)]
 use std::sync::atomic::Ordering;
+#[cfg(desktop)]
 use std::sync::Arc;
 use tauri::AppHandle;
 #[cfg(desktop)]
 use tauri::Manager;
+#[cfg(desktop)]
 use url::Url;
+#[cfg(desktop)]
 use uuid::Uuid;
 
 impl SessionManager {
@@ -919,12 +930,13 @@ impl SessionManager {
     }
 
     if let Some(av) = avatar_opt {
-      if av.starts_with("data:image/")
-        && av.len() < 80_000
-        && target.avatar_url.as_ref() != Some(&av)
-      {
-        target.avatar_url = Some(av);
-        changed = true;
+      // MAAM-M-10：实时探测的头像只入库 data: 位图（现有行为：http(s) 不入库），
+      // 且须过白名单——SVG data URL（base64 与非 base64）一律拒收，静默保持原头像。
+      if let Some(av) = normalize_avatar_url(&av) {
+        if av.starts_with("data:") && av.len() < 80_000 && target.avatar_url.as_ref() != Some(&av) {
+          target.avatar_url = Some(av);
+          changed = true;
+        }
       }
     }
 

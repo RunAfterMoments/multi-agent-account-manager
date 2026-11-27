@@ -1589,3 +1589,89 @@ check 上会多 3 条 `dead_code`/`unused import` 警告。全部补
 - 流式在真机多 Agent 并发下的零卡顿/无输入抖动：靠 Phase 4 真机验收
   （本机只有单测 + 构建验证，没有跑起来的多路流式）。
 - iOS Swift、Kotlin：本轮未改动，无需验证。
+
+## 十九、v6.5 Phase 2 剩余中低危清零 + 防回归护栏（2026-11-27）
+
+### 1. 2A.1 MAAM-M-03：Windows SmartScreen + Android 代理 fail-closed
+
+- `platform.rs` `parse_account_proxy`：省略端口不再报错，默认 80（`format_account_proxy` 经 `port_or_known_default` 补出完整 `host:port`）。仍拒绝空端口、非数字端口、`:0`、`https://`、`socks5://`、带认证/路径/query/fragment 的地址；错误文案同步改成 `http://主机[:端口]，省略端口时默认 80`。
+- `platform.rs` `windows_proxy_browser_args`：`--disable-features` 去掉 `msSmartScreenProtection`，只保留 `msWebOOUI,msPdfOOUI`；`with_windows_account_proxy` 删除 `proxy.port().is_some()` 双分支，全部代理统一走 `additional_browser_args`。
+- “补端口后统一走 `builder.proxy_url`”**行不通，已对真实代码核实两条证据**（故取统一走 `additional_browser_args` 的路）：
+  1. `url` crate 会抹掉默认端口：`http://proxy.local:80` → `port()` 为 `None`、序列化也不保留 `:80`（测试里 `domain.port().is_none()` 断言即此）；往 `Url` 里“补 :80”写不进去，补端口只能发生在字符串层面。
+  2. `tauri-runtime-wry 2.12.4` 的 `parse_proxy_url`（`src/lib.rs:4393`）：`port = url.port().map(...).unwrap_or_default()`，无端口/默认端口会拼出 `--proxy-server=http://host:`（空端口）；且 wry 0.57.2 的默认 `additional_browser_args`（`webview2/mod.rs:312`，另见 `lib.rs:1790` 文档）本身就含 `msSmartScreenProtection`，只有显式传参（整体替换 wry 默认参数）才能让 SmartScreen 保持开启。
+  - 附带行为变化：显式非默认端口代理以前走 `proxy_url`（wry 按 builder 的 autoplay 属性决定是否加 `--autoplay-policy`），现在统一走自定义参数，`--autoplay-policy=no-user-gesture-required` 恒加（与原来无端口路径一致）。
+  - `https://` 代理仍拒绝（`tauri-runtime-wry` 对非 `http`/`socks5` 返回 `InvalidProxyUrl`；macOS `create_http_connect_proxy` 是明文 HTTP CONNECT，与 TLS 代理不匹配；既有测试明确把 `https://127.0.0.1:7890` 列为非法），故“https 省略端口补 443”不适用；`socks5://` 同样仍拒绝。
+- `AccountSessionPlugin.kt` `openAccountSession` 入口最先 fail-closed：`proxyUrl` 非空即 `invoke.reject("账号代理暂不支持 Android，请先移除该账号的代理设置，或在桌面端打开")`，不静默降级。链路已核实：`session_manager.rs:2731` `payload.proxy_url = account.proxy_url` → 插件 `lib.rs:27` `OpenMobileAccountPayload.proxy_url`（camelCase `proxyUrl`）→ Kotlin `OpenSessionArgs.proxyUrl`（第 64 行）→ 此前未传入 `AndroidAccountSessionSpec` 被静默丢弃。选 Kotlin 而非 Rust 移动端桥接：Rust 桥接与 iOS 共用，而 iOS 真的支持代理（`AccountWebViewController.swift:397` `buildHttpConnectProxyConfig` 经 WKWebView 配置应用），Rust 侧拦截会误伤 iOS。另：正常流程在 Android 上已有前置关卡（移动端打开前 `parse_account_proxy` 在 Android 上对非空代理直接 `Err`，`SUPPORTS_ACCOUNT_PROXY` 不含 Android）；Kotlin 检查是纵深防御。拒绝后错误经 `open_account_session` 的 `map_err` 回到 `session_manager`，以 notice“打开独立会话页面失败: …”提示用户。
+
+### 2. 2A.2 MAAM-M-08：文件管理器定位路径加固
+
+- Windows 分支改用 Win32 `SHOpenFolderAndSelectItems`（首选方案，彻底零命令行解析风险）：
+  - 新增 `reveal_with_shell_select`（`#[cfg(windows)]`）：`ILCreateFromPathW` 分别取父目录与文件的 PIDL → `ILFindLastID(file_pidl)` 取相对子项 → `SHOpenFolderAndSelectItems(folder_pidl, Some(&[child]), 0)`；任一步失败回退到只打开父目录；两个完整 PIDL 用完必 `CoTaskMemFree`（`ILFindLastID` 返回的指针指向 `file_pidl` 内部，禁止单独释放）。
+  - API 签名对照 vendored windows 0.62.2 核实：`SHOpenFolderAndSelectItems(pidlfolder: *const ITEMIDLIST, apidl: Option<&[*const ITEMIDLIST]>, dwflags: u32) -> Result<()>`（`Shell/mod.rs:3626`）、`ILCreateFromPathW<P0: Param<PCWSTR>> -> *mut ITEMIDLIST`（:882，失败返 null，调用方负责释放）、`ILFindLastID(pidl: *const ITEMIDLIST) -> *mut ITEMIDLIST`（:897）、`CoTaskMemFree(pv: Option<*const c_void>)`（`System/Com/mod.rs:552`）。三者中前三个被 `Win32_UI_Shell_Common` feature 门控，故 `Cargo.toml` 的 windows features 加了 `"Win32_UI_Shell_Common"` 一行（仅 feature，无新 crate，`Cargo.lock` 无变化）。
+  - `clean` 含 `"`、`\r`、`\n`、`\0` 时仍先拒绝并回退到只打开父目录（HSTRING 遇 NUL 会截断，且绝不把不可信路径拼进任何命令行）；`explorer.exe` 命令行拼接已彻底删除。
+  - 实施小插曲：协调人插入 helper 时把原来紧贴 `reveal_path_in_file_manager` 的 `#[cfg(desktop)]` 顶到了 helper 头上，导致 reveal 函数在 Android 上编译、报 E0425/E0433（`Path` 与 `open` 均为桌面专属）；2B.3 清警告时发现并补回，协调人复核后又删掉了 helper 头上多余的 `#[cfg(desktop)]`（helper 自有 `#[cfg(windows)]`，windows ⊆ desktop，冗余）。调用方 `session_manager.rs:1905` 本就在 `#[cfg(desktop)]` 块内（非桌面分支返回 Err），语义不变。
+- Linux 分支：删掉 `else if path.exists() { open::that_detached(path) }` 一臂；父目录不存在直接返回 `Err("文件已被移动或删除")`，绝不打开文件本身（避免意外执行刚下载的文件）。调用链已核实：`reveal_downloaded_file`（`lib.rs:162`）原样返回 `Result`，`session_manager.rs:1905` 原样返回，前端 `main.ts:1358` `try/catch` 后以 notice 提示用户，不静默吞掉。
+- 新增单测 `reveal_rejects_missing_parent_without_opening_file`（`#[cfg(all(desktop, target_os = "linux"))]`，父目录不存在 → `Err`，不 spawn 任何进程）。
+
+### 3. 2A.3 MAAM-M-01：Cookie 一键复制防误触
+
+- 新增 `src/cookie-copy.ts`（69 行，零运行时依赖，与 1B 的 `group-stream.ts` 同模式）：`createCookieCopyConfirm(button, confirmMs=3000)`。首次点击返回 `false`，仅置 `data-copy-label="确认复制？"` + `.confirming` 类 + `aria-label="确认复制 Cookie？"`；3 秒内二次点击返回 `true`；超时自动复原；二次点击/超时/`dispose` 均清 timer。
+- 状态放按钮自身 `data-copy-confirm`，timer 是每按钮闭包内的单次 timeout——`main.ts:346` `render()` 每次全量 `innerHTML` 重建按钮、没有解绑钩子，故不用模块级 map；重渲染后旧按钮 detached，超时回调靠 `isConnected` 守卫直接返回，不碰已不存在的 DOM，不泄漏（最长 3 秒释放）。另导出 `dispose()` 供解绑/测试用。
+- `src/main.ts` 绑定处：点击先清 `feedbackTimer`（防止“已复制”反馈在确认窗内把文案复原），`confirm.click()` 为假即返回，绝不调用 `copy_account_cookie`；其余复制流程（`复制中…`→`已复制 Cookie` 1.8s→复原、失败 notice）原样不动。
+- `src/styles.css`：`.confirming` 并入亮/暗两处 tooltip 选择器使提示常驻，并加红色警示 `.copy-cookie-btn.confirming { color: var(--danger); }`。`render.ts` 零改动（按钮 HTML 已有 `data-copy-label`/`aria-label`）。
+- 新文件而非放 `render.ts` 的原因：`node --test` 类型擦除加载器解析不了 `render.ts` 的无后缀运行时导入（`./state`、`./modals`，实测 `ERR_MODULE_NOT_FOUND`），且 `state.ts:148` 顶层 `window.matchMedia` 让动态导入需要桩；抽成零依赖模块可直接测试，并用全局 `setTimeout`（浏览器与 Node 通用）。
+- `package.json`：`test:js` 加入新测试文件。新增 JS 单测 6 条（`tests/cookie_copy_confirm.test.mjs`）：首次点击不复制只变文案/样式；窗内二次点击才复制；超时后点击重新进入确认态；按钮被移除后超时回调不碰 DOM；`dispose` 立即取消；默认确认窗 3000ms。
+
+### 4. 2A.4 MAAM-M-10：avatarUrl 拒绝 SVG data URL
+
+- 核实结论：`normalize_avatar_url` 在树上**不存在**，头像此前无任何校验；新建在 `src-tauri/src/storage.rs`（`normalize_uuid` 旁）。
+- `normalize_avatar_url(raw: &str) -> Option<String>`：trim 后空值 → `None`；`http(s)://` 放行（加载时既有行为）；`data:` 仅放行 `data:image/{png,jpeg,webp,gif};base64,<非空payload>`；`data:image/svg+xml` 的 base64 与非 base64 两种形式都拒；精确 mime + `;base64,` 边界判断，`data:image/pngx…`、`data:image/png;charset=…`、空 payload 均拒；其余 scheme（`data:text/html`、`javascript:`、`blob:`）均拒。大小写敏感，与现有 `starts_with` 风格一致。
+- 调用链（两处入库点，失败处理均沿用现有，不新发明交互）：
+  - 加载时：`storage.rs` `migrate_from_value` 解析 `avatarUrl`/`avatar_url`，此前仅判非空——SVG 直通前端 `<img src>`（`render.ts:384`）；现改用 `.and_then(normalize_avatar_url)`，拒绝 → `None` → 前端落到字母默认头像。
+  - 实时探测：`quota_sync.rs` `apply_detected_metadata_locked`，此前只认 `data:image/` 前缀 + `<80_000` 长度，SVG 同样入库；现叠加白名单校验，拒绝 → 静默保持原头像（http(s) 探测头像仍不入库，与此前一致）。
+- 新增 Rust 单测 2 条：`normalize_avatar_url_rejects_svg_data_urls`（SVG 两种形式 + charset 变体拒；png/jpeg/webp/gif base64 通过；非 base64 位图、`pngx` 擦边、空 payload 拒；http(s) 通过、空值拒；其他 scheme 拒）；`migrate_avatar_url_svg_is_dropped_and_png_is_kept`（加载集成：SVG 丢弃、png/https 保留）。
+
+### 5. 2B.1 四方 ACL 一致性单测
+
+- `src-tauri/src/lib.rs` 末尾纯追加 `#[cfg(test)] mod acl_consistency_tests`（272 行，业务逻辑一字未动），测试 `four_way_acl_consistency`：`lib.rs` `generate_handler!` == `build.rs` `APP_COMMANDS` == `permissions/autogenerated/*.toml` == `capabilities/manager.json`。核实前现状：各 44 条、无重复、集合全等，仅顺序不同。
+- 解析方式：`manager.json` 结构化解析（`serde_json` 正式依赖），`allow-<kebab>` 映射回 snake_case，`core:event:*` 等非命令权限跳过；`*.toml` 未用 toml 解析（`toml` crate 不在 dev-dependencies，加 dev-dependency 要改 `Cargo.toml`/`Cargo.lock`，超出范围），改用词法抽取 `commands.allow = ["<cmd>"]`——文件由 tauri-build 自动生成，格式固定为单行单条，抽取精确；若上游改格式导致抽不到，测试报“找不到 `commands.allow` 行”而非静默通过；另断言每文件恰好 1 条 allow 且文件名 == 命令名；`lib.rs`/`build.rs` 用词法抽取字面量条目（局限已写进模块注释：只认字面量，`#[cfg]` 条件编译、被注释的命令会失真）。只比集合不比顺序，另做重复条目检查。
+- 失败文案逐对双向比对，形如 `capabilities/manager.json 缺少命令 select_provider（lib.rs 有）`。反向验证已做：临时删 `manager.json` 的 `allow-select-provider` 一行，测试如期失败并报出该文案；恢复后通过。
+- 测试读文件用 `CARGO_MANIFEST_DIR` 定位路径，不假设工作目录。
+
+### 6. 2B.2 CI 补移动端 Rust 静态检查
+
+- `.github/workflows/ci.yml` 的 `check` job（matrix 三系统共用），`cargo clippy` 之后、`cargo test` 之前，加 Linux-only step（`if: runner.os == 'Linux'`，与已有的 "Install Linux system dependencies" 同款守卫）：`rustup target add aarch64-linux-android && cargo check --manifest-path src-tauri/Cargo.toml --target aarch64-linux-android --lib`。补了 `--manifest-path src-tauri/Cargo.toml`（CI 从仓库根目录跑，其余 cargo step 全带此参数，不带会找不到 Cargo.toml）。
+- rustup 可用性：ci.yml 里无现成的 `rustup target add` 先例，但 `dtolnay/rust-toolchain` 本身经 rustup 安装工具链，故后续 step 里 `rustup` 在 PATH 上；本机实测 `rustup target add aarch64-linux-android` 可用。yaml 语法已校验（`yaml.safe_load` 通过）。本机等价命令 3.7s，无需 Android SDK/NDK。
+
+### 7. 2B.3 清掉移动端 43 条警告 → Android 0 错误 0 警告
+
+- 首次跑出的清单是 **2 错误 + 30 警告**（全是 `unused_imports`），与 43 条不符——原因是那 2 个错误（即上文 §2 的 cfg 门错位）导致 rustc 跳过了 `dead_code` 分析；修掉错误后又浮出 **13 条 `dead_code`**，30 + 13 = 43，正好对上 v6.4 1B 的基线。43 条已全部清掉，无剩余。
+- 30 个 `unused_imports`：逐项 grep 全库核实调用点 cfg，**无一例是 windows-only / macos-only / `not(android)` / test-only 使用，全部只在 `#[cfg(desktop)]` 代码里使用**——处理：给桌面专属 `use` 补 `#[cfg(desktop)]`，混用的拆块（保留 Android 仍用的项，如 `a2a.rs` 的 `AccountKey`、`group_chat.rs` 的 `resolve_provider, ProviderId`、`store.rs` 拆成 `#[cfg(desktop)] use crate::platform;` + `use crate::platform::current_platform_name;`）。
+- 13 条 `dead_code`：逐项 grep 全库，**没有一条是真死代码**，全部有桌面端调用方——按规则不删除，改加库内既有模式 `#[cfg_attr(not(desktop), allow(dead_code))]`（`a2a.rs:58`、`group_chat.rs:215` 已有先例），涉及 `group_transport.rs` 的 `build_cli_args_and_stdin` / `finish_api_turn` / `sync_shared_partial` / `merge_augmented_path` / `Utf8ChunkDecoder`、`key_vault.rs` 的 `KEYRING_SERVICE`、`providers.rs` 的 `is_verified_callback_origin`、`session_manager.rs` 的 `switch_account_by_index`、`site_adapters.rs` 的 `host_matches_pattern` / `resolve_adapter_for_host`、`updater.rs` 的 `verify_downloaded_installer_signature` / `is_allowed_redirect_target`。
+- 未删除任何函数/常量/字段；未改任何业务逻辑。Linux/Windows clippy 各剩 1 条 manifest 警告（`cargo::unused_dependencies`，提示 `tauri-plugin-account-session` 未使用——原因是该依赖全库唯一引用是 `platform.rs` 的 `#[cfg(mobile)] pub use tauri_plugin_account_session as mobile;`，桌面目标上自然不用；要消它需改 Cargo.toml 或加 lint allow，超出本次范围，留待后续）。
+
+### 8. 2B.4 Step 2 回归单测核实（三条全在，全跑过，零补加）
+
+| # | 测试名 | 文件 | 跑过证据 |
+|---|---|---|---|
+| ① | `persist_now_concurrent_writes_last_state_wins_and_inner_stays_free` | `session_manager.rs:4920` | `cargo test --lib` 输出行 `... ok` |
+| ② | `stream_fast_path_only_when_steady_streaming_non_empty`（被测 `is_stream_fast_path`，五条件与 1B 设计一致） | `group_chat.rs:4224` | `cargo test --lib` 输出行 `... ok` |
+| ③ | 4 条 JS 单测（只更新目标消息正文并同步内存快照 / 群或消息不存在时 ignored / 不在群聊页时只同步内存 / 距底 ≤64px 贴底滚动） | `tests/group_msg_stream.test.mjs:62,84,101,118`，被测 `src/group-stream.ts` 的 `applyGroupMessageStreamEvent` | `npm run test:js`：4 条全过，总计 30 pass / 0 fail |
+
+### 9. 验证（协调人逐项重跑，全绿）
+
+- `cargo fmt --check`：通过。
+- `cargo clippy --all-targets -- -D warnings`（Linux）：通过（仅 1 条基线 manifest 警告）。
+- `cargo clippy --target x86_64-pc-windows-gnu --all-targets -- -D warnings`：通过（SHOpenFolderAndSelectItems 改动已编过；同上 1 条基线警告）。
+- `cargo test --lib`：**126/126**（122 基线 + ACL 单测 1 + avatar 单测 2 + reveal 单测 1）。
+- `cargo check --target aarch64-linux-android --lib`：**0 错误 0 警告**（grep 计 0 条 warning 行）。
+- `npm run build`：通过；`npm run test:js`：**30/30**（24 既有 + 6 新 Cookie 单测）。
+- 协调人另行核实：wry `parse_proxy_url` 与默认参数（vendored `tauri-runtime-wry 2.12.4` `lib.rs:4393`、`wry 0.57.2` `webview2/mod.rs:312`）；SHOpenFolderAndSelectItems 等 4 个 Win32 API 签名与 feature 门（vendored windows 0.62.2）；`proxyUrl` 完整链路（`session_manager.rs:2731` → 插件 `lib.rs:27` → Kotlin）；ACL 测试反向验证（删一行即红，文案可定位）；2B.3 逐条抽查（`store.rs` 的 `platform::` 拆分、`group_chat.rs` 的 `save_store_atomic`/`ExternalAgentRecord` 均在 `#[cfg(desktop)]` 函数内、`KEYRING_SERVICE` 的使用点均在非移动端 keyring 函数内）。
+
+### 10. 未验证
+
+- Kotlin 编译（`openAccountSession` fail-closed 9 行）：本机无 Android SDK，CI check job 是 cargo-only，靠 release workflow 的 Android 构建验证。改动只用同文件已有 API（`invoke.reject`、`isNullOrBlank`、`return@runOnUiThread`），风险低。
+- iOS Swift：本轮未改动；2B.3 的 `#[cfg(desktop)]` 核查已排除 `not(android)`/iOS 专属调用，未发现会误伤 iOS 的项。
+- `SHOpenFolderAndSelectItems` 真跑：靠 Phase 4 Windows 真机验收。
+- CI 上的真实运行（含新增的 Android check step）：本机只做了 yaml 语法校验 + 等价命令验证。
+- Gemini 当天不可用（direct REST 429 额度耗尽、CLI `service_unavailable`），本轮代码由各执行者按核实过的设计直接写（v6.2 已有先例）；协调人逐项对照真实源码与 vendored API 复核。

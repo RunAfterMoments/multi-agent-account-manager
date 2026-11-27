@@ -8,7 +8,7 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
-    "test:js": "node --test tests/auto_approve.test.mjs tests/group_msg_stream.test.mjs"
+    "test:js": "node --test tests/auto_approve.test.mjs tests/group_msg_stream.test.mjs tests/cookie_copy_confirm.test.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "2.12.5"

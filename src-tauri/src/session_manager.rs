@@ -2021,6 +2021,7 @@ impl SessionManager {
     self.switch_account_internal(app, key, false).await
   }
 
+  #[cfg_attr(not(desktop), allow(dead_code))]
   pub async fn switch_account_by_index(
     self: &Arc<Self>,
     app: &AppHandle,

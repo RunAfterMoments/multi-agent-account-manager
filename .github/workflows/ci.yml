@@ -50,6 +50,13 @@ jobs:
       - run: npm run test:js
       - run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
       - run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+      # v6.5 2B.2：移动端 Rust 静态检查（仅 Linux job）。dtolnay/rust-toolchain 经
+      # rustup 装工具链，故 rustup 在后续 step 可用；`cargo check --lib` 只产出
+      # 元数据不链接，无需 Android SDK/NDK，几十秒跑完。桌面改动误伤 Android
+      # 编译（如 cfg 门写错）会在此处红灯，而不是等到发版才发现。
+      - name: Check Android target (Linux only)
+        if: runner.os == 'Linux'
+        run: rustup target add aarch64-linux-android && cargo check --manifest-path src-tauri/Cargo.toml --target aarch64-linux-android --lib
       - run: cargo test --manifest-path src-tauri/Cargo.toml
 
   # 依赖审计单独放一个 Linux job：三个 OS 各装一次 cargo-audit 太慢，

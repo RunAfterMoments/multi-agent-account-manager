@@ -185,6 +185,15 @@ class AccountSessionPlugin(private val activity: Activity) : Plugin(activity) {
     fun openAccountSession(invoke: Invoke) {
         val args = invoke.parseArgs(OpenSessionArgs::class.java)
         activity.runOnUiThread {
+            // M-03 fail-closed：proxyUrl 自 Rust 移动端桥接传入（与 iOS 共用，
+            // iOS 侧由 AccountWebViewController 经 WKWebView 配置真正应用），
+            // 但 Android 侧未接 ProxyController，此处若直接丢弃，账号会
+            // 在不走代理的情况下打开。非空即拒绝，不静默降级；这是唯一的
+            // fail-closed 点——Rust 侧不拦，以免误伤支持代理的 iOS。
+            if (!args.proxyUrl.isNullOrBlank()) {
+                invoke.reject("账号代理暂不支持 Android，请先移除该账号的代理设置，或在桌面端打开")
+                return@runOnUiThread
+            }
             if (!WebViewFeature.isFeatureSupported(WebViewFeature.MULTI_PROFILE)) {
                 invoke.reject("系统 WebView 不支持 MULTI_PROFILE")
                 return@runOnUiThread

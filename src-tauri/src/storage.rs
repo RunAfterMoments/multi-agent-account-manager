@@ -415,6 +415,35 @@ pub fn normalize_uuid(raw: &str) -> Option<String> {
     .map(|u| u.hyphenated().to_string())
 }
 
+/// 头像 URL 白名单校验（MAAM-M-10）：只放行 http(s) 与 png/jpeg/webp/gif 的
+/// base64 data URL；`data:image/svg+xml`（base64 与非 base64 两种）一律拒绝——
+/// SVG 可内嵌脚本与外部引用，头像只应是位图。失败返回 `None`，调用方按现有
+/// 处理落到默认头像（加载时）或保持原头像（实时探测时），不新增错误交互。
+///
+/// 前缀用精确 mime + `;base64,` 边界判断：`data:image/pngx...`、
+/// `data:image/png;charset=...` 等均不放行；空 payload 也不放行。
+pub fn normalize_avatar_url(raw: &str) -> Option<String> {
+  let url = raw.trim();
+  if url.is_empty() {
+    return None;
+  }
+  if url.starts_with("http://") || url.starts_with("https://") {
+    return Some(url.to_string());
+  }
+  let rest = url.strip_prefix("data:")?;
+  for mime in ["image/png", "image/jpeg", "image/webp", "image/gif"] {
+    if let Some(after) = rest.strip_prefix(mime) {
+      if let Some(payload) = after.strip_prefix(";base64,") {
+        if !payload.is_empty() {
+          return Some(url.to_string());
+        }
+      }
+      return None;
+    }
+  }
+  None
+}
+
 pub fn detect_conflicts(accounts: &[AccountRecord]) -> Vec<ConflictItem> {
   let mut by_uuid: BTreeMap<String, Vec<ProviderId>> = BTreeMap::new();
   for acc in accounts {
@@ -558,8 +587,7 @@ fn migrate_from_value(root: Value) -> Result<(AccountsStoreFile, bool), String> 
         .get("avatarUrl")
         .or_else(|| item_obj.get("avatar_url"))
         .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .filter(|s| !s.is_empty());
+        .and_then(normalize_avatar_url);
       let auth_state = item_obj
         .get("authState")
         .or_else(|| item_obj.get("auth_state"))
@@ -1605,6 +1633,100 @@ mod tests {
       settings: super::AppSettings::default(),
       unknown_accounts: Vec::new(),
     }
+  }
+
+  #[test]
+  fn normalize_avatar_url_rejects_svg_data_urls() {
+    use super::normalize_avatar_url;
+    // SVG data URL 两种形式都拒绝。
+    assert_eq!(
+      normalize_avatar_url("data:image/svg+xml;base64,PHN2Zz48c2NyaXB0Pjwvc2NyaXB0Pjwvc3ZnPg=="),
+      None
+    );
+    assert_eq!(
+      normalize_avatar_url("data:image/svg+xml,%3Csvg%20onload%3Dalert(1)%3E"),
+      None
+    );
+    assert_eq!(
+      normalize_avatar_url("data:image/svg+xml;charset=utf-8,%3Csvg%3E"),
+      None
+    );
+    // 位图 base64 data URL 通过。
+    for (mime, payload) in [
+      ("image/png", "iVBORw0KGgo="),
+      ("image/jpeg", "/9j/4AAQ=="),
+      ("image/webp", "UklGRg=="),
+      ("image/gif", "R0lGODlhAQABAAAAACw="),
+    ] {
+      let url = format!("data:{mime};base64,{payload}");
+      assert_eq!(
+        normalize_avatar_url(&url),
+        Some(url),
+        "应放行 {mime} base64 头像"
+      );
+    }
+    // 非 base64 位图、前缀擦边、空 payload 都拒绝。
+    assert_eq!(normalize_avatar_url("data:image/png,%89PNG"), None);
+    assert_eq!(
+      normalize_avatar_url("data:image/pngx;base64,AAAA"),
+      None,
+      "image/pngx 不得借 image/png 前缀放行"
+    );
+    assert_eq!(normalize_avatar_url("data:image/png;base64,"), None);
+    // http(s) 与空值按现有行为：加载时 http(s) 仍放行，空值拒绝。
+    assert_eq!(
+      normalize_avatar_url("https://example.invalid/a.png"),
+      Some("https://example.invalid/a.png".to_string())
+    );
+    assert_eq!(
+      normalize_avatar_url("http://example.invalid/a.jpg"),
+      Some("http://example.invalid/a.jpg".to_string())
+    );
+    assert_eq!(normalize_avatar_url(""), None);
+    assert_eq!(normalize_avatar_url("   "), None);
+    // 其他 scheme 一律拒绝。
+    assert_eq!(normalize_avatar_url("data:text/html;base64,PGh0bWw+"), None);
+    assert_eq!(normalize_avatar_url("javascript:alert(1)"), None);
+    assert_eq!(normalize_avatar_url("blob:https://example.invalid/x"), None);
+  }
+
+  #[test]
+  fn migrate_avatar_url_svg_is_dropped_and_png_is_kept() {
+    let raw = json!({
+      "version": 2,
+      "accounts": [
+        {
+          "uuid": "00000000-0000-4000-8000-0000000000a1",
+          "providerId": "muse",
+          "avatarUrl": "data:image/svg+xml;base64,PHN2Zz48c2NyaXB0Pjwvc2NyaXB0Pjwvc3ZnPg=="
+        },
+        {
+          "uuid": "00000000-0000-4000-8000-0000000000a2",
+          "providerId": "muse",
+          "avatarUrl": "data:image/png;base64,iVBORw0KGgo="
+        },
+        {
+          "uuid": "00000000-0000-4000-8000-0000000000a3",
+          "providerId": "muse",
+          "avatarUrl": "https://example.invalid/a.png"
+        }
+      ]
+    });
+    let (store, _) = migrate_from_value(raw).expect("migrate");
+    assert_eq!(store.accounts.len(), 3);
+    assert_eq!(
+      store.accounts[0].avatar_url, None,
+      "SVG 头像加载时应丢弃，落到默认头像"
+    );
+    assert_eq!(
+      store.accounts[1].avatar_url.as_deref(),
+      Some("data:image/png;base64,iVBORw0KGgo=")
+    );
+    assert_eq!(
+      store.accounts[2].avatar_url.as_deref(),
+      Some("https://example.invalid/a.png"),
+      "http(s) 头像按现有加载行为仍放行"
+    );
   }
 
   #[test]

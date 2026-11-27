@@ -20,18 +20,19 @@ use super::{
   GroupAttachment,
 };
 use super::{
-  evaluate_account_quota, AccountQuotaEval, InnerState, ManagerSnapshot, SessionManager, APP_TITLE,
-  AUTO_ROUTE_COOLDOWN_MS, MAX_GROUP_MEMBERS,
+  evaluate_account_quota, AccountQuotaEval, InnerState, ManagerSnapshot, SessionManager,
+  MAX_GROUP_MEMBERS,
 };
+#[cfg(desktop)]
+use super::{APP_TITLE, AUTO_ROUTE_COOLDOWN_MS};
 use crate::group_transport;
 #[cfg(desktop)]
 use crate::group_transport::ResolvedMemberTransport;
 #[cfg(target_os = "macos")]
 use crate::platform;
-use crate::providers::{
-  classify_top_level_url, is_verified_callback_origin, resolve_provider, NavigationDecision,
-  ProviderId,
-};
+#[cfg(desktop)]
+use crate::providers::{classify_top_level_url, is_verified_callback_origin, NavigationDecision};
+use crate::providers::{resolve_provider, ProviderId};
 #[cfg(desktop)]
 use crate::site_adapters::SiteAdapterConfig;
 use crate::site_adapters::{self, SiteAdaptersSnapshot};
@@ -40,21 +41,26 @@ use crate::storage::GroupChatMessage;
 #[cfg(any(desktop, test))]
 use crate::storage::GroupThreadBinding;
 use crate::storage::{
-  normalize_uuid, now_ms, save_store_atomic, AccountKey, AccountRecord, AuthState,
-  ExternalAgentKind, ExternalAgentRecord, GroupChatRecord, GroupMemberRole, GroupReplyStatus,
-  GroupSharedSkill, GroupWorkflowMode,
+  normalize_uuid, now_ms, AccountKey, AccountRecord, AuthState, ExternalAgentKind, GroupChatRecord,
+  GroupMemberRole, GroupReplyStatus, GroupSharedSkill, GroupWorkflowMode,
 };
+#[cfg(desktop)]
+use crate::storage::{save_store_atomic, ExternalAgentRecord};
 #[cfg(any(desktop, test))]
 use serde::Serialize;
 use std::collections::HashSet;
+#[cfg(desktop)]
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(desktop)]
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tauri::AppHandle;
 #[cfg(desktop)]
 use tauri::Emitter;
 #[cfg(desktop)]
 use tauri::Manager;
+#[cfg(desktop)]
 use url::Url;
 use uuid::Uuid;
 use zeroize::Zeroizing;

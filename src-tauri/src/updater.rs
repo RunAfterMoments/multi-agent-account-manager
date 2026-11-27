@@ -427,6 +427,7 @@ async fn verify_manifest_signature(
 
 /// 验签已下载的安装包文件（桌面分支用）：取 `{download_url}.minisig`，
 /// 再对文件流式验签。
+#[cfg_attr(not(desktop), allow(dead_code))]
 async fn verify_downloaded_installer_signature(
   app: &AppHandle,
   download_url: &str,
@@ -476,6 +477,7 @@ fn verify_downloaded_apk_path(
 /// release-assets.githubusercontent.com。未签名的 GitHub API 回退已删除，
 /// api.github.com 不再是合法跳转目标。
 /// 子域名不在白名单内（如 github.com.evil.com、sub.github.com）。
+#[cfg_attr(not(desktop), allow(dead_code))]
 fn is_allowed_redirect_target(url: &Url) -> bool {
   if url.scheme() != "https" {
     return false;

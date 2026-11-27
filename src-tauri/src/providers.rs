@@ -252,6 +252,7 @@ pub fn classify_top_level_url(
   }
 }
 
+#[cfg_attr(not(desktop), allow(dead_code))]
 pub fn is_verified_callback_origin(spec: &ProviderSpec, url: &Url) -> bool {
   if url.scheme() != "https" {
     return false;

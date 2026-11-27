@@ -2,6 +2,7 @@ use crate::storage::{
   default_agent_idle_timeout_secs, default_agent_timeout_secs, normalize_uuid, now_ms, AccountKey,
   ExternalAgentKind, ExternalAgentRecord,
 };
+#[cfg(desktop)]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use url::Url;
@@ -380,6 +381,7 @@ pub fn validate_local_cli_command(command: &str) -> Result<(), String> {
 /// 原因：argv 会出现在进程列表（ps / 任务管理器）里，提问内容可能
 /// 含敏感信息；且以 `-` 开头的提问会被 CLI 当成开关解析（flag 注入）。
 /// 参数里出现 `{prompt}` 即报错，提示去掉它（历史配置需手动改一次）。
+#[cfg_attr(not(desktop), allow(dead_code))]
 pub fn build_cli_args_and_stdin(
   args: &[String],
   prompt: &str,
@@ -395,6 +397,7 @@ pub fn build_cli_args_and_stdin(
 
 /// 超时或断流后：有累积文本就返回累积文本并标注「回复被截断」，
 /// 没有才把原始错误透传。
+#[cfg_attr(not(desktop), allow(dead_code))]
 fn finish_api_turn(
   result: Result<String, String>,
   shared_partial: &Arc<std::sync::Mutex<String>>,
@@ -415,6 +418,7 @@ fn finish_api_turn(
   }
 }
 
+#[cfg_attr(not(desktop), allow(dead_code))]
 fn sync_shared_partial(shared: &Arc<std::sync::Mutex<String>>, text: &str) {
   if let Ok(mut guard) = shared.lock() {
     *guard = text.to_string();
@@ -731,6 +735,7 @@ fn login_shell_path() -> Option<String> {
 /// 合并 PATH：登录 shell 的 PATH 在最前（与登录 shell 的视角一致），
 /// 再接当前进程的 PATH，最后补硬编码的常见目录；全程去重。
 /// 与平台无关的纯函数，可在 Linux 上单测。
+#[cfg_attr(not(desktop), allow(dead_code))]
 #[cfg(unix)]
 fn merge_augmented_path(cur: &str, home: &str, shell_path: Option<&str>) -> String {
   let mut parts: Vec<String> = Vec::new();
@@ -853,11 +858,13 @@ const MAX_CLI_STDOUT_BYTES: usize = 2 * 1024 * 1024;
 /// 跨块时会被切成两半，变成 U+FFFD 乱码。这里只解出完整的有效前缀，
 /// 把尾部不完整的多字节字符留在 `pending` 里等下一块；真正无效的字节
 /// 才按单个 U+FFFD 输出并跳过。
+#[cfg_attr(not(desktop), allow(dead_code))]
 #[derive(Debug, Default)]
 pub struct Utf8ChunkDecoder {
   pending: Vec<u8>,
 }
 
+#[cfg_attr(not(desktop), allow(dead_code))]
 impl Utf8ChunkDecoder {
   pub fn new() -> Self {
     Self::default()

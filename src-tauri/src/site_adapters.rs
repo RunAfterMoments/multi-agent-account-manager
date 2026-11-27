@@ -264,6 +264,7 @@ pub fn load_effective_adapters(app_data_dir: &Path) -> Vec<SiteAdapterConfig> {
   }
 }
 
+#[cfg_attr(not(desktop), allow(dead_code))]
 fn host_matches_pattern(host: &str, pattern: &str) -> bool {
   let h = host.trim().to_ascii_lowercase();
   let p = pattern.trim().to_ascii_lowercase();
@@ -279,6 +280,7 @@ fn host_matches_pattern(host: &str, pattern: &str) -> bool {
   h == p
 }
 
+#[cfg_attr(not(desktop), allow(dead_code))]
 pub fn resolve_adapter_for_host(app_data_dir: &Path, host: &str) -> SiteAdapterConfig {
   let adapters = load_effective_adapters(app_data_dir);
   for adapter in &adapters {

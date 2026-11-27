@@ -17,26 +17,38 @@
 //! identity watcher (`spawn_desktop_identity_watcher`) still lives in the
 //! parent and calls into this module.
 
-use super::{ActiveSessionSlot, InnerState, ManagerSnapshot, SessionManager, APP_TITLE};
+#[cfg(desktop)]
+use super::{ActiveSessionSlot, ManagerSnapshot, APP_TITLE};
+use super::{InnerState, SessionManager};
 #[cfg(desktop)]
 use super::{
   WarmDesktopEntry, AUTO_APPROVE_INIT_JS, BACKGROUND_RAF_INIT_JS, DOM_PAINT_READY_JS,
   GROUP_IDLE_RECLAIM_MS, LEFT_PANE_WIDTH, LOGIN_CAPTURE_INIT_JS, MAX_CONCURRENT_PREWARMS,
   MAX_WARM_DESKTOP_VIEWS, SERVICE_RAIL_WIDTH,
 };
+#[cfg(desktop)]
 use crate::platform;
 #[cfg(desktop)]
 use crate::providers::ProviderSpec;
+#[cfg(desktop)]
 use crate::providers::{classify_top_level_url, resolve_provider, NavigationDecision};
-use crate::storage::{now_ms, AccountKey, AccountRecord, GroupReplyStatus};
+use crate::storage::AccountKey;
+#[cfg(desktop)]
+use crate::storage::{now_ms, AccountRecord, GroupReplyStatus};
+#[cfg(desktop)]
 use std::collections::{HashMap, HashSet, VecDeque};
+#[cfg(desktop)]
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
+#[cfg(desktop)]
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Arc;
 use tauri::AppHandle;
 #[cfg(desktop)]
 use tauri::Manager;
+#[cfg(desktop)]
 use url::Url;
+#[cfg(desktop)]
 use uuid::Uuid;
 
 /// 移动端在锁外关闭当前活动会话时携带的参数（仅需 switch_seq）。

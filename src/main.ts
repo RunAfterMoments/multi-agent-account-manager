@@ -74,6 +74,7 @@ import {
   saveScrollPosition,
   restoreScrollPosition,
 } from "./render";
+import { createCookieCopyConfirm } from "./cookie-copy";
 import {
   renderGroupMiddleContent,
   renderGroupRightStage,
@@ -1410,14 +1411,18 @@ function bindEvents(state: ManagerSnapshot, provider: ProviderInfo): void {
 
   document.querySelectorAll<HTMLButtonElement>("[data-copy-cookie-uuid]").forEach((button) => {
     let feedbackTimer: number | undefined;
+    const confirm = createCookieCopyConfirm(button);
     button.addEventListener("click", async (event) => {
       event.stopPropagation();
       const uuid = button.dataset.copyCookieUuid;
       if (!uuid) return;
+      // “已复制”反馈 timer 若在确认窗内触发，会把「确认复制？」文案复原，先清掉。
+      window.clearTimeout(feedbackTimer);
+      // 两段确认（MAAM-M-01）：首次点击只进入确认态，不调用复制。
+      if (!confirm.click()) return;
       const copyKey = `${provider.id}:${uuid}`;
       if (copyingCookies.has(copyKey)) return;
       copyingCookies.add(copyKey);
-      window.clearTimeout(feedbackTimer);
       button.classList.remove("copied");
       button.dataset.copyLabel = "复制中…";
       try {

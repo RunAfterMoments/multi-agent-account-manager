@@ -11,7 +11,9 @@
 //! methods belong to the type, not the file.
 
 use super::{AccountPageError, InnerState, ManagerSnapshot, SessionManager};
-use crate::platform::{self, current_platform_name};
+#[cfg(desktop)]
+use crate::platform;
+use crate::platform::current_platform_name;
 use crate::providers::{all_provider_infos, resolve_provider, ProviderId};
 use crate::storage::{
   migrate_agent_keys_to_vault, parse_store_str, save_store_atomic, AccountsStoreFile,

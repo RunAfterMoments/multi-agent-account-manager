@@ -10,13 +10,18 @@
 use super::SessionManager;
 #[cfg(desktop)]
 use super::{GroupAttachment, REVIEW_FALLBACK_CHAR_LIMIT, REVIEW_INLINE_CHAR_LIMIT};
+#[cfg(desktop)]
 use crate::providers::{resolve_provider, ProviderId};
+use crate::storage::AccountKey;
+#[cfg(desktop)]
 use crate::storage::{
-  now_ms, AccountKey, AuthState, ExternalAgentKind, GroupChatMessage, GroupReplyStatus,
-  GroupWorkflowMode,
+  now_ms, AuthState, ExternalAgentKind, GroupChatMessage, GroupReplyStatus, GroupWorkflowMode,
 };
+#[cfg(desktop)]
 use std::sync::Arc;
+#[cfg(desktop)]
 use tauri::AppHandle;
+#[cfg(desktop)]
 use uuid::Uuid;
 
 /// A2A 接力在途登记 Drop 守卫：子链结束（正常、提前返回、panic）

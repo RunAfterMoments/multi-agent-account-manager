@@ -20,6 +20,7 @@ use std::sync::Mutex;
 
 use zeroize::Zeroizing;
 
+#[cfg_attr(not(desktop), allow(dead_code))]
 pub const KEYRING_SERVICE: &str = "multi-agent-account-manager";
 pub const FALLBACK_FILE_NAME: &str = "api-keys.json";
 /// 回退文件里 DPAPI 密文值的前缀（仅 Windows 写入）。

@@ -331,7 +331,8 @@ pub fn parse_account_proxy(raw: &str) -> Result<Option<url::Url>, String> {
   if !SUPPORTS_ACCOUNT_PROXY {
     return Err("当前平台不支持账号代理".to_string());
   }
-  let invalid = || "请输入无认证的 HTTP CONNECT 代理地址（http://主机:端口）".to_string();
+  let invalid =
+    || "请输入无认证的 HTTP CONNECT 代理地址（http://主机[:端口]，省略端口时默认 80）".to_string();
   if !raw
     .get(..7)
     .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
@@ -341,15 +342,19 @@ pub fn parse_account_proxy(raw: &str) -> Result<Option<url::Url>, String> {
   }
   let rest = &raw[7..];
   let authority = rest.strip_suffix('/').unwrap_or(rest);
-  let explicit_port = if let Some(after_bracket) = authority.strip_prefix('[') {
+  // 省略端口合法，默认 80（format_account_proxy 经 port_or_known_default
+  // 补出 host:port 字符串）。注意 url::Url 会抹掉默认端口：即使写成
+  // http://host:80，port() 仍为 None，序列化也不保留 :80，所以“补端口”
+  // 只能发生在字符串层面，不能靠往 Url 里写端口。
+  let port_part = if let Some(after_bracket) = authority.strip_prefix('[') {
     after_bracket.split_once("]:").map(|(_, port)| port)
   } else {
     authority.split_once(':').map(|(_, port)| port)
   };
-  let has_explicit_port = explicit_port
-    .is_some_and(|port| !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()));
-  if !has_explicit_port {
-    return Err(invalid());
+  if let Some(port) = port_part {
+    if port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit()) {
+      return Err(invalid());
+    }
   }
   let parsed = url::Url::parse(raw).map_err(|_| invalid())?;
   if parsed.scheme() != "http"
@@ -385,8 +390,16 @@ pub fn format_account_proxy(proxy: &url::Url) -> String {
 
 #[cfg(windows)]
 pub fn windows_proxy_browser_args(proxy: &url::Url) -> String {
+  // M-03：不再禁用 msSmartScreenProtection，只保留确实需要的 WebView UI
+  // 参数（msWebOOUI/msPdfOOUI，去迷你菜单与 PDF 内嵌 UI）。
+  // 统一走这条路而不是 builder.proxy_url，原因有二（均已对真实代码核实）：
+  // 1. url::Url 抹掉默认端口，tauri-runtime-wry 的 parse_proxy_url 会把
+  //    无端口/默认端口代理拼成 `--proxy-server=http://host:`（空端口）；
+  // 2. wry 的默认 additional_browser_args 本就含 msSmartScreenProtection，
+  //    只有显式传参（整体替换 wry 默认参数）才能把它保留开启。
+  // format_account_proxy 经 port_or_known_default 补出完整 host:port。
   format!(
-    "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection \
+    "--disable-features=msWebOOUI,msPdfOOUI \
      --autoplay-policy=no-user-gesture-required --proxy-server={}",
     format_account_proxy(proxy)
   )
@@ -402,11 +415,10 @@ pub fn with_windows_account_proxy(
     return Ok(builder);
   };
   check_windows_proxy_overrides(app_id)?;
-  Ok(if proxy.port().is_some() {
-    builder.proxy_url(proxy.clone())
-  } else {
-    builder.additional_browser_args(&windows_proxy_browser_args(proxy))
-  })
+  // 见 windows_proxy_browser_args 的注释：无端口/默认端口代理不能走
+  // builder.proxy_url（空端口），且只有显式 additional_browser_args
+  // 才能让 SmartScreen 保持开启，故全部代理统一走这一条路。
+  Ok(builder.additional_browser_args(&windows_proxy_browser_args(proxy)))
 }
 
 #[cfg(windows)]
@@ -2147,6 +2159,54 @@ pub fn lock_windows_manager_webview_zoom(webview: &tauri::Webview) {
   });
 }
 
+/// Windows：用 SHOpenFolderAndSelectItems 打开父目录并选中文件，彻底避免
+/// explorer.exe 命令行拼接（M-08 首选方案；API 签名对照 vendored
+/// windows 0.62.2 核实：SHOpenFolderAndSelectItems / ILCreateFromPathW /
+/// ILFindLastID 均需 Win32_UI_Shell_Common feature，CoTaskMemFree 需
+/// Win32_System_Com）。任一步失败都回退到只打开父目录。
+/// `clean` 是去掉 `\\?\` 前缀后的完整文件路径。
+#[cfg(windows)]
+fn reveal_with_shell_select(path: &Path, clean: &str) -> Result<(), String> {
+  use windows::core::HSTRING;
+  use windows::Win32::System::Com::CoTaskMemFree;
+  use windows::Win32::UI::Shell::{ILCreateFromPathW, ILFindLastID, SHOpenFolderAndSelectItems};
+
+  let open_parent = || {
+    if let Some(parent) = path.parent().filter(|p| p.exists()) {
+      open::that_detached(parent).map_err(|e| format!("打开文件夹失败: {e}"))
+    } else {
+      Err("文件已被移动或删除".to_string())
+    }
+  };
+  let Some(parent) = path.parent() else {
+    return open::that_detached(path).map_err(|e| format!("打开文件夹失败: {e}"));
+  };
+  let parent_raw = parent.to_string_lossy();
+  let parent_clean = parent_raw.strip_prefix(r"\\?\").unwrap_or(&parent_raw);
+  // SAFETY：两个 PIDL 均由 ILCreateFromPathW 分配，null 即失败；用完必
+  // CoTaskMemFree。ILFindLastID 返回指向 file_pidl 内部的相对子项，
+  // 禁止单独释放，只随 file_pidl 一起释放。
+  unsafe {
+    let folder_pidl = ILCreateFromPathW(&HSTRING::from(parent_clean));
+    if folder_pidl.is_null() {
+      return open_parent();
+    }
+    let file_pidl = ILCreateFromPathW(&HSTRING::from(clean));
+    if file_pidl.is_null() {
+      CoTaskMemFree(Some(folder_pidl as *const core::ffi::c_void));
+      return open_parent();
+    }
+    let child = ILFindLastID(file_pidl) as *const _;
+    let result = SHOpenFolderAndSelectItems(folder_pidl, Some(&[child]), 0);
+    CoTaskMemFree(Some(folder_pidl as *const core::ffi::c_void));
+    CoTaskMemFree(Some(file_pidl as *const core::ffi::c_void));
+    match result {
+      Ok(()) => Ok(()),
+      Err(_) => open_parent(),
+    }
+  }
+}
+
 #[cfg(desktop)]
 pub fn reveal_path_in_file_manager(path: &Path) -> Result<(), String> {
   #[cfg(target_os = "macos")]
@@ -2166,16 +2226,19 @@ pub fn reveal_path_in_file_manager(path: &Path) -> Result<(), String> {
   }
   #[cfg(windows)]
   {
-    use std::os::windows::process::CommandExt;
-
     if path.exists() {
       let raw = path.to_string_lossy();
       let clean = raw.strip_prefix(r"\\?\").unwrap_or(&raw);
-      std::process::Command::new("explorer.exe")
-        .raw_arg(format!("/select,\"{clean}\""))
-        .spawn()
-        .map(|_| ())
-        .map_err(|e| format!("打开资源管理器失败: {e}"))
+      // M-08：含 `"`/控制字符时回退到只打开父目录（HSTRING 遇 NUL 会截断，
+      // 且绝不把不可信路径拼进任何命令行）。
+      if clean.chars().any(|c| matches!(c, '"' | '\r' | '\n' | '\0')) {
+        return if let Some(parent) = path.parent().filter(|p| p.exists()) {
+          open::that_detached(parent).map_err(|e| format!("打开文件夹失败: {e}"))
+        } else {
+          Err("文件已被移动或删除".to_string())
+        };
+      }
+      reveal_with_shell_select(path, clean)
     } else if let Some(parent) = path.parent().filter(|p| p.exists()) {
       open::that_detached(parent).map_err(|e| format!("打开文件夹失败: {e}"))
     } else {
@@ -2184,10 +2247,12 @@ pub fn reveal_path_in_file_manager(path: &Path) -> Result<(), String> {
   }
   #[cfg(all(not(target_os = "macos"), not(windows)))]
   {
+    // M-08：父目录不存在时直接返回 Err，绝不 open::that_detached(path)
+    // 本身——否则刚下载的文件会被默认程序直接打开/执行。调用方
+    // reveal_downloaded_file 经 Tauri 命令原样返回 Err，前端以 notice
+    // 提示用户，不静默吞掉。
     if let Some(target) = path.parent().filter(|p| p.exists()) {
       open::that_detached(target).map_err(|e| format!("打开文件夹失败: {e}"))
-    } else if path.exists() {
-      open::that_detached(path).map_err(|e| format!("打开文件失败: {e}"))
     } else {
       Err("文件已被移动或删除".to_string())
     }
@@ -2332,12 +2397,17 @@ mod tests {
       "http://proxy_1.example-host.local:80"
     );
 
+    // M-03：省略端口合法，format_account_proxy 补默认 80。
+    let no_port = parse_account_proxy("http://127.0.0.1").unwrap().unwrap();
+    assert_eq!(format_account_proxy(&no_port), "http://127.0.0.1:80");
+    let no_port_v6 = parse_account_proxy("http://[::1]/").unwrap().unwrap();
+    assert_eq!(format_account_proxy(&no_port_v6), "http://[::1]:80");
+    // url::Url 会抹掉默认端口：即使显式写 :80，port() 仍为 None——
+    // 这正是 with_windows_account_proxy 不能走 builder.proxy_url 的原因。
+    assert!(domain.port().is_none());
+
     for invalid in [
-      "http://127.0.0.1",
-      "http://127.0.0.1/",
       "http://127.0.0.1:",
-      "http://[::1]",
-      "http://[::1]/",
       "http://127.0.0.1:0",
       "socks5://127.0.0.1:7890",
       "https://127.0.0.1:7890",
@@ -2383,8 +2453,14 @@ mod tests {
       .unwrap();
     let args80 = windows_proxy_browser_args(&url80);
     assert!(args80.contains("--proxy-server=http://proxy.local:80"));
-    assert!(args80.contains("--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection"));
+    assert!(args80.contains("--disable-features=msWebOOUI,msPdfOOUI"));
+    // M-03：SmartScreen 不再被禁用。
+    assert!(!args80.contains("msSmartScreenProtection"));
     assert!(args80.contains("--autoplay-policy=no-user-gesture-required"));
+
+    // M-03：省略端口时补默认 80。
+    let no_port = parse_account_proxy("http://proxy.local").unwrap().unwrap();
+    assert!(windows_proxy_browser_args(&no_port).contains("--proxy-server=http://proxy.local:80"));
 
     let ipv6 = parse_account_proxy("http://[::1]:7890").unwrap().unwrap();
     assert!(windows_proxy_browser_args(&ipv6).contains("--proxy-server=http://[::1]:7890"));
@@ -2399,6 +2475,19 @@ mod tests {
       wry::Error::WebView2Error(webview2_com::Error::from(ERROR_ACCESS_DENIED.to_hresult())),
     )));
     assert!(!windows_webview_options_in_use(&other_err));
+  }
+
+  // M-08：父目录不存在时直接 Err，不尝试打开文件本身。
+  #[cfg(all(desktop, target_os = "linux"))]
+  #[test]
+  fn reveal_rejects_missing_parent_without_opening_file() {
+    let missing =
+      std::path::Path::new("/tmp/maam-m08-test-nonexistent-dir-xyz/downloaded-file.bin");
+    assert!(!missing.parent().unwrap().exists());
+    assert_eq!(
+      reveal_path_in_file_manager(missing),
+      Err("文件已被移动或删除".to_string())
+    );
   }
 
   #[test]

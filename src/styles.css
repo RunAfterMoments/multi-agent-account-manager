@@ -1172,7 +1172,11 @@ body,
   color: var(--online);
 }
 
-.copy-cookie-btn:is(:hover, :focus-visible, .copied)::after {
+.copy-cookie-btn.confirming {
+  color: var(--danger);
+}
+
+.copy-cookie-btn:is(:hover, :focus-visible, .copied, .confirming)::after {
   content: attr(data-copy-label);
   position: absolute;
   z-index: 1;
@@ -2360,7 +2364,7 @@ body,
   background: rgba(15, 23, 42, 0.45);
 }
 
-:root[data-theme="dark"] .copy-cookie-btn:is(:hover, :focus-visible, .copied)::after {
+:root[data-theme="dark"] .copy-cookie-btn:is(:hover, :focus-visible, .copied, .confirming)::after {
   background: #0b101b;
   border: 1px solid var(--border-strong);
 }
