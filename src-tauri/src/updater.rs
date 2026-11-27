@@ -364,10 +364,168 @@ fn extract_sha256_digest(raw: Option<&str>) -> Option<String> {
 
 /// sha256 必填：缺失或格式非法直接拒绝，不下载、不复用、不安装。
 /// 这是桌面端与 Android 分支的单点关口——`download_and_install_update`
-/// 是唯一调用 Android 插件 `downloadAndInstallApk` 的入口，空 sha256
+/// 是唯一调用 Android 插件 `downloadApk` 的入口，空 sha256
 /// 到不了 Kotlin 侧（插件内 `expectedSha == null` 的放行逻辑因此不可达）。
 fn require_expected_sha256(sha: Option<&str>) -> Result<String, String> {
   extract_sha256_digest(sha).ok_or_else(|| "缺少更新包 SHA-256，拒绝安装".to_string())
+}
+
+/// Minisign 更新签名公钥（编译进二进制）。key id D4EB876AB73E8C4A。
+/// 私钥只存 GitHub 仓库 Secret MAAM_MINISIGN_SECRET_KEY，永不入库。
+const MAAM_MINISIGN_PUBLIC_KEY: &str = "RWRKjD63aofr1DUF3GDVK8tjmvnIzrN4YqTMHHr7WHHsT8bkD6mtdS5j";
+
+/// 解析编译进二进制的 Minisign 公钥。常量写死，解析失败只可能是源码被改坏。
+fn minisign_public_key() -> Result<minisign_verify::PublicKey, String> {
+  minisign_verify::PublicKey::from_base64(MAAM_MINISIGN_PUBLIC_KEY)
+    .map_err(|_| "内置更新公钥无效".to_string())
+}
+
+/// 把 minisign-verify 的错误翻译成中文原因短语（不含“拒绝安装”等上下文，
+/// 调用方再拼完整消息）。
+fn minisign_error_reason(err: minisign_verify::Error) -> &'static str {
+  use minisign_verify::Error;
+  match err {
+    Error::UnexpectedKeyId => "签名密钥与内置公钥不一致",
+    Error::InvalidSignature => "签名校验失败",
+    Error::UnexpectedAlgorithm | Error::UnsupportedLegacyMode => "签名为旧版非预哈希模式",
+    Error::InvalidEncoding => "签名文件格式无效",
+    Error::UnsupportedAlgorithm => "签名算法不受支持",
+    Error::IoError(_) => "读取签名数据失败",
+  }
+}
+
+/// 对内存中的内容验签（用于 latest.json 这类小文本）。
+/// `context` 为 "更新清单" 或 "安装包"，用于拼完整错误消息。
+fn verify_minisign_bytes(
+  public_key: &minisign_verify::PublicKey,
+  context: &str,
+  content: &[u8],
+  signature_text: &str,
+) -> Result<(), String> {
+  let signature = minisign_verify::Signature::decode(signature_text).map_err(|e| {
+    format!(
+      "{context}签名校验失败：{}，拒绝安装",
+      minisign_error_reason(e)
+    )
+  })?;
+  public_key.verify(content, &signature, false).map_err(|e| {
+    format!(
+      "{context}签名校验失败：{}，拒绝安装",
+      minisign_error_reason(e)
+    )
+  })
+}
+
+/// 对磁盘文件流式验签（用于安装包，避免把大文件读进内存）。
+/// 只接受预哈希签名（verify_stream 的要求，与发布端 minisign -S -H 一致）。
+fn verify_minisign_file(
+  public_key: &minisign_verify::PublicKey,
+  context: &str,
+  path: &std::path::Path,
+  signature_text: &str,
+) -> Result<(), String> {
+  use std::io::Read;
+  let signature = minisign_verify::Signature::decode(signature_text).map_err(|e| {
+    format!(
+      "{context}签名校验失败：{}，拒绝安装",
+      minisign_error_reason(e)
+    )
+  })?;
+  let mut verifier = public_key.verify_stream(&signature).map_err(|e| {
+    format!(
+      "{context}签名校验失败：{}，拒绝安装",
+      minisign_error_reason(e)
+    )
+  })?;
+  let mut file = std::fs::File::open(path).map_err(|e| format!("打开待验签文件失败: {e}"))?;
+  let mut buf = [0u8; 64 * 1024];
+  loop {
+    let n = file
+      .read(&mut buf)
+      .map_err(|e| format!("读取待验签文件失败: {e}"))?;
+    if n == 0 {
+      break;
+    }
+    verifier.update(&buf[..n]);
+  }
+  verifier.finalize().map_err(|e| {
+    format!(
+      "{context}签名校验失败：{}，拒绝安装",
+      minisign_error_reason(e)
+    )
+  })
+}
+
+/// 取回 .minisig 文本（小文本）。要求 HTTP 2xx，否则直接报错（缺失即拒绝，
+/// 不静默回退）。走现有 fetch_text_with_status，桌面/移动端自动分流。
+async fn fetch_minisig_text(
+  app: &AppHandle,
+  url: &str,
+  user_agent: &str,
+) -> Result<String, String> {
+  let (status, body) = fetch_text_with_status(app, url, user_agent, None).await?;
+  if !(200..=299).contains(&status) {
+    return Err(format!("获取更新签名文件失败（HTTP {status}），拒绝安装"));
+  }
+  Ok(body)
+}
+
+/// 资产 URL 对应的 .minisig URL：直接加后缀。
+fn minisig_url_for(asset_url: &str) -> String {
+  format!("{asset_url}.minisig")
+}
+
+/// 验签 latest.json 内容（manifest 分支用）：先取 `{manifest_url}.minisig`，
+/// 再对 manifest 字节验签。任何失败都返回 Err，调用方不得回退到 GitHub API。
+async fn verify_manifest_signature(
+  app: &AppHandle,
+  repo: &str,
+  user_agent: &str,
+  manifest_bytes: &[u8],
+) -> Result<(), String> {
+  let public_key = minisign_public_key()?;
+  let sig_url = minisig_url_for(&latest_manifest_url(repo));
+  let signature_text = fetch_minisig_text(app, &sig_url, user_agent).await?;
+  verify_minisign_bytes(&public_key, "更新清单", manifest_bytes, &signature_text)
+}
+
+/// 验签已下载的安装包文件（桌面分支用）：取 `{download_url}.minisig`，
+/// 再对文件流式验签。
+async fn verify_downloaded_installer_signature(
+  app: &AppHandle,
+  download_url: &str,
+  dest_path: &std::path::Path,
+  user_agent: &str,
+) -> Result<(), String> {
+  let public_key = minisign_public_key()?;
+  let sig_url = minisig_url_for(download_url);
+  let signature_text = fetch_minisig_text(app, &sig_url, user_agent).await?;
+  verify_minisign_file(&public_key, "安装包", dest_path, &signature_text)
+}
+
+/// Android 专用：校验 Kotlin 返回的 APK 路径确实位于应用缓存的 updates
+/// 目录下且是 .apk 文件，防止验签/安装跑到别的路径。返回校验后的路径。
+#[cfg(target_os = "android")]
+fn verify_downloaded_apk_path(
+  app: &AppHandle,
+  apk_path: &str,
+) -> Result<std::path::PathBuf, String> {
+  use tauri::Manager;
+  let cache_root = app
+    .path()
+    .app_cache_dir()
+    .map_err(|e| format!("获取缓存目录失败: {e}"))?;
+  let updates_dir = cache_root.join("updates");
+  let path = std::path::PathBuf::from(apk_path);
+  let file_name_ok = path
+    .extension()
+    .and_then(|s| s.to_str())
+    .map(|ext| ext.eq_ignore_ascii_case("apk"))
+    .unwrap_or(false);
+  if !file_name_ok || !path.starts_with(&updates_dir) || !path.is_file() {
+    return Err("Kotlin 返回的安装包路径不在应用缓存的 updates 目录下，拒绝安装".to_string());
+  }
+  Ok(path)
 }
 
 /// 每一跳重定向目标都必须满足：https 且主机在白名单内。
@@ -479,6 +637,9 @@ pub async fn check_for_updates(app: &AppHandle) -> Result<UpdateCheckResult, Str
   )
   .await
   {
+    // 清单取回成功：必须先验签（latest.json.minisig），签名缺失/无效直接拒绝，
+    // 不回退到 GitHub API——回退会绕过签名门。
+    verify_manifest_signature(app, &repo, &user_agent, body.as_bytes()).await?;
     if let Ok(manifest) = serde_json::from_str::<LatestManifest>(&body) {
       let latest_version = clean_version(&manifest.version).to_string();
       let asset = manifest.platforms.get(platform_key);
@@ -1092,7 +1253,12 @@ pub async fn download_and_install_update(
 
   #[cfg(target_os = "android")]
   {
-    let res = crate::platform::mobile::download_and_install_apk(
+    // 1. 先取安装包 .minisig（小文本，走现有 fetchText 桥），缺失即拒绝，
+    // 不下载大文件。
+    let signature_text =
+      fetch_minisig_text(app, &minisig_url_for(validated_url.as_str()), &user_agent).await?;
+    // 2. Kotlin 只下载 + SHA-256 校验，不安装，返回文件路径。
+    let downloaded = crate::platform::mobile::download_apk(
       app,
       validated_url.as_str(),
       Some(expected_sha.as_str()),
@@ -1100,6 +1266,25 @@ pub async fn download_and_install_update(
       &user_agent,
     )
     .await?;
+    if downloaded.status != "downloaded" {
+      return Err("安装包下载未完成，拒绝安装".to_string());
+    }
+    let apk_path = downloaded
+      .path
+      .ok_or_else(|| "Kotlin 未返回安装包路径，拒绝安装".to_string())?;
+    let verified_path = verify_downloaded_apk_path(app, &apk_path)?;
+    // 3. Rust 流式验签（预哈希模式），失败删文件并拒绝。
+    if let Err(err) = verify_minisign_file(
+      &minisign_public_key()?,
+      "安装包",
+      &verified_path,
+      &signature_text,
+    ) {
+      let _ = std::fs::remove_file(&verified_path);
+      return Err(err);
+    }
+    // 4. 验签通过才调起系统安装器。
+    let res = crate::platform::mobile::install_apk(app, &verified_path.to_string_lossy()).await?;
     Ok(InstallUpdateOutcome {
       status: res.status,
       message: res.message,
@@ -1135,6 +1320,17 @@ pub async fn download_and_install_update(
         return Err(err);
       }
     };
+
+    // 签名门：安装包 .minisig 流式验签，在 SHA-256 校验之后、任何安装步骤之前。
+    // 签名缺失/无效直接拒绝并删除已下载文件（缓存复用路径同样经过这里）。
+    if let Err(err) =
+      verify_downloaded_installer_signature(app, validated_url.as_str(), &dest_path, &user_agent)
+        .await
+    {
+      let _ = std::fs::remove_file(&dest_path);
+      emit_progress(app, "error", downloaded, Some(downloaded), None, &err);
+      return Err(err);
+    }
 
     #[cfg(target_os = "macos")]
     {
@@ -1547,5 +1743,124 @@ mod tests {
         "应拒绝: {raw}"
       );
     }
+  }
+
+  /// 生成一次性测试密钥对并对 `content` 签名，返回（公钥 base64，.minisig 文本）。
+  /// minisign::sign 内部恒做预哈希，与生产签名模式一致。永不使用真实密钥。
+  fn test_sign(content: &[u8]) -> (String, String) {
+    use std::io::Cursor;
+    let minisign::KeyPair { pk, sk } =
+      minisign::KeyPair::generate_encrypted_keypair(Some("maam-test-password".to_string()))
+        .expect("生成测试密钥对失败");
+    let pk_box_str = pk.to_box().expect("导出测试公钥失败").into_string();
+    let pubkey_b64 = pk_box_str
+      .lines()
+      .nth(1)
+      .expect("测试公钥应有两行")
+      .to_string();
+    let sk_box_str = sk.to_box(None).expect("导出测试私钥失败").into_string();
+    let secret = minisign::SecretKeyBox::from_string(&sk_box_str)
+      .expect("解析测试私钥失败")
+      .into_secret_key(Some("maam-test-password".to_string()))
+      .expect("解密测试私钥失败");
+    let sig_box =
+      minisign::sign(None, &secret, Cursor::new(content), None, None).expect("测试签名失败");
+    (pubkey_b64, sig_box.into_string())
+  }
+
+  fn test_public_key(pubkey_b64: &str) -> minisign_verify::PublicKey {
+    minisign_verify::PublicKey::from_base64(pubkey_b64).expect("测试公钥应合法")
+  }
+
+  #[test]
+  fn minisign_sign_then_verify_passes() {
+    let (pubkey_b64, sig_text) = test_sign(b"hello minisign");
+    let pk = test_public_key(&pubkey_b64);
+    verify_minisign_bytes(&pk, "更新清单", b"hello minisign", &sig_text).expect("合法签名应通过");
+  }
+
+  #[test]
+  fn minisign_tampered_content_fails() {
+    let (pubkey_b64, sig_text) = test_sign(b"hello minisign");
+    let pk = test_public_key(&pubkey_b64);
+    let err = verify_minisign_bytes(&pk, "更新清单", b"hello minisign!", &sig_text)
+      .expect_err("篡改内容后验签应失败");
+    assert!(
+      err.contains("签名校验失败"),
+      "错误应说明签名校验失败: {err}"
+    );
+  }
+
+  #[test]
+  fn minisign_tampered_signature_fails() {
+    let (pubkey_b64, sig_text) = test_sign(b"hello minisign");
+    let pk = test_public_key(&pubkey_b64);
+    // 篡改第二行（base64 签名行）中间一个字符，保持 base64 合法。
+    let mut lines: Vec<String> = sig_text.lines().map(str::to_string).collect();
+    let mut chars: Vec<char> = lines[1].chars().collect();
+    let idx = lines[1].find('A').unwrap_or(0);
+    chars[idx] = if chars[idx] == 'A' { 'B' } else { 'A' };
+    lines[1] = chars.into_iter().collect();
+    let tampered = lines.join("\n");
+    let err = verify_minisign_bytes(&pk, "更新清单", b"hello minisign", &tampered)
+      .expect_err("篡改签名后验签应失败");
+    assert!(
+      err.contains("签名校验失败"),
+      "错误应说明签名校验失败: {err}"
+    );
+  }
+
+  #[test]
+  fn minisign_wrong_key_fails() {
+    let (_pk_a, sig_text) = test_sign(b"hello minisign");
+    let (pubkey_b64, _sig_b) = test_sign(b"hello minisign");
+    let pk_b = test_public_key(&pubkey_b64);
+    let err = verify_minisign_bytes(&pk_b, "更新清单", b"hello minisign", &sig_text)
+      .expect_err("错密钥验签应失败");
+    assert!(
+      err.contains("与内置公钥不一致"),
+      "错误应说明密钥不匹配: {err}"
+    );
+  }
+
+  #[test]
+  fn minisign_missing_or_garbage_signature_fails() {
+    let (pubkey_b64, _sig_text) = test_sign(b"hello minisign");
+    let pk = test_public_key(&pubkey_b64);
+    assert!(verify_minisign_bytes(&pk, "更新清单", b"hello minisign", "").is_err());
+    assert!(verify_minisign_bytes(&pk, "更新清单", b"hello minisign", "not a signature").is_err());
+  }
+
+  #[test]
+  fn minisign_file_verify_passes_and_tampered_fails() {
+    let content = b"fake installer bytes for streaming verify";
+    let (pubkey_b64, sig_text) = test_sign(content);
+    let pk = test_public_key(&pubkey_b64);
+    let path = std::env::temp_dir().join(format!(
+      "maam-minisign-test-{}-{}",
+      std::process::id(),
+      "installer.bin"
+    ));
+    std::fs::write(&path, content).expect("写临时测试文件失败");
+    let first = verify_minisign_file(&pk, "安装包", &path, &sig_text);
+    std::fs::write(&path, b"tampered installer bytes").expect("改写临时测试文件失败");
+    let second = verify_minisign_file(&pk, "安装包", &path, &sig_text);
+    let _ = std::fs::remove_file(&path);
+    first.expect("合法文件流式验签应通过");
+    assert!(second.is_err(), "篡改文件后流式验签应失败");
+  }
+
+  #[test]
+  fn minisign_embedded_public_key_parses() {
+    // 只测内置常量能解析（不签任何东西），防止公钥串抄错。
+    minisign_public_key().expect("内置更新公钥应能解析");
+  }
+
+  #[test]
+  fn minisig_url_for_appends_suffix() {
+    assert_eq!(
+      minisig_url_for("https://github.com/o/r/releases/download/v1.0.0/app.tar.gz"),
+      "https://github.com/o/r/releases/download/v1.0.0/app.tar.gz.minisig"
+    );
   }
 }

@@ -27,10 +27,10 @@ permissions:
 
 env:
   # 更新源：编译进二进制（updater.rs 经 option_env!("MAAM_UPDATE_REPO") 读取）。
-  # 默认留空（更新检查关闭）：Ed25519 验签未落地前，带着已启用更新源发公开版
-  # 是不安全的——已装上的无验签版本不会验签后续更新，仓库或 Release 出事
-  # 就能向存量版本推恶意更新。验签落地后，在仓库 Settings > Variables 里
-  # 设 MAAM_UPDATE_REPO=<owner/repo> 再发版；内部自测可直接在 workflow_dispatch
+  # 默认留空（更新检查关闭）。Ed25519 验签已落地：updater.rs 用 minisign-verify
+  # 验签 latest.json.minisig 与安装包 .minisig（公钥编译进二进制，见 minisign.pub），
+  # publish job 签署全部资产 + latest.json。开启更新只需在仓库 Settings > Variables
+  # 里设 MAAM_UPDATE_REPO=<owner/repo> 再发版；内部自测可直接在 workflow_dispatch
   # 输入里覆盖（见上面的 inputs.maam_update_repo）。
   MAAM_UPDATE_REPO: ${{ inputs.maam_update_repo || vars.MAAM_UPDATE_REPO }}
 
@@ -338,10 +338,19 @@ jobs:
 
           echo "RELEASE_TAG=$tag" >> "$GITHUB_ENV"
           printf '%s\n' "$notes" > "$pub_dir/release-notes.txt"
-      - name: Create or update GitHub Release
+      - name: Sign release assets with minisign
         env:
-          GH_TOKEN: ${{ github.token }}
+          MINISIGN_SECRET_KEY: ${{ secrets.MAAM_MINISIGN_SECRET_KEY }}
         run: |
+          set -eu
+          : "${MINISIGN_SECRET_KEY:?Missing MAAM_MINISIGN_SECRET_KEY secret}"
+          umask 077
+          key_file="$RUNNER_TEMP/minisign.key"
+          trap 'shred -u "$key_file" 2>/dev/null || rm -f "$key_file"' EXIT
+          printf '%s' "$MINISIGN_SECRET_KEY" > "$key_file"
+          chmod 600 "$key_file"
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq minisign
           pub_dir="$RUNNER_TEMP/publish"
           files=(
             "$pub_dir/account-manager-macos-universal.app.tar.gz"
@@ -350,6 +359,33 @@ jobs:
             "$pub_dir/account-manager-android-universal-release.apk"
             "$pub_dir/account-manager-ios-unsigned.ipa"
             "$pub_dir/latest.json"
+          )
+          for f in "${files[@]}"; do
+            minisign -S -H -s "$key_file" -m "$f"
+          done
+          # 自检：用仓库根目录的公钥文件逐个验签，验签失败即中断发布。
+          for f in "${files[@]}"; do
+            minisign -V -p minisign.pub -m "$f" -x "$f.minisig"
+          done
+          ls -la "$pub_dir"
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          pub_dir="$RUNNER_TEMP/publish"
+          files=(
+            "$pub_dir/account-manager-macos-universal.app.tar.gz"
+            "$pub_dir/account-manager-macos-universal.app.tar.gz.minisig"
+            "$pub_dir/account-manager-macos-universal.dmg"
+            "$pub_dir/account-manager-macos-universal.dmg.minisig"
+            "$pub_dir/account-manager-windows-x64-setup.exe"
+            "$pub_dir/account-manager-windows-x64-setup.exe.minisig"
+            "$pub_dir/account-manager-android-universal-release.apk"
+            "$pub_dir/account-manager-android-universal-release.apk.minisig"
+            "$pub_dir/account-manager-ios-unsigned.ipa"
+            "$pub_dir/account-manager-ios-unsigned.ipa.minisig"
+            "$pub_dir/latest.json"
+            "$pub_dir/latest.json.minisig"
           )
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release upload "$RELEASE_TAG" "${files[@]}" --clobber

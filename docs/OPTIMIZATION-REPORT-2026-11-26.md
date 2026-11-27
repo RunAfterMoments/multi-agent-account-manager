@@ -831,8 +831,10 @@ tooltip 按平台显示：macOS `⌘\`，其余 `Ctrl+\`（`IS_MAC`，
   windows-2025 / macos-15 + audit job）与 `release.yml`。
 - `cargo audit` / `npm audit` 未在本机跑通（cargo-audit 未装；npm audit 端点被代理拦）——
   CI 的 audit job 是首次真跑，现有依赖的高危漏洞可能让它变红。
-- Ed25519/minisign 更新签名**未实现**；`release.yml` 现默认更新关闭（vars 为空），
-  需用户生成密钥对（`minisign -G`，私钥进 CI secret，公钥编进程序）并设仓库变量后开启。
+- Ed25519/minisign 更新签名**已实现（v6.2，见 §十四）**；`release.yml` 仍默认更新关闭（vars 为空），
+  开启只需用户在仓库 Settings > Variables 设 `MAAM_UPDATE_REPO=<owner/repo>` 后再发版。
+  注意：首次带签名的公开 Release 尚未发过，签名流水线的端到端验证（真实 Secret +
+  `minisign -S` + 上传）需一次真实 publish 才能证明。
 - **PR-F 与 Step 2 明确延后**（按 v6 复审路线）：PR-F（key_vault DPAPI / Keystore /
   Keychain + `Zeroizing<String>`，去静默明文回退）；Step 2（`self.inner.lock().await`
   跨 `.await` 持锁拆解、流式 delta + 局部 DOM 更新）。等用户复审 v6.1.1 后再定。
@@ -845,4 +847,66 @@ tooltip 按平台显示：macOS `⌘\`，其余 `Ctrl+\`（`IS_MAC`，
   `publish_release: false`，首次真实验证 Windows Job Object、Android Kotlin、iOS Swift）；
   ② Ed25519 签名 + PR-F；③ Step 2 + 真机验收（Windows `.cmd` CLI + Job Object 杀树 +
   NSIS 重装；Android 旋转恢复会话 + APK 拦截）。
+
+## 十四、v6.2 Ed25519（minisign）离线更新签名（2026-11-27，闭环 MAAM-H-05）
+
+### 密钥
+- `minisign -G` 生成（空口令，密钥本身靠 GitHub Secret 保护）。公钥
+  `RWRKjD63aofr1DUF3GDVK8tjmvnIzrN4YqTMHHr7WHHsT8bkD6mtdS5j`
+  （key id `D4EB876AB73E8C4A`），编译进 `updater.rs` 常量
+  `MAAM_MINISIGN_PUBLIC_KEY`，另存仓库根目录 `minisign.pub`（供
+  release.yml 自检用）。私钥只存 GitHub 仓库 Secret
+  `MAAM_MINISIGN_SECRET_KEY`（2026-11-27 设定，存的是标准密钥文件全文：
+  `untrusted comment:` 行 + base64 行），本地临时文件已 shred 删除。
+  私钥丢失的后果：无法再用旧公钥签署新版，需先发一版带新公钥的程序。
+
+### Rust（桌面 + Android 共用同一份实现）
+- 依赖：`minisign-verify = "0.2"`（实际 0.2.5，全平台共用）；
+  `[dev-dependencies] minisign = "0.7"`（实际 0.7.9，仅测试里现生成
+  密钥对做签名，永不使用真实密钥）。
+- `verify_minisign_bytes`（latest.json 这类小文本）与
+  `verify_minisign_file`（安装包流式验签，64KiB 分块）；两者都只接受
+  预哈希签名（`allow_legacy=false`，与发布端 `minisign -S -H` 一致）。
+- 接线点（全部 fail-closed，无静默回退）：
+  - `check_for_updates` 取到 latest.json 后**先验签再解析**，签名缺失/
+    无效直接 `Err`，不回退 GitHub API（回退会绕过签名门）；
+  - 桌面分支：下载完成、SHA-256 校验之后、任何安装步骤之前流式验签，
+    失败删文件（缓存复用路径同样经过这里）；
+  - Android 分支：先取安装包 `.minisig`（小文本，走现有 `fetchText` 桥，
+    缺失即拒、不下载大文件）→ Kotlin 只下载 + SHA-256（`downloadApk`，
+    不安装，返回路径）→ Rust 校验路径确在应用缓存 `updates` 目录下且
+    是 `.apk` → 流式验签，失败删文件 → 通过才调 `installApk`。
+- 8 个新测试（`cargo test --lib` 105 → 113）：合法签名通过、篡改内容失败、
+  篡改签名失败、错密钥失败、缺失/垃圾签名失败、文件流式通过 + 篡改失败、
+  内置公钥解析、`.minisig` URL 后缀。
+
+### Android 验签决策：全部在 Rust 做，Kotlin 只下载 + 安装
+- 依据：minSdk=24，而 `java.security.Signature` 的 Ed25519 要 API 28+ 才有；
+  生产签名是预哈希模式（算法字节 `ED`），预哈希要 BLAKE2b，JCA 没有；
+  Bouncy Castle 不在依赖里，引入 ~5MB 加密库只为验签不值；插件没有
+  Kotlin 测试基建。Rust 侧本来就有 `fetchText` 桥，同一公钥、同一份实现、
+  全 API 级别覆盖。
+- `downloadAndInstallApk` 拆成 `downloadApk` + `installApk`（Rust 侧
+  `account-session` 的 `download_and_install_apk` 同样拆成 `download_apk` +
+  `install_apk`；`platform::mobile` 是整包 re-export，改名自动流通）。
+  `installApk` 保留原安装逻辑，另加 canonical 路径校验（必须在
+  `cacheDir/updates` 下、是 `.apk`、真实存在）。下载逻辑逐行未动。
+
+### release.yml（publish job）
+- 新增 "Sign release assets with minisign" 步骤：`apt install minisign` →
+  Secret 写 0600 临时密钥文件（`trap shred -u || rm -f`）→ `minisign -S -H`
+  签 5 个资产 + latest.json → `minisign -V -p minisign.pub` 逐个自检，
+  失败即中断发布；发布步骤的 files 数组加 6 个 `.minisig`。
+- `MAAM_UPDATE_REPO` 的值未动，更新仍关闭。顶部注释更新为“验签已落地”。
+- CLI→Rust 互通已验：minisign CLI 0.11 签的文件，Rust `verify()`（清单）与
+  `verify_stream()`（安装包）均通过，篡改文件流式验签失败。
+
+### 验证（v6.2）
+- fmt、clippy（Linux/Windows）、`cargo test --lib` 113/113、Windows `--no-run`、
+  `cargo check --target aarch64-linux-android --lib` 0 错误（44 条 mobile 警告
+  是此前就有的）、npm build、test:js 全绿。
+- Kotlin 未本机编译（本机无 Android SDK），只做了逐行比对 + 括号平衡检查；
+  需 CI 的 release Android 构建验证。iOS 不做应用内验签（沿用现有设计：
+  Safari 打开下载），但 `.ipa` 照常签署上传。
+- 未验证：真实发布流程（未触发 publish）；首次带签名的公开 Release 需用户点头。
 

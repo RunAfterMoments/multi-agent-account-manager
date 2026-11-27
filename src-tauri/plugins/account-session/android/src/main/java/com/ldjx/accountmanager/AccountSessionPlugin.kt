@@ -102,6 +102,11 @@ class DownloadApkArgs {
     var userAgent: String = ""
 }
 
+@InvokeArg
+class InstallApkArgs {
+    var path: String = ""
+}
+
 @TauriPlugin
 class AccountSessionPlugin(private val activity: Activity) : Plugin(activity) {
     @Volatile
@@ -377,9 +382,9 @@ class AccountSessionPlugin(private val activity: Activity) : Plugin(activity) {
     }
 
     @Command
-    fun downloadAndInstallApk(invoke: Invoke) {
+    fun downloadApk(invoke: Invoke) {
         val args = invoke.parseArgs(DownloadApkArgs::class.java)
-        thread(name = "maam-update-apk") {
+        thread(name = "maam-update-apk-dl") {
             var conn: HttpURLConnection? = null
             val rawName = args.filename.substringAfterLast('/').substringAfterLast('\\').trim()
             val safeName = rawName
@@ -502,61 +507,12 @@ class AccountSessionPlugin(private val activity: Activity) : Plugin(activity) {
                     lastDownloadedPath = targetFile.absolutePath
                 }
 
-                activity.runOnUiThread {
-                    try {
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !activity.packageManager.canRequestPackageInstalls()) {
-                            val permIntent = Intent(
-                                Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
-                                Uri.parse("package:${activity.packageName}"),
-                            ).apply {
-                                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                            }
-                            activity.startActivity(permIntent)
-                            val msg = "请先开启“允许安装未知来源应用”，开启后返回再次点击安装"
-                            AccountSessionCoordinator.emitUpdateProgress(
-                                stage = "needs_permission",
-                                downloaded = targetFile.length(),
-                                total = targetFile.length(),
-                                percent = 100,
-                                message = msg,
-                            )
-                            val ret = JSObject().apply {
-                                put("status", "needs_permission")
-                                put("message", msg)
-                            }
-                            invoke.resolve(ret)
-                            return@runOnUiThread
-                        }
-
-                        val apkUri = FileProvider.getUriForFile(
-                            activity,
-                            "${activity.packageName}.fileprovider",
-                            targetFile,
-                        )
-                        val installIntent = Intent(Intent.ACTION_VIEW).apply {
-                            setDataAndType(apkUri, "application/vnd.android.package-archive")
-                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                        }
-                        activity.startActivity(installIntent)
-                        val msg = "已调起系统安装器，请按提示完成覆盖更新"
-                        AccountSessionCoordinator.emitUpdateProgress(
-                            stage = "ready",
-                            downloaded = targetFile.length(),
-                            total = targetFile.length(),
-                            percent = 100,
-                            message = msg,
-                        )
-                        val ret = JSObject().apply {
-                            put("status", "installer_launched")
-                            put("message", msg)
-                        }
-                        invoke.resolve(ret)
-                    } catch (t: Throwable) {
-                        val err = t.message ?: "调起系统安装器失败"
-                        AccountSessionCoordinator.emitUpdateProgress("error", 0L, null, null, err)
-                        invoke.reject(err)
-                    }
+                val ret = JSObject().apply {
+                    put("status", "downloaded")
+                    put("message", "安装包已下载完成")
+                    put("path", targetFile.absolutePath)
                 }
+                invoke.resolve(ret)
             } catch (t: Throwable) {
                 if (partFile.exists()) {
                     partFile.delete()
@@ -570,6 +526,81 @@ class AccountSessionPlugin(private val activity: Activity) : Plugin(activity) {
         }
     }
 
+    @Command
+    fun installApk(invoke: Invoke) {
+        val args = invoke.parseArgs(InstallApkArgs::class.java)
+        thread(name = "maam-update-apk-install") {
+            val apkFile = File(args.path)
+            // 必须位于应用缓存 updates 目录下、是 .apk 文件、真实存在。
+            val updatesDir = File(activity.cacheDir, "updates")
+            val canonicalUpdates = updatesDir.canonicalFile
+            val canonicalApk = apkFile.canonicalFile
+            if (!canonicalApk.path.startsWith(canonicalUpdates.path + File.separator)
+                || !canonicalApk.name.endsWith(".apk", ignoreCase = true)
+                || !canonicalApk.isFile
+            ) {
+                invoke.reject("安装包路径不在应用缓存的 updates 目录下，拒绝安装")
+                return@thread
+            }
+            val targetFile = canonicalApk
+
+            activity.runOnUiThread {
+                try {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !activity.packageManager.canRequestPackageInstalls()) {
+                        val permIntent = Intent(
+                            Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                            Uri.parse("package:${activity.packageName}"),
+                        ).apply {
+                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        }
+                        activity.startActivity(permIntent)
+                        val msg = "请先开启“允许安装未知来源应用”，开启后返回再次点击安装"
+                        AccountSessionCoordinator.emitUpdateProgress(
+                            stage = "needs_permission",
+                            downloaded = targetFile.length(),
+                            total = targetFile.length(),
+                            percent = 100,
+                            message = msg,
+                        )
+                        val ret = JSObject().apply {
+                            put("status", "needs_permission")
+                            put("message", msg)
+                        }
+                        invoke.resolve(ret)
+                        return@runOnUiThread
+                    }
+
+                    val apkUri = FileProvider.getUriForFile(
+                        activity,
+                        "${activity.packageName}.fileprovider",
+                        targetFile,
+                    )
+                    val installIntent = Intent(Intent.ACTION_VIEW).apply {
+                        setDataAndType(apkUri, "application/vnd.android.package-archive")
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    }
+                    activity.startActivity(installIntent)
+                    val msg = "已调起系统安装器，请按提示完成覆盖更新"
+                    AccountSessionCoordinator.emitUpdateProgress(
+                        stage = "ready",
+                        downloaded = targetFile.length(),
+                        total = targetFile.length(),
+                        percent = 100,
+                        message = msg,
+                    )
+                    val ret = JSObject().apply {
+                        put("status", "installer_launched")
+                        put("message", msg)
+                    }
+                    invoke.resolve(ret)
+                } catch (t: Throwable) {
+                    val err = t.message ?: "调起系统安装器失败"
+                    AccountSessionCoordinator.emitUpdateProgress("error", 0L, null, null, err)
+                    invoke.reject(err)
+                }
+            }
+        }
+    }
     private fun openHttpConnection(
         rawUrl: String,
         userAgent: String,
