@@ -901,6 +901,20 @@ tooltip 按平台显示：macOS `⌘\`，其余 `Ctrl+\`（`IS_MAC`，
   要交互式问口令，CI 无 tty 会直接失败（v6.2.1 修复：签名循环改成
   `printf '\n' | minisign -S -H …`，空行即解密通过；本机已验证空口令
   密钥 + 管道喂空行可正常签署并通过 `minisign -V`）。
+- v6.2.2（用户 2026-11-27 12:03 审计，8.8/10）：补 2 条。① 删掉
+  `check_for_updates` 的未签名 GitHub Releases API 回退——原来清单取回
+  非 2xx（例如攻击者发一个不带 latest.json 的 Release）会落入未签名
+  API，伪造版本提示/更新日志/下载链接，iOS 因走 Safari 无第二道
+  `.minisig` 验签会被直接导去下载恶意 IPA；现改为只信任已签名清单，
+  取回失败、非 2xx、验签失败、解析失败一律 fail-closed 报错，`GithubRelease`
+  / `GithubAsset` / `select_github_asset` / `github_latest_api_url` 四处
+  死代码一并删除，重定向白名单同步去掉 `api.github.com`。② Android
+  `verify_downloaded_apk_path` 两边先 `std::fs::canonicalize` 再比较，
+  解决真机 `/data/data/<pkg>/cache` → `/data/user/0/<pkg>/cache` 符号
+  链接导致合法更新被误拦（同时消掉 `..` 片段；`Path::starts_with`
+  本就按组件比较，无 updates-evil 式前缀误判）。顺手：桌面
+  `fetch_text_with_status` 的 `resp.text()` 改成分块流式读并加 2 MiB
+  上限（与移动端 fetchText 一致，Kotlin 侧 2 * 1024 * 1024）。
 - `MAAM_UPDATE_REPO` 的值未动，更新仍关闭。顶部注释更新为“验签已落地”。
 - CLI→Rust 互通已验：minisign CLI 0.11 签的文件，Rust `verify()`（清单）与
   `verify_stream()`（安装包）均通过，篡改文件流式验签失败。

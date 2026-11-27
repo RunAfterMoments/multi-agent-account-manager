@@ -34,10 +34,6 @@ fn latest_manifest_url(repo: &str) -> String {
   format!("https://github.com/{repo}/releases/latest/download/latest.json")
 }
 
-fn github_latest_api_url(repo: &str) -> String {
-  format!("https://api.github.com/repos/{repo}/releases/latest")
-}
-
 fn releases_page_url(repo: &str) -> String {
   format!("https://github.com/{repo}/releases")
 }
@@ -129,28 +125,6 @@ struct LatestPlatformAsset {
   filename: Option<String>,
   #[serde(default)]
   size: Option<u64>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GithubRelease {
-  tag_name: String,
-  #[serde(default)]
-  body: Option<String>,
-  #[serde(default)]
-  published_at: Option<String>,
-  #[serde(default)]
-  html_url: Option<String>,
-  #[serde(default)]
-  assets: Vec<GithubAsset>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GithubAsset {
-  name: String,
-  browser_download_url: String,
-  size: u64,
-  #[serde(default)]
-  digest: Option<String>,
 }
 
 fn clean_version(raw: &str) -> &str {
@@ -304,44 +278,6 @@ fn default_filename_for_platform(version: &str, url: &str) -> String {
     "android" => format!("account-manager-{ver}-android.apk"),
     "ios" => "account-manager-ios-unsigned.ipa".to_string(),
     _ => format!("account-manager-{ver}.bin"),
-  }
-}
-
-fn select_github_asset<'a>(assets: &'a [GithubAsset], platform: &str) -> Option<&'a GithubAsset> {
-  match platform {
-    "macos" => assets
-      .iter()
-      .find(|a| a.name.to_ascii_lowercase().ends_with(".app.tar.gz"))
-      .or_else(|| {
-        assets
-          .iter()
-          .find(|a| a.name.to_ascii_lowercase().ends_with(".dmg"))
-      }),
-    "windows" => assets
-      .iter()
-      .find(|a| a.name.to_ascii_lowercase().ends_with("-setup.exe"))
-      .or_else(|| {
-        assets
-          .iter()
-          .find(|a| a.name.to_ascii_lowercase().ends_with(".exe"))
-      }),
-    "android" => assets
-      .iter()
-      .find(|a| a.name.to_ascii_lowercase().ends_with("-release.apk"))
-      .or_else(|| {
-        assets
-          .iter()
-          .find(|a| a.name.to_ascii_lowercase().ends_with(".apk"))
-      }),
-    "ios" => assets
-      .iter()
-      .find(|a| a.name.to_ascii_lowercase().ends_with("-ios-unsigned.ipa"))
-      .or_else(|| {
-        assets
-          .iter()
-          .find(|a| a.name.to_ascii_lowercase().ends_with(".ipa"))
-      }),
-    _ => None,
   }
 }
 
@@ -516,21 +452,29 @@ fn verify_downloaded_apk_path(
     .app_cache_dir()
     .map_err(|e| format!("获取缓存目录失败: {e}"))?;
   let updates_dir = cache_root.join("updates");
-  let path = std::path::PathBuf::from(apk_path);
-  let file_name_ok = path
+  // 两边都先规范化再比较：Android 真机上 /data/data/<pkg>/cache 常是
+  // 指向 /data/user/0/<pkg>/cache 的符号链接，词法比较会误拦合法更新；
+  // 规范化同时消掉 .. 片段。canonicalize 要求路径真实存在，不存在即拒。
+  // 注：Path::starts_with 本就是按组件比较，不存在 updates-evil 式前缀误判。
+  let canonical_updates =
+    std::fs::canonicalize(&updates_dir).map_err(|e| format!("规范化更新目录失败: {e}"))?;
+  let canonical_path =
+    std::fs::canonicalize(apk_path).map_err(|e| format!("规范化安装包路径失败: {e}"))?;
+  let file_name_ok = canonical_path
     .extension()
     .and_then(|s| s.to_str())
     .map(|ext| ext.eq_ignore_ascii_case("apk"))
     .unwrap_or(false);
-  if !file_name_ok || !path.starts_with(&updates_dir) || !path.is_file() {
+  if !file_name_ok || !canonical_path.starts_with(&canonical_updates) || !canonical_path.is_file() {
     return Err("Kotlin 返回的安装包路径不在应用缓存的 updates 目录下，拒绝安装".to_string());
   }
-  Ok(path)
+  Ok(canonical_path)
 }
 
 /// 每一跳重定向目标都必须满足：https 且主机在白名单内。
-/// 白名单：github.com、api.github.com（清单 API 自身跳转，见笔记）、
-/// objects.githubusercontent.com、release-assets.githubusercontent.com。
+/// 白名单：github.com、objects.githubusercontent.com、
+/// release-assets.githubusercontent.com。未签名的 GitHub API 回退已删除，
+/// api.github.com 不再是合法跳转目标。
 /// 子域名不在白名单内（如 github.com.evil.com、sub.github.com）。
 fn is_allowed_redirect_target(url: &Url) -> bool {
   if url.scheme() != "https" {
@@ -541,10 +485,7 @@ fn is_allowed_redirect_target(url: &Url) -> bool {
   };
   matches!(
     host.to_ascii_lowercase().as_str(),
-    "github.com"
-      | "api.github.com"
-      | "objects.githubusercontent.com"
-      | "release-assets.githubusercontent.com"
+    "github.com" | "objects.githubusercontent.com" | "release-assets.githubusercontent.com"
   )
 }
 
@@ -581,7 +522,7 @@ async fn fetch_text_with_status(
     if let Some(acc) = accept {
       req = req.header("Accept", acc);
     }
-    let resp = req
+    let mut resp = req
       .send()
       .await
       .map_err(|e| format!("检查更新网络请求失败: {e}"))?;
@@ -589,10 +530,26 @@ async fn fetch_text_with_status(
       return Err("更新响应重定向到了非 HTTPS 地址".to_string());
     }
     let status = resp.status().as_u16();
-    let body = resp
-      .text()
+    // Content-Length 预检 + 流式累计，超 2 MiB 即拒（与移动端 fetchText
+    // 的上限一致；清单与 .minisig 都是小文本）。
+    if resp
+      .content_length()
+      .is_some_and(|n| n > MAX_UPDATE_TEXT_BYTES as u64)
+    {
+      return Err("更新响应内容超过 2 MiB 上限，已拒绝".to_string());
+    }
+    let mut buf = Vec::new();
+    while let Some(chunk) = resp
+      .chunk()
       .await
-      .map_err(|e| format!("读取更新响应内容失败: {e}"))?;
+      .map_err(|e| format!("读取更新响应内容失败: {e}"))?
+    {
+      if buf.len() + chunk.len() > MAX_UPDATE_TEXT_BYTES {
+        return Err("更新响应内容超过 2 MiB 上限，已拒绝".to_string());
+      }
+      buf.extend_from_slice(&chunk);
+    }
+    let body = String::from_utf8(buf).map_err(|_| "更新响应内容不是合法 UTF-8 文本".to_string())?;
     Ok((status, body))
   }
 
@@ -629,92 +586,45 @@ pub async fn check_for_updates(app: &AppHandle) -> Result<UpdateCheckResult, Str
   let platform_key = crate::platform::current_platform_name();
   let user_agent = format!("multi-agent-account-manager/{current_version}");
 
-  if let Ok((200..=299, body)) = fetch_text_with_status(
+  // 只信任已签名的更新清单：取回失败、非 2xx、验签失败、解析失败一律
+  // fail-closed 报错，绝不回退读未签名的 GitHub Releases API——回退会
+  // 让攻击者仅靠发一个不带 latest.json 的 Release 就绕过签名门。
+  let (status, body) = fetch_text_with_status(
     app,
     &latest_manifest_url(&repo),
     &user_agent,
     Some("application/json"),
   )
-  .await
-  {
-    // 清单取回成功：必须先验签（latest.json.minisig），签名缺失/无效直接拒绝，
-    // 不回退到 GitHub API——回退会绕过签名门。
-    verify_manifest_signature(app, &repo, &user_agent, body.as_bytes()).await?;
-    if let Ok(manifest) = serde_json::from_str::<LatestManifest>(&body) {
-      let latest_version = clean_version(&manifest.version).to_string();
-      let asset = manifest.platforms.get(platform_key);
-      let has_update = is_newer_version(&current_version, &latest_version);
-      return Ok(UpdateCheckResult {
-        current_version,
-        latest_version: if latest_version.is_empty() {
-          app.package_info().version.to_string()
-        } else {
-          latest_version
-        },
-        has_update,
-        release_notes: manifest.notes,
-        pub_date: manifest.pub_date,
-        download_url: asset.map(|a| a.url.clone()),
-        sha256: asset.and_then(|a| extract_sha256_digest(a.sha256.as_deref())),
-        filename: asset.and_then(|a| a.filename.clone()),
-        size: asset.and_then(|a| a.size),
-        release_page_url: manifest
-          .release_page_url
-          .unwrap_or_else(|| releases_page_url(&repo)),
-        updates_disabled: false,
-      });
-    }
-  }
-
-  let (status, body) = fetch_text_with_status(
-    app,
-    &github_latest_api_url(&repo),
-    &user_agent,
-    Some("application/vnd.github+json"),
-  )
   .await?;
-
-  if status == 404 {
-    return Ok(UpdateCheckResult {
-      current_version: current_version.clone(),
-      latest_version: current_version,
-      has_update: false,
-      release_notes: "当前仓库尚未发布任何 GitHub Release 版本。".to_string(),
-      pub_date: None,
-      download_url: None,
-      sha256: None,
-      filename: None,
-      size: None,
-      release_page_url: releases_page_url(&repo),
-      updates_disabled: false,
-    });
-  }
-
   if !(200..=299).contains(&status) {
-    return Err(format!("检查更新失败（GitHub API HTTP {status}）"));
+    return Err(format!(
+      "未找到已签名的更新清单（HTTP {status}），拒绝检查更新"
+    ));
   }
-
-  let release: GithubRelease =
-    serde_json::from_str(&body).map_err(|e| format!("解析更新信息失败: {e}"))?;
-  let latest_version = clean_version(&release.tag_name).to_string();
+  // 清单取回成功：必须先验签（latest.json.minisig），签名缺失/无效直接拒绝。
+  verify_manifest_signature(app, &repo, &user_agent, body.as_bytes()).await?;
+  let manifest = serde_json::from_str::<LatestManifest>(&body)
+    .map_err(|e| format!("解析已签名的更新清单失败: {e}"))?;
+  let latest_version = clean_version(&manifest.version).to_string();
+  let asset = manifest.platforms.get(platform_key);
   let has_update = is_newer_version(&current_version, &latest_version);
-  let asset = select_github_asset(&release.assets, platform_key);
-
   Ok(UpdateCheckResult {
-    current_version: current_version.clone(),
+    current_version,
     latest_version: if latest_version.is_empty() {
-      current_version
+      app.package_info().version.to_string()
     } else {
       latest_version
     },
     has_update,
-    release_notes: release.body.unwrap_or_default(),
-    pub_date: release.published_at,
-    download_url: asset.map(|a| a.browser_download_url.clone()),
-    sha256: asset.and_then(|a| extract_sha256_digest(a.digest.as_deref())),
-    filename: asset.map(|a| a.name.clone()),
-    size: asset.map(|a| a.size),
-    release_page_url: release.html_url.unwrap_or_else(|| releases_page_url(&repo)),
+    release_notes: manifest.notes,
+    pub_date: manifest.pub_date,
+    download_url: asset.map(|a| a.url.clone()),
+    sha256: asset.and_then(|a| extract_sha256_digest(a.sha256.as_deref())),
+    filename: asset.and_then(|a| a.filename.clone()),
+    size: asset.and_then(|a| a.size),
+    release_page_url: manifest
+      .release_page_url
+      .unwrap_or_else(|| releases_page_url(&repo)),
     updates_disabled: false,
   })
 }
@@ -747,6 +657,8 @@ fn emit_progress(
 /// 流式循环里按已下载量硬停，避免无限下载撑满磁盘。清单里声明的
 /// size 仅作展示，不作为放行依据。
 const MAX_UPDATE_DOWNLOAD_BYTES: u64 = 512 * 1024 * 1024;
+/// 文本型更新响应（清单 / .minisig）的字节上限，与移动端 fetchText 一致。
+const MAX_UPDATE_TEXT_BYTES: usize = 2 * 1024 * 1024;
 
 #[cfg(desktop)]
 async fn download_to_updates_cache(
@@ -1466,10 +1378,6 @@ mod tests {
       "https://github.com/my-org/my-fork/releases/latest/download/latest.json"
     );
     assert_eq!(
-      github_latest_api_url(repo),
-      "https://api.github.com/repos/my-org/my-fork/releases/latest"
-    );
-    assert_eq!(
       releases_page_url(repo),
       "https://github.com/my-org/my-fork/releases"
     );
@@ -1661,7 +1569,6 @@ mod tests {
     // 合法的重定向目标（任务书 P0-2-4 的用例）。
     for raw in [
       "https://github.com/my-org/my-fork/releases/download/v1.0.0/app.tar.gz",
-      "https://api.github.com/repos/my-org/my-fork/releases/latest",
       "https://objects.githubusercontent.com/123456/app.tar.gz?X-Amz-Algorithm=AWS4-HMAC-SHA256",
       "https://release-assets.githubusercontent.com/123456/app.tar.gz",
     ] {
@@ -1670,6 +1577,7 @@ mod tests {
     }
     for raw in [
       "http://github.com/my-org/my-fork/releases/download/v1.0.0/app.tar.gz",
+      "https://api.github.com/repos/my-org/my-fork/releases/latest",
       "https://evil.com/app.tar.gz",
       "https://github.com.evil.com/app.tar.gz",
       "https://objects.githubusercontent.com.evil.com/app.tar.gz",
