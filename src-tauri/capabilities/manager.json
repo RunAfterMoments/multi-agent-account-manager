@@ -28,6 +28,7 @@
     "allow-restore-config-from-backup",
     "allow-trigger-quota-sync",
     "allow-update-app-settings",
+    "allow-set-sidebar-collapsed",
     "allow-select-group-chat",
     "allow-create-group-chat",
     "allow-update-group-chat",

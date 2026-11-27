@@ -20,6 +20,7 @@ const APP_COMMANDS: &[&str] = &[
   "restore_config_from_backup",
   "trigger_quota_sync",
   "update_app_settings",
+  "set_sidebar_collapsed",
   "select_group_chat",
   "create_group_chat",
   "update_group_chat",
@@ -64,7 +65,11 @@ fn main() {
   // 集成测试目标，本 crate 只有 lib 内单元测试，v6.1.3 因此在 clippy 步
   // 就被拒（invalid instruction）。只在 Windows 宿主上发 link.exe 参数：
   // MinGW 交叉链接和 lld-link 都消化不了 /MANIFESTINPUT（后者还要外挂 mt.exe）。
-  if cfg!(target_os = "windows") {
+  // 宿主门 + 目标门缺一不可：宿主不是 Windows（cargo-xwin）时没有 link.exe；
+  // 目标不是 MSVC（Windows 上交叉编 MinGW/Android）时链接器也不是 link.exe。
+  let is_windows_msvc_target = std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
+    && std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc");
+  if cfg!(target_os = "windows") && is_windows_msvc_target {
     let manifest = std::path::PathBuf::from(
       std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set by cargo"),
     )
