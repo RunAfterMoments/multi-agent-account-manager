@@ -322,11 +322,6 @@ impl SessionManager {
     let Ok(scale) = main_win.scale_factor() else {
       return;
     };
-    let (win_w, win_h) = (
-      (phys_size.width as f64) / scale,
-      (phys_size.height as f64) / scale,
-    );
-    let _ = (win_w, win_h);
 
     // 折叠态只留 68px 服务栏（与 styles.css 的 .service-rail 同宽），
     // 账号 WebView 多出 312px。manager 与账号 WebView 的 bounds、
@@ -338,8 +333,8 @@ impl SessionManager {
     } else {
       LEFT_PANE_WIDTH
     };
-    let left_phys = ((left_logical * scale).round().max(0.0) as u32).min(phys_size.width);
-    let right_phys = phys_size.width.saturating_sub(left_phys);
+    let (left_phys, right_phys, height_phys) =
+      Self::desktop_right_rect(phys_size.width, phys_size.height, scale, left_logical);
 
     let active_committed_label = locked.active_slot.as_ref().and_then(|slot| {
       if slot.committed {
@@ -381,50 +376,26 @@ impl SessionManager {
       }
     }
 
-    for entry in locked.warm_pool.values() {
-      let keep_visible = Some(&entry.webview_label) == active_committed_label.as_ref()
-        || (stage_loading_behind && Some(&entry.webview_label) == active_loading_label.as_ref());
-      let keep_group_behind = group_work_behind
-        && locked
-          .in_flight_group_members
-          .contains_key(&entry.account_key);
-      if keep_group_behind {
-        if let Some(wv) = app.get_webview(&entry.webview_label) {
-          let _ = wv.set_bounds(tauri::Rect {
-            position: tauri::PhysicalPosition::new(left_phys as i32, 0).into(),
-            size: tauri::PhysicalSize::new(right_phys, phys_size.height).into(),
-          });
-          let _ = wv.show();
-        }
-      } else if !keep_visible {
-        if let Some(wv) = app.get_webview(&entry.webview_label) {
-          let _ = wv.hide();
-        }
-      }
-    }
-
-    #[cfg(target_os = "macos")]
-    if group_work_behind {
-      if let Some(mgr_wv) = app.get_webview("manager") {
-        platform::raise_macos_webview_to_front(&mgr_wv);
-      }
-    }
-
-    if let Some(active_label) = active_committed_label {
+    // 切号黑闪修复：先显新号、再藏旧号。旧顺序是循环里先 hide 旧
+    // WebView、最后才 show 新号，中间几帧右侧裸露出下层主窗口；
+    // 现在先把新号 set_bounds + show，再去藏旧号——任何一帧都至少
+    // 有一个 WebView 盖住右侧，不留空窗（z 序不影响：旧号盖在上面
+    // 时画面仍是旧号内容，藏掉后即露出已就位的新号）。
+    if let Some(active_label) = active_committed_label.as_ref() {
       if let Some(mgr_wv) = app.get_webview("manager") {
         let _ = mgr_wv.set_bounds(tauri::Rect {
           position: tauri::PhysicalPosition::new(0, 0).into(),
-          size: tauri::PhysicalSize::new(left_phys, phys_size.height).into(),
+          size: tauri::PhysicalSize::new(left_phys, height_phys).into(),
         });
       }
 
-      if let Some(acc_wv) = app.get_webview(&active_label) {
+      if let Some(acc_wv) = app.get_webview(active_label) {
         if right_phys <= 1 {
           let _ = acc_wv.hide();
         } else {
           let _ = acc_wv.set_bounds(tauri::Rect {
             position: tauri::PhysicalPosition::new(left_phys as i32, 0).into(),
-            size: tauri::PhysicalSize::new(right_phys, phys_size.height).into(),
+            size: tauri::PhysicalSize::new(right_phys, height_phys).into(),
           });
           let _ = acc_wv.show();
         }
@@ -448,12 +419,60 @@ impl SessionManager {
           if let Some(loading_wv) = app.get_webview(&loading_label) {
             let _ = loading_wv.set_bounds(tauri::Rect {
               position: tauri::PhysicalPosition::new(left_phys as i32, 0).into(),
-              size: tauri::PhysicalSize::new(right_phys, phys_size.height).into(),
+              size: tauri::PhysicalSize::new(right_phys, height_phys).into(),
             });
             let _ = loading_wv.show();
             platform::raise_macos_webview_to_front(&mgr_wv);
           }
         }
+      }
+    }
+
+    // 切号黑闪修复：只要右侧矩形变化，就把 warm_pool 里所有隐藏保活
+    // 的 WebView 也同步 set_bounds 到最新右侧尺寸（保持 hide 状态），
+    // 切过去之前 Chromium 早就按正确宽度排好版，不再现算。
+    // 矩形未变时跳过，避免 Moved 等事件重复下发（set_bounds 本身不贵，
+    // 但隐藏页收到新尺寸会触发 Chromium 重排，没必要每事件都做）。
+    let rect_changed =
+      locked.last_desktop_right_rect.get() != Some((left_phys, right_phys, height_phys));
+    if rect_changed {
+      locked
+        .last_desktop_right_rect
+        .set(Some((left_phys, right_phys, height_phys)));
+    }
+
+    for entry in locked.warm_pool.values() {
+      let keep_visible = Some(&entry.webview_label) == active_committed_label.as_ref()
+        || (stage_loading_behind && Some(&entry.webview_label) == active_loading_label.as_ref());
+      let keep_group_behind = group_work_behind
+        && locked
+          .in_flight_group_members
+          .contains_key(&entry.account_key);
+      if keep_group_behind {
+        if let Some(wv) = app.get_webview(&entry.webview_label) {
+          let _ = wv.set_bounds(tauri::Rect {
+            position: tauri::PhysicalPosition::new(left_phys as i32, 0).into(),
+            size: tauri::PhysicalSize::new(right_phys, height_phys).into(),
+          });
+          let _ = wv.show();
+        }
+      } else if !keep_visible {
+        if let Some(wv) = app.get_webview(&entry.webview_label) {
+          if rect_changed {
+            let _ = wv.set_bounds(tauri::Rect {
+              position: tauri::PhysicalPosition::new(left_phys as i32, 0).into(),
+              size: tauri::PhysicalSize::new(right_phys, height_phys).into(),
+            });
+          }
+          let _ = wv.hide();
+        }
+      }
+    }
+
+    #[cfg(target_os = "macos")]
+    if group_work_behind {
+      if let Some(mgr_wv) = app.get_webview("manager") {
+        platform::raise_macos_webview_to_front(&mgr_wv);
       }
     }
   }
@@ -744,14 +763,46 @@ impl SessionManager {
 
     if provider_spec.info.id.is_hark() {
       builder = builder.background_color(tauri::webview::Color(23, 29, 47, 255));
+    } else {
+      // 账号页本身是浅色站（Muse/Claude 等）：未绘区域给白底，
+      // 切号瞬间不再露出 WebView2 默认黑底。Hark 站本身是深色，
+      // 保持上面的深色底。
+      builder = builder.background_color(tauri::webview::Color(255, 255, 255, 255));
     }
 
     builder
   }
 
+  /// 桌面右侧区域物理矩形（纯函数，便于单测）：
+  /// (left_phys, right_phys, height_phys)。
+  #[cfg(desktop)]
+  pub(super) fn desktop_right_rect(
+    phys_width: u32,
+    phys_height: u32,
+    scale: f64,
+    left_logical: f64,
+  ) -> (u32, u32, u32) {
+    let left_phys = ((left_logical * scale).round().max(0.0) as u32).min(phys_width);
+    let right_phys = phys_width.saturating_sub(left_phys);
+    (left_phys, right_phys, phys_height)
+  }
+
+  /// 隐藏子 WebView 初始尺寸（纯函数，便于单测）：
+  /// 宽 = 窗口宽 - 当前真实左栏宽（下限 600），高 = 窗口高（下限 400）。
+  /// 左栏宽必须取调用时真实的折叠态：折叠时 68px，展开时 380px；
+  /// 写死 LEFT_PANE_WIDTH 会让折叠态下创建的 WebView 窄 312px，
+  /// 切号时才 set_bounds + show，Chromium 重绘前露出黑底（切号黑闪主因）。
+  #[cfg(desktop)]
+  fn hidden_child_size(win_w: f64, win_h: f64, left_logical: f64) -> (f64, f64) {
+    let left_w = win_w.min(left_logical);
+    let right_w = (win_w - left_w).max(600.0);
+    (right_w, win_h.max(400.0))
+  }
+
   #[cfg(desktop)]
   pub(super) fn initial_hidden_child_rect(
     main_win: &tauri::Window,
+    left_logical: f64,
   ) -> (tauri::LogicalPosition<f64>, tauri::LogicalSize<f64>) {
     let (win_w, win_h) = match (main_win.inner_size(), main_win.scale_factor()) {
       (Ok(phys), Ok(scale)) if scale > 0.0 => {
@@ -759,11 +810,10 @@ impl SessionManager {
       }
       _ => (1280.0, 800.0),
     };
-    let left_w = win_w.min(LEFT_PANE_WIDTH);
-    let right_w = (win_w - left_w).max(600.0);
+    let (right_w, height) = Self::hidden_child_size(win_w, win_h, left_logical);
     (
       tauri::LogicalPosition::new(win_w.max(2000.0) + 1000.0, 0.0),
-      tauri::LogicalSize::new(right_w, win_h.max(400.0)),
+      tauri::LogicalSize::new(right_w, height),
     )
   }
 
@@ -811,7 +861,18 @@ impl SessionManager {
     let main_win = app
       .get_window("main")
       .ok_or_else(|| "主窗口不存在".to_string())?;
-    let (init_pos, init_size) = Self::initial_hidden_child_rect(&main_win);
+    // 创建时就按当前真实折叠态算宽：折叠 68px，展开 380px。
+    // 写死 LEFT_PANE_WIDTH 会让折叠态下创建的 WebView 窄 312px，
+    // 切号时才放大，Chromium 重绘前露出黑底。
+    let left_logical = {
+      let locked = self.inner.lock().await;
+      if Self::is_sidebar_effectively_collapsed(&locked) {
+        SERVICE_RAIL_WIDTH
+      } else {
+        LEFT_PANE_WIDTH
+      }
+    };
+    let (init_pos, init_size) = Self::initial_hidden_child_rect(&main_win, left_logical);
     #[cfg(windows)]
     let retry_until = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
 
@@ -1726,5 +1787,58 @@ impl SessionManager {
         .map(|s| s.account_key == *key && s.view_instance_id == view_instance_id)
         .unwrap_or(false)
     }
+  }
+}
+
+#[cfg(test)]
+#[cfg(desktop)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn desktop_right_rect_expanded_collapsed_and_narrow() {
+    // 1920x1200 逻辑 @125%（2400x1500 物理）：展开左栏 380 -> 475，
+    // 折叠 68 -> 85；高度取物理高。
+    assert_eq!(
+      SessionManager::desktop_right_rect(2400, 1500, 1.25, LEFT_PANE_WIDTH),
+      (475, 1925, 1500)
+    );
+    assert_eq!(
+      SessionManager::desktop_right_rect(2400, 1500, 1.25, SERVICE_RAIL_WIDTH),
+      (85, 2315, 1500)
+    );
+    // 100% 下 1280x800：展开右宽 900。
+    assert_eq!(
+      SessionManager::desktop_right_rect(1280, 800, 1.0, LEFT_PANE_WIDTH),
+      (380, 900, 800)
+    );
+    // 窗口比左栏还窄：左栏钳到窗口宽，右宽 0（不下溢）。
+    assert_eq!(
+      SessionManager::desktop_right_rect(300, 800, 1.0, LEFT_PANE_WIDTH),
+      (300, 0, 800)
+    );
+  }
+
+  #[test]
+  fn hidden_child_size_uses_real_left_width() {
+    // 1920x1200：展开右宽 1540；折叠右宽 1852（旧代码写死 380 时
+    // 折叠态只有 1540，窄 312px——切号黑闪主因）。
+    assert_eq!(
+      SessionManager::hidden_child_size(1920.0, 1200.0, LEFT_PANE_WIDTH),
+      (1540.0, 1200.0)
+    );
+    assert_eq!(
+      SessionManager::hidden_child_size(1920.0, 1200.0, SERVICE_RAIL_WIDTH),
+      (1852.0, 1200.0)
+    );
+    // 窄窗口宽下限 600、矮窗口高下限 400。
+    assert_eq!(
+      SessionManager::hidden_child_size(700.0, 800.0, LEFT_PANE_WIDTH),
+      (600.0, 800.0)
+    );
+    assert_eq!(
+      SessionManager::hidden_child_size(1280.0, 300.0, LEFT_PANE_WIDTH),
+      (900.0, 400.0)
+    );
   }
 }

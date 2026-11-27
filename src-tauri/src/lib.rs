@@ -738,16 +738,26 @@ pub fn run() {
           })
           .build(app)?;
 
+        // 切号黑闪修复第 3 步：主窗口与 manager 默认背景色按系统主题取
+        // 浅色白 / 深色 #0f141f（--stage-bg），未绘区域不再是黑底。
+        let window_bg = if platform::system_uses_dark_theme() {
+          tauri::webview::Color(15, 20, 31, 255)
+        } else {
+          tauri::webview::Color(255, 255, 255, 255)
+        };
+
         let main_window = tauri::window::WindowBuilder::new(app, "main")
           .title(APP_TITLE)
           .inner_size(1240.0, 800.0)
           .min_inner_size(760.0, 520.0)
+          .background_color(window_bg)
           .build()?;
 
         let manager_builder = tauri::webview::WebviewBuilder::new(
           "manager",
           tauri::WebviewUrl::App("index.html".into()),
         )
+        .background_color(window_bg)
         .disable_drag_drop_handler()
         .on_navigation(|url| {
           url.scheme() == "tauri"
@@ -803,6 +813,11 @@ pub fn run() {
           "manager",
           tauri::WebviewUrl::App("index.html".into()),
         )
+        .background_color(if platform::system_uses_dark_theme() {
+          tauri::webview::Color(15, 20, 31, 255)
+        } else {
+          tauri::webview::Color(255, 255, 255, 255)
+        })
         // 与桌面端同款导航锁：manager 只允许加载应用自身页面，
         // 外站链接一律不许在 manager 内打开（走 open_external_url）。
         .on_navigation(|url| {

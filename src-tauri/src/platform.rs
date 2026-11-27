@@ -31,6 +31,50 @@ pub fn current_platform_name() -> &'static str {
   }
 }
 
+/// 系统是否正在用深色主题（切号黑闪修复第 3 步：主窗口与 manager
+/// WebView 的默认背景色按此取浅色白 / 深色 #0f141f）。
+/// 只读操作系统级主题：应用内主题覆盖（localStorage 里的 themeMode）
+/// Rust 侧读不到，默认值 "system" 时与这里一致；用户在应用内手动
+/// 改过主题时两者可能不一致——背景色只是残留空隙的兜底，1 帧的
+/// 色差可接受。读不到时默认浅色。
+pub fn system_uses_dark_theme() -> bool {
+  #[cfg(windows)]
+  {
+    use windows::core::HSTRING;
+    use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
+    // AppsUseLightTheme 是 REG_DWORD：0 = 深色，1 = 浅色。
+    let subkey = HSTRING::from(r"SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize");
+    let value_name = HSTRING::from("AppsUseLightTheme");
+    let mut value: u32 = 1;
+    let mut size = size_of::<u32>() as u32;
+    let result = unsafe {
+      RegGetValueW(
+        HKEY_CURRENT_USER,
+        &subkey,
+        &value_name,
+        RRF_RT_REG_DWORD,
+        None,
+        Some((&mut value as *mut u32).cast()),
+        Some(&mut size),
+      )
+    };
+    result.ok().is_ok() && value == 0
+  }
+  #[cfg(target_os = "macos")]
+  {
+    use objc2_foundation::{NSString, NSUserDefaults};
+    let defaults = NSUserDefaults::standardUserDefaults();
+    let key = NSString::from_str("AppleInterfaceStyle");
+    defaults
+      .stringForKey(&key)
+      .is_some_and(|v| v.to_string() == "Dark")
+  }
+  #[cfg(not(any(windows, target_os = "macos")))]
+  {
+    false
+  }
+}
+
 #[cfg(desktop)]
 pub fn open_external_browser(url: &str) -> Result<(), String> {
   open::that_detached(url).map_err(|e| format!("打开系统浏览器失败: {e}"))

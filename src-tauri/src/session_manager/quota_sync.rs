@@ -15,6 +15,8 @@
 #[cfg(desktop)]
 use super::PendingExternalAuth;
 #[cfg(desktop)]
+use super::LEFT_PANE_WIDTH;
+#[cfg(desktop)]
 use super::{DesktopProbeResult, IDENTITY_PROBE_JS};
 use super::{InnerState, ManagerSnapshot, SessionManager};
 #[cfg(desktop)]
@@ -220,7 +222,8 @@ impl SessionManager {
       builder = b;
     }
 
-    let (position, size) = Self::initial_hidden_child_rect(&window);
+    // 临时视图永不显示：尺寸只影响探测页排版，沿用旧的展开宽即可。
+    let (position, size) = Self::initial_hidden_child_rect(&window, LEFT_PANE_WIDTH);
     let Ok(temp_wv) = window.add_child(builder, position, size) else {
       return;
     };

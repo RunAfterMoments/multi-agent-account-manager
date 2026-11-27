@@ -3288,6 +3288,16 @@ body,
   transform: translateY(0);
 }
 
+/* 平板/触屏：没有 hover，消息旁的同步/沉淀按钮否则永远点不到
+   （与 .row-ops 的 hover:none 兜底同款；只补可见性，不改尺寸）。 */
+@media (hover: none) {
+  .group-bubble .group-save-ctx-wrap {
+    opacity: 1;
+    pointer-events: auto;
+    transform: translateY(0);
+  }
+}
+
 @keyframes group-sync-spin {
   to {
     transform: rotate(360deg);

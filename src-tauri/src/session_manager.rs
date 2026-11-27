@@ -200,6 +200,15 @@ struct InnerState {
   /// 本轮不再被自动接力，重启后恢复）。
   #[cfg(desktop)]
   a2a_relay_in_flight: HashMap<String, HashSet<AccountKey>>,
+  /// 上次下发给隐藏保活 WebView 的右侧物理矩形
+  /// (left_phys, right_phys, height_phys)：只在矩形变化时才对
+  /// warm_pool 里的隐藏项重发 set_bounds（切号黑闪修复）。
+  /// Cell 而非 &mut InnerState：apply_desktop_layout_locked 有
+  /// 18 处调用点且只拿到 &InnerState，改签名会波及所有调用方；
+  /// InnerState 只在 tokio Mutex 锁内访问，同一时刻最多一个持有者，
+  /// Cell 在此是安全的。
+  #[cfg(desktop)]
+  last_desktop_right_rect: std::cell::Cell<Option<(u32, u32, u32)>>,
   #[cfg_attr(not(desktop), allow(dead_code))]
   group_channel_last_account: HashMap<(String, ProviderId), AccountKey>,
   #[cfg_attr(not(desktop), allow(dead_code))]
@@ -324,6 +333,8 @@ impl SessionManager {
         group_member_locks: HashMap::new(),
         #[cfg(desktop)]
         a2a_relay_in_flight: HashMap::new(),
+        #[cfg(desktop)]
+        last_desktop_right_rect: std::cell::Cell::new(None),
         group_channel_last_account: HashMap::new(),
         account_last_assigned_ms: HashMap::new(),
         account_cooldown_until_ms: HashMap::new(),
@@ -1151,7 +1162,8 @@ impl SessionManager {
         .focused(false);
         let builder =
           platform::with_windows_account_proxy(builder, proxy.as_ref(), &app.config().identifier)?;
-        let (position, size) = Self::initial_hidden_child_rect(&window);
+        // 临时视图永不显示：尺寸只影响探测页排版，沿用旧的展开宽即可。
+        let (position, size) = Self::initial_hidden_child_rect(&window, LEFT_PANE_WIDTH);
         let webview = window
           .add_child(builder, position, size)
           .map_err(|_| "无法打开该账号的会话资料，请重试".to_string())?;
@@ -1230,7 +1242,8 @@ impl SessionManager {
               &app.config().identifier,
             )?;
           }
-          let (position, size) = Self::initial_hidden_child_rect(&window);
+          // 临时视图永不显示：尺寸只影响探测页排版，沿用旧的展开宽即可。
+          let (position, size) = Self::initial_hidden_child_rect(&window, LEFT_PANE_WIDTH);
           let temp_wv = window
             .add_child(builder, position, size)
             .map_err(|_| "无法创建 Cookie 导入视图，请重试".to_string())?;
@@ -2254,8 +2267,13 @@ impl SessionManager {
         Abort(ManagerSnapshot),
       }
 
-      // 桌面 switch 的 detach 点（pending 清理分支与主路径）互斥，
-      // 任一走到 plan 后的路径都已赋值一次；let-else 分支在块内就地执行。
+      // 桌面 switch 的 detach 点：各分支按需调用，任一走到 plan 后
+      // 的路径都已赋值一次；let-else 分支在块内就地执行。
+      // 切号黑闪修复：旧账号的 hide 不再先于热池判断执行——
+      // InstantWarm 热切路径先写盘（旧画面继续显示），写盘成功后
+      // 再一次性 detach + 提交新槽位 + 布画；写盘失败直接 Abort，
+      // 旧画面原地不动。其它分支（加载中 / 冷创建）在提交前 detach，
+      // 与旧行为一致。
       let hide_op;
       let plan = {
         let mut locked = self.inner.lock().await;
@@ -2293,7 +2311,6 @@ impl SessionManager {
           locked.selected_provider_id = key.provider_id.clone();
           locked.notice = None;
           locked.prewarm_failed.remove(&key);
-          hide_op = self.detach_foreground_slot_locked(app, next_seq, &mut locked);
 
           let warm_state = locked.warm_pool.get(&key).and_then(|entry| {
             if app.get_webview(&entry.webview_label).is_some() {
@@ -2331,6 +2348,7 @@ impl SessionManager {
             if needs_stage_paint {
               #[cfg(target_os = "macos")]
               {
+                hide_op = self.detach_foreground_slot_locked(app, next_seq, &mut locked);
                 if let Some(entry) = locked.warm_pool.get_mut(&key) {
                   entry.last_used_ms = now_ms();
                 }
@@ -2356,14 +2374,19 @@ impl SessionManager {
             } else if paint_ready {
               let prev_last = locked.store.last_committed.clone();
               locked.store.last_committed = Some(key.clone());
+              // 热切先写盘：此时旧槽位仍在、旧画面继续显示，不先藏。
               drop(locked);
               if let Err(err) = self.persist_now().await {
                 let mut locked = self.inner.lock().await;
                 locked.store.last_committed = prev_last;
                 locked.notice = Some(format!("提交账号记录写盘失败: {err}"));
+                // 写盘失败不切换：不 detach，旧画面原地不动。
+                hide_op = None;
                 DesktopSwitchPlan::Abort(Self::snapshot_from_locked(&locked))
               } else {
                 let mut locked = self.inner.lock().await;
+                // 写盘成功再一次性切换：detach 旧号 + 提交新槽位 + 布画。
+                hide_op = self.detach_foreground_slot_locked(app, next_seq, &mut locked);
                 locked
                   .last_active_per_provider
                   .insert(key.provider_id.clone(), key.clone());
@@ -2393,6 +2416,7 @@ impl SessionManager {
                 }
               }
             } else {
+              hide_op = self.detach_foreground_slot_locked(app, next_seq, &mut locked);
               if let Some(entry) = locked.warm_pool.get_mut(&key) {
                 entry.last_used_ms = now_ms();
               }
@@ -2409,6 +2433,7 @@ impl SessionManager {
               }
             }
           } else {
+            hide_op = self.detach_foreground_slot_locked(app, next_seq, &mut locked);
             if let Some(entry) = locked.warm_pool.remove(&key) {
               Self::close_warm_entry(app, entry);
             }

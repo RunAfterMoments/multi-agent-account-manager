@@ -1859,3 +1859,51 @@ check 上会多 3 条 `dead_code`/`unused import` 警告。全部补
 - Windows 真机复测：MSIX 版 `python.exe` 的 `.cmd` 成员点「停止」后 0 残留（手工步骤已补进 `docs/hardening-notes-cli.md` 的 P1-5(b)），以及 Win32 `node.exe` 对照复测——需用户在 Win 机上跑（本机无 Windows）。
 - M-08 高亮选中（`CoInitializeEx(...).is_ok()` 的真跑验证）：等 v1.0.0 出来顺手验。
 - 未升版本号、未打 tag——v1.0.0 正式切版等 macOS/Android/iOS 三端验收都 Go；minisign 的事未碰（仍等用户定）。
+
+## 二十四、Windows WebView2 切号黑闪 + 平板触屏 CSS（Phase 4 验收，用户真机定位根因，2026-11-27 晚）
+
+### 1. 现象与根因（用户 Win11 实机定位，仓库代码逐项核对，行号以仓库为准）
+
+切号时右侧先黑一下、再闪一下才铺满。三个叠加原因：
+
+- **主因：热池里隐藏保活的账号 WebView 没跟随窗口尺寸更新。** `apply_desktop_layout_locked`（`session_manager/webview.rs`）只对当前激活的 WebView 调 `set_bounds`，其余隐藏项只 `hide()`，停留在创建时的旧尺寸；`initial_hidden_child_rect` 还写死了 `LEFT_PANE_WIDTH`（380px），折叠态（68px 服务栏）下创建的 WebView 窄 312px。切号时同一瞬间 `set_bounds(新宽) + show()`：Win32 立刻按新宽度显示窗口，但 Chromium 渲染器里还是旧宽度画面，右侧多出区域在重绘完成前的 50–150ms 露出 WebView2 默认黑色底板，重绘完再闪一下铺满。
+- **次因：切号顺序是先藏旧号 → 写盘 → 再显新号。** `switch_account_internal`（`session_manager.rs`）在还没判断目标是否已在热池时就先调 `detach_foreground_slot_locked` 把旧账号 `hide()` 掉；`apply_desktop_layout_locked` 里也是循环先 hide 旧的、最后才 show 新的，中间几帧裸露出下层主窗口。
+- **兜底缺失：主窗口和 Muse WebView 未设背景色。** `lib.rs` 的主窗口和 `webview.rs` 的 Muse 分支都没设 `.background_color(...)`（只有 Hark 设了深色），Windows DirectComposition 未绘区域默认显黑色，任何 1 帧空隙都变黑边。
+
+### 2. 修复（3 步 + 平板 CSS，8 文件）
+
+**第 1 步——热池统一同步真实尺寸（治本，`session_manager/webview.rs` + `session_manager.rs`）：**
+
+- `initial_hidden_child_rect` 改为接收当前真实 `left_logical`（`attach_desktop_account_webview` 创建时短锁取 `is_sidebar_effectively_collapsed`：折叠 68px / 展开 380px）。另 3 处调用点是 Cookie 复制/导入与 quota 探测的临时视图（永不显示，尺寸只影响探测页排版），沿用旧的 `LEFT_PANE_WIDTH`——其中 `read_windows_cookies_for_url` 的 1A 设计明确不再碰 `inner` 锁，不为它加锁。
+- `apply_desktop_layout_locked` 里缓存上次下发的 `(left_phys, right_phys, height_phys)`（`InnerState.last_desktop_right_rect`，见下）；只要矩形变化，就把 `warm_pool` 里所有隐藏保活的 WebView 也同步 `set_bounds` 到最新右侧尺寸（坐标 `(left_phys, 0)`，保持 `hide()` 状态），切过去之前 Chromium 早就按正确宽度排好版。矩形未变时跳过，避免 `Moved` 等事件重复下发。
+- 矩形计算抽成纯函数 `desktop_right_rect`、初始尺寸抽成 `hidden_child_size`，各 2 条单测（展开/折叠/窄窗口钳制、600×400 下限）。
+- 缓存用 `Cell<Option<(u32, u32, u32)>>` 而非 `&mut InnerState`：`apply_desktop_layout_locked` 有 18 处调用点且只拿到 `&InnerState`，改签名会波及所有调用方（含 `group_chat.rs` 里拿 `&InnerState` 参数的函数）；`InnerState` 只在 tokio Mutex 锁内访问，同一时刻最多一个持有者，Cell 在此安全。Linux/Windows clippy 与 132 个单测均已验证无 `!Sync` 问题。
+
+**第 2 步——先显新号、再藏旧号（消空窗）：**
+
+- `apply_desktop_layout_locked` 重排：先把新 `acc_wv` `set_bounds + show()`（manager 同步缩到左栏），再循环藏旧号。任何一帧都至少有一个 WebView 盖住右侧。macOS 的 `group_work_behind` / `stage_loading_behind` 分支原样保留（`keep_group_behind` 只在无已提交活动号时为真，与新顺序无冲突）。
+- `switch_account_internal` 的 InstantWarm 热切路径：`detach` 不再先于热池判断执行，改为各分支按需调用——热切先写盘（旧画面继续显示），`persist_now` 成功后再一次性 detach + 提交新槽位 + 布画；写盘失败直接 Abort 且不 detach，旧画面原地不动。加载中（`StageWarmPaint` / `AwaitWarmLoading`）与冷创建分支在提交前 detach，与旧行为一致。`hide_op` 的“任一走到 plan 后的路径都已赋值一次”不变式由编译器保证（桌面端 detach 返回 `None`，`execute_hide_slot` 本就是空操作）。
+
+**第 3 步——补默认背景色（消黑底，`lib.rs` + `platform.rs` + `webview.rs` + `Cargo.toml`）：**
+
+- 主窗口与 manager WebView：按系统主题取浅色白 `Color(255, 255, 255, 255)` / 深色 `#0f141f`（`--stage-bg`）。新增 `platform::system_uses_dark_theme()`：Windows 读注册表 `HKCU\...\Themes\Personalize\AppsUseLightTheme`（REG_DWORD，0=深色；沿用 `platform.rs` 已有的 `RegGetValueW` 模式）；macOS 读 `NSUserDefaults` 的 `AppleInterfaceStyle`（`objc2-foundation` 加 `"NSUserDefaults"` feature，两处 API 均对照 vendored 0.3.2 源码核对）；其它平台默认浅色。已知局限：应用内主题覆盖（localStorage 里的 `themeMode`）Rust 侧读不到，默认值 `"system"` 时与这里一致；用户在应用内手动改过主题时两者可能不一致——背景色只是残留空隙的兜底，1 帧色差可接受。
+- 账号 WebView（非 Hark）：白底（账号页本身是浅色站，Muse/Claude 均然）；Hark 保持原有深色底。移动端 manager 同款补色。
+
+**平板/触屏 CSS（`src/styles.css`，5 行，用户原先说的 5 行 CSS 出处找不到了，自己找的缺口）：**
+
+- 缺口：群聊消息旁的「同步最新回复 / 沉淀到共享上下文」按钮（`.group-save-ctx-wrap`）只在 `.group-bubble:hover`、`:focus-within` 或同步进行中（`.is-active`）时才可见（`opacity: 0; pointer-events: none`）。群聊视图只在桌面端有，Windows 平板（桌面壳 + 触屏、无 hover）上这两个按钮永远点不到。`.row-ops` 同样的问题已在 L995 用 `@media (hover: none)` 兜底，这里漏了——全仓搜过，这是唯一一个 hover 门控的交互控件且无触屏兜底（其余 `opacity: 0` 都是 keyframes / tooltip 装饰）。
+- 修复：同款 `@media (hover: none)`，常显该按钮组（只补可见性，不改尺寸）。另查过：窄宽布局（`.middle-column` 是 `min(312px, 100%-68px)`）、420px 断点、触摸目标（移动壳已是 30px，桌面壳 24px 是桌面常规尺寸）均无可修的真实缺口，没硬加。
+
+### 3. 验证（本机逐项重跑，全绿）
+
+- `cargo fmt --check`：通过（初版一处 `use` 换行被 fmt 指出，已跑 `cargo fmt` 修正）。
+- `cargo clippy --all-targets -- -D warnings`（Linux）：通过（仅 1 条基线 manifest 警告）。
+- `cargo clippy --target x86_64-pc-windows-gnu --all-targets -- -D warnings`：通过（仅 1 条基线 manifest 警告；macOS 的 `NSUserDefaults` 分支 Windows 编不到，由 CI 的 macOS job 覆盖）。
+- `cargo test --lib`：**132/132**（130 + 新增 2 条：`desktop_right_rect` 展开/折叠/窄窗口、`hidden_child_size` 真实左宽/上下限，均单独跑过）。
+- `npm run build`：通过；`npm run test:js`：**30/30**。
+- Gemini 当天仍不可用（未再试，沿用 v6.2 先例）：本轮代码由协调人按核实过的设计直接写，每处 API 均对照真实源码与 vendored 源码核对（`WindowBuilder::background_color` / `WebviewBuilder::background_color` / `Window::theme` 均在 tauri 2.12.6 vendored 源码中核对过签名；`RegGetValueW` / `RRF_RT_REG_DWORD` 在 windows 0.62.2 中核对；`NSUserDefaults::standardUserDefaults` / `stringForKey` / `NSString::from_str` / `Display` 在 objc2-foundation 0.3.2 中核对）。
+
+### 4. 已知未验证项
+
+- Windows 真机复测：折叠侧边栏后切号是否零黑闪（主验证项）、最大化/改 DPI 后切号、群聊消息同步/沉淀按钮在触屏上可点——需用户在 Win 机上跑（本机无 Windows，也无触屏）。
+- 未升版本号、未打 tag——v1.0.0 正式切版等 macOS/Android/iOS 三端验收都 Go；minisign 的事未碰（仍等用户定）。
