@@ -897,6 +897,10 @@ tooltip 按平台显示：macOS `⌘\`，其余 `Ctrl+\`（`IS_MAC`，
   Secret 写 0600 临时密钥文件（`trap shred -u || rm -f`）→ `minisign -S -H`
   签 5 个资产 + latest.json → `minisign -V -p minisign.pub` 逐个自检，
   失败即中断发布；发布步骤的 files 数组加 6 个 `.minisig`。
+  注意：私钥即使用空口令生成也经 scrypt 加密保存，`minisign -S` 每次都
+  要交互式问口令，CI 无 tty 会直接失败（v6.2.1 修复：签名循环改成
+  `printf '\n' | minisign -S -H …`，空行即解密通过；本机已验证空口令
+  密钥 + 管道喂空行可正常签署并通过 `minisign -V`）。
 - `MAAM_UPDATE_REPO` 的值未动，更新仍关闭。顶部注释更新为“验签已落地”。
 - CLI→Rust 互通已验：minisign CLI 0.11 签的文件，Rust `verify()`（清单）与
   `verify_stream()`（安装包）均通过，篡改文件流式验签失败。

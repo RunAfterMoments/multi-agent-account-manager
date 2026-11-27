@@ -361,7 +361,9 @@ jobs:
             "$pub_dir/latest.json"
           )
           for f in "${files[@]}"; do
-            minisign -S -H -s "$key_file" -m "$f"
+            # 私钥即使用空口令生成也经 scrypt 加密保存，minisign -S 每次都
+            # 要交互式问口令；CI 无 tty，喂一个空行即解密通过。
+            printf '\n' | minisign -S -H -s "$key_file" -m "$f"
           done
           # 自检：用仓库根目录的公钥文件逐个验签，验签失败即中断发布。
           for f in "${files[@]}"; do
