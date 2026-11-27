@@ -71,6 +71,6 @@ fn main() {
     .join("windows-app-manifest.xml");
     println!("cargo:rerun-if-changed=windows-app-manifest.xml");
     println!("cargo:rustc-link-arg=/MANIFEST:EMBED");
-    println!("cargo:rustc-link-arg=/MANIFESTINPUT={}", manifest.display());
+    println!("cargo:rustc-link-arg=/MANIFESTINPUT:{}", manifest.display());
   }
 }
