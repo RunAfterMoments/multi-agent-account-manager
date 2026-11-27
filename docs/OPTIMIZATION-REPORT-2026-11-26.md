@@ -1675,3 +1675,51 @@ check 上会多 3 条 `dead_code`/`unused import` 警告。全部补
 - `SHOpenFolderAndSelectItems` 真跑：靠 Phase 4 Windows 真机验收。
 - CI 上的真实运行（含新增的 Android check step）：本机只做了 yaml 语法校验 + 等价命令验证。
 - Gemini 当天不可用（direct REST 429 额度耗尽、CLI `service_unavailable`），本轮代码由各执行者按核实过的设计直接写（v6.2 已有先例）；协调人逐项对照真实源码与 vendored API 复核。
+
+## 二十、v1.0.0-rc1 干跑（release.yml 不发版预演，2026-11-27）
+
+### 1. dispatch 前核实（release.yml 逐项读过）
+
+- workflow_dispatch 输入：`android_variant`（choice release/debug，默认 release）、`publish_release`（boolean，默认 false）、`maam_update_repo`（string，默认 ""）。
+- publish job 的 `if` 条件：`github.ref_type == 'tag' || (workflow_dispatch && publish_release == true && android_variant == 'release')`——dispatch + `publish_release=false` 时 publish job 整段跳过：不签名（minisign 步骤在 publish job 内）、不创建/更新 Release、不上传任何资产。workflow 内没有任何创建 tag 的步骤，dispatch 本身不产生 tag。
+- 四个构建 job（desktop 矩阵 macOS + Windows、android、ios）无 `if` 条件，dispatch 全跑。
+- 干跑用到的 secrets：Android job 的 "Sign release APK" 读仓库级 `ANDROID_KEYSTORE_*`（APK 签名是构建步骤，产物只作为私有 workflow artifact 上传，不是公开 Release 资产）；`MAAM_MINISIGN_SECRET_KEY` 只在 publish job 内使用，干跑不读。
+- `MAAM_UPDATE_REPO`：dispatch 未传 `maam_update_repo`，取仓库变量（当前为空）→ 干跑编出的二进制更新检查仍关闭（与当前 main 一致）；干跑目的只是编译验证，不影响结论。
+- dispatch 命令：`gh workflow run release.yml --repo RunAfterMoments/multi-agent-account-manager --ref main -f android_variant=release -f publish_release=false`，run 45965857958，commit a715930（main，v6.5）。
+
+### 2. 干跑结果
+
+- 首次运行：Windows success（约 6m05s）、macOS success（约 9m05s）、iOS success（约 3m30s）、Android failure、Publish Release skipped；整体 failure。
+- Android 首轮失败原因（**非代码问题**）：Gradle 配置阶段解析 Kotlin 依赖时 Maven Central 返回 `429 Too Many Requests`（`kotlin-gradle-plugin-api 2.3.21` / `kotlin-gradle-plugins-bom 2.3.21` 等，`plugins.gradle.org` → `repo.maven.apache.org`）。日志 `~/workspace/multi-agent-optimization/ci-logs/release-dryrun-Android.log`。Rust 侧已编过（release profile 1m51s，`.so` 已链接进 jniLibs）；Gradle 在 `:buildSrc` 配置阶段就失败，Kotlin 代码根本没编到。
+- 处理：失败是瞬时基础设施限流，与代码无关，执行了一次失败 job 重跑（`gh run rerun 45965857958 --failed`，沿用同一次 dispatch 的输入，publish job 仍为 skipped，不产生任何公开产物）。
+- 重跑结果：Android success（job 140398800698，08:38:41→08:48:19，约 9m38s）。日志 `~/workspace/multi-agent-optimization/ci-logs/release-dryrun-Android-rerun.log`。
+- 最终：run 45965857958 整体 **success**，四端构建全部成功，Publish Release skipped。
+
+### 3. Kotlin/Swift 首次 CI 编译验证结论
+
+- **Kotlin**：重跑的 "Build release APK" 步骤从头重编 Rust（Compiling 行自 08:39:43 起），Gradle 配置通过（08:42:19 出现 `android.builtInKotlin=false` 弃用警告，说明 Gradle 已进入构建），随后 apksigner 签名 + verify 通过，workflow artifact `android-universal-release` 上传成功（16,510,300 字节）。assembleRelease 成功即证明 `AccountSessionPlugin.kt`（含 v6.3.2 改动与 v6.5 proxyUrl fail-closed）已编译通过——**这是 v6.3.2 以来 Kotlin 改动第一次在 CI 里编译**。
+- **Swift**：iOS job 成功（08:27:57→08:31:27），`build-ios-ipa.sh` 编出未签名 IPA，upload-artifact（`if-no-files-found: error`）通过——**v6.3.2 的 Keychain 改动第一次在 CI 里编译通过**。
+- Windows/macOS：desktop 矩阵成功，NSIS 与通用 DMG / `.app.tar.gz` 均产出为 workflow artifact。
+
+### 4. 无发布物核实
+
+- 干跑前后核实：最新 Release 仍是 v0.1.10（2026-11-27T03:56:40Z），最新 tag 仍是 v0.1.10；publish job 在首次运行与重跑里均为 skipped。四个构建产物仅作为私有 workflow artifact 存在（GitHub Actions artifact，非公开 Release 资产）。
+
+### 5. 用户侧操作清单（只准备，不执行）
+
+1. **创建受保护 Environment `release`**：GitHub 仓库 Settings → Environments → New environment `release`；deployment branches/tags 限制为 main 与 `v*` tags；是否加 required reviewers 由用户定。**先不要动任何 secret，等清单确认后再操作。**
+2. **移动 secrets 的决策点（minisign 密钥是关键阻塞）**：
+   - `ANDROID_KEYSTORE_*` 四个值：本地备份在 `~/workspace/multi-agent-optimization/android-keystore/`（keystore + CREDENTIALS.txt，mode 600），可以移入 Environment；移到 Environment 后从仓库级删除，避免两份并存。
+   - `MAAM_MINISIGN_SECRET_KEY`：**私钥值本地已不存在**（当初设为仓库 secret 后本地临时文件已 shred；GitHub secrets 读不回来）。所以它不能直接"移动"，只有两条路：
+     - (a) **留在仓库级不动**，只把 Android 四个移入 Environment。依据：GitHub 的文档行为——job 引用某个 Environment 时，除该环境的 secrets 外，仓库级 secrets 仍可读；加 `environment: release` 只是给 job 额外开放该环境的 secrets，不会屏蔽仓库级 secrets。所以 publish job 同时读仓库级 `MAAM_MINISIGN_SECRET_KEY` 与 Environment 的 `ANDROID_KEYSTORE_*` 是可行的。
+     - (b) **重新生成 minisign 密钥对**。但新公钥必须先随一个新版本发出去，旧客户端（v0.1.10，内置旧公钥）才能验证后续的 `latest.json`；否则 v0.1.10 客户端永远无法通过签名清单升级到新版。
+   - 利弊：(a) 零迁移成本、零兼容风险，但 minisign 私钥仍留在仓库级（保护级别低于 Environment）；(b) 密钥可进受保护 Environment，但要走一次"先发新公钥版本、再启用新私钥签名"的过渡，且过渡期间新旧密钥管理容易出错。**等用户选，不要替用户选。**
+   - 只有用户做完 Settings 操作后，才能在 release.yml 的 build-android 与 publish job 加 `environment: release`——这一步现在不做（加了而 Environment 还没有 secret，release 会直接失败）。
+3. **设仓库 Variable `MAAM_UPDATE_REPO=RunAfterMoments/multi-agent-account-manager`**（Settings → Secrets and variables → Actions → Variables）：这是 rc1 的前提——更新检查是编译期 `option_env!` 进二进制的，变量空着编出来的 rc1 更新检查仍是关闭的。
+4. **之后的代码侧步骤（父代理做，用户不用动）**：三处版本号升 1.0.0-rc1（package.json、src-tauri/Cargo.toml、src-tauri/tauri.conf.json）→ 打 tag `v1.0.0-rc1` → release workflow 跑出第一份真实签名的 `latest.json` + `latest.json.minisig`。
+
+### 6. 未验证
+
+- Android 真机运行：签名 APK 仅在 CI 里编出并验签，未装机跑过——靠 Phase 4 真机验收。
+- 干跑编出的二进制更新检查是关闭的（`MAAM_UPDATE_REPO` 为空）；rc1 的真实更新检查需设变量后重新编。
+- 密钥方案 (a) 的"仓库级 + Environment 混合读取"结论来自 GitHub 文档行为，未在本次干跑里实测（publish job 被跳过）；rc1 发布时是第一次实测点。
