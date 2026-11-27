@@ -1738,4 +1738,35 @@ check 上会多 3 条 `dead_code`/`unused import` 警告。全部补
 - 核实：全仓库 grep `secrets\.` 只有五处——Android job 的四个 `ANDROID_KEYSTORE_*`（“Sign release APK”步骤）与 publish job 的 `MAAM_MINISIGN_SECRET_KEY`（“Sign release assets with minisign”步骤）；没有别的 job 读仓库级 Android secrets（仓库级已删，读了就会失败）。YAML 经 `yaml.safe_load` 校验通过。
 - 触发条件核实：`on.push.tags: ["v*"]`，push tag `v1.0.0-rc1` 即触发 release workflow；publish job 的 `if` 含 `github.ref_type == 'tag'`，tag 触发时 publish 一定跑。`MAAM_UPDATE_REPO` 取 `${{ inputs.maam_update_repo || vars.MAAM_UPDATE_REPO }}`，tag push 时 inputs 为空，回落到刚设的仓库变量——rc1 编出的二进制更新检查是开启的。
 
-### 3. 版本号与 tag（待补：run 结果与验签结论见 §4–5）
+### 3. 版本号与 tag
+
+- 三处 `0.1.10` → `1.0.0-rc1`：`package.json`、`src-tauri/Cargo.toml`、`src-tauri/tauri.conf.json`；`Cargo.lock` 经 `cargo check` 刷新（仅本包一行；注：`cargo metadata --no-deps` 不写 lock，改用 cargo check 才刷出）、`package-lock.json` 经 `npm install --package-lock-only` 刷新（仅根版本号两行）。其余 `0.1.10` 出现处（历史文档基线、updater.rs 测试固件）均不是应用版本，未动。
+- 提交 65657c4（v1.0.0-rc1），已 push main；tag `v1.0.0-rc1` 指向 65657c4，已 push。`cargo check --lib` 本机编过 v1.0.0-rc1。
+- 触发：tag push 触发 release workflow，无需手动 dispatch（`on.push.tags: ["v*"]` 已核实）。
+
+### 4. release run 结果（run 45971539788，tag push 触发，整体 success，约 8 分钟）
+
+| Job | 结论 | 用时 |
+|---|---|---|
+| macOS | success | 2m05s |
+| Windows | success | 3m20s |
+| iOS (Unsigned IPA) | success | 3m55s |
+| Android | success | 6m27s |
+| Publish Release | success | 1m08s |
+
+- Release 已创建：`叠号 v1.0.0-rc1`，tag `v1.0.0-rc1`，发布于 2026-11-27T09:18:33Z。12 个资产齐全（5 安装包 + latest.json + 6 个 `.minisig`，与 v0.1.10 结构一致）。
+- CI（ci.yml）说明：step-1 提交触发的 run 45971351388 最终结论为 failure，但**没有一个 job 失败**——audit、ubuntu、windows 全部 success，只有 macOS job 为 cancelled（09:09:31Z 启动、09:24:31Z 取消；其日志 blob 不存在，系等待/启动阶段被取消；ci.yml 无 concurrency 配置、job 超时为 60 分钟，故不是超限也不是新 push 顶掉——当天早上 macOS arm64 runner 有容量约束，release run 上亦有同类提示）。版本提交触发的 run 45971520178 **全部 4 个 job success**（含 macOS，3m08s）。结论：CI 的 failure 与本次 release.yml 改动无关（ci.yml 从不读 release.yml），main 的 CI 是绿的。
+
+### 5. 本地验签结论（最关键：混合读取第一次实测通过）
+
+- `latest.json`：version `1.0.0-rc1`，四平台齐全（android 51,850,114 B、ios 3,070,694 B、macos 11,318,733 B、windows 4,272,438 B）。
+- 本机 `minisign -V -p minisign.pub`（仓库根公钥，apt 现装 minisign 0.11-1；本机原先未装，`apt-get update` 后安装，nodesource 源一条 fetch 警告不影响）逐个验签已发布的 6 个文件，**全部通过**，均为预哈希模式（trusted comment `file:<name> hashed`，timestamp 1795771095–1795771105，同一发布分钟内）：
+  - account-manager-macos-universal.app.tar.gz / .dmg / windows-x64-setup.exe / android-universal-release.apk / ios-unsigned.ipa / latest.json。
+- **混合读取实测结论：通过。** Android job 从 Environment `release` 读到 keystore（apksigner 签名 + “Verify APK signature”步骤通过，签名 APK 已发布）；publish job 从仓库级读到 `MAAM_MINISIGN_SECRET_KEY`（6 个 `.minisig` 全部用仓库根公钥验签通过）。job 引用 Environment 不屏蔽仓库级 secrets 的文档行为，第一次实测成立。rc1 编出的二进制更新检查已开启（变量已设，tag 触发时回落到仓库变量）。
+- 验签用文件下载自已发布的 Release（`/tmp/rc1-verify`，临时文件，用后可删）。
+
+### 6. 未验证
+
+- rc1 尚未真机验收（Phase 4）：四端真机 Go/No-Go 清单 + 实测 rc1→v1.0.0 验签升级。
+- Android 真机运行：签名 APK 仅在 CI 里编出、apksigner 验签、minisign 验签，未装机跑过。
+- rc1 客户端实际拉取 latest.json 做更新检查的行为（需真机 + 后续版本才有升级路径）。
