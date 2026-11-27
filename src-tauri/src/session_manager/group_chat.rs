@@ -96,6 +96,15 @@ fn is_stream_fast_path(
     && !error_changed
 }
 
+/// 内容是否实际为空（空白字符也算空）：前端用 `msg.content.trim()` 决定
+/// 是否渲染 `[data-msg-text-id]` 容器；首帧若只有空白字符，DOM 里没有
+/// text 容器，后续流式分片会被局部更新静默跳过，直到 Done 才整段显示。
+/// 故快路径的“之前内容非空”判定必须与前端一致，用 trim 而不是 is_empty。
+#[cfg(any(desktop, test))]
+fn content_is_effectively_empty(content: &str) -> bool {
+  content.trim().is_empty()
+}
+
 impl SessionManager {
   #[cfg(any(desktop, test))]
   pub(super) fn resolve_member_alias_locked(
@@ -2404,7 +2413,7 @@ impl SessionManager {
         return false;
       };
       let prev_status = m.status;
-      let prev_content_was_empty = m.content.is_empty();
+      let prev_content_was_empty = content_is_effectively_empty(&m.content);
       let mut changed = m.status != status;
       m.status = status;
       if let Some(content) = content_opt {
@@ -4276,6 +4285,14 @@ mod tests {
       false,
       false
     ));
+  }
+
+  #[test]
+  fn content_is_effectively_empty_treats_whitespace_only_as_empty() {
+    assert!(content_is_effectively_empty(""));
+    assert!(content_is_effectively_empty("  \n\t "));
+    assert!(!content_is_effectively_empty("a"));
+    assert!(!content_is_effectively_empty("\nhello"));
   }
 
   #[test]

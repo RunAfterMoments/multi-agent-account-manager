@@ -1770,3 +1770,47 @@ check 上会多 3 条 `dead_code`/`unused import` 警告。全部补
 - rc1 尚未真机验收（Phase 4）：四端真机 Go/No-Go 清单 + 实测 rc1→v1.0.0 验签升级。
 - Android 真机运行：签名 APK 仅在 CI 里编出、apksigner 验签、minisign 验签，未装机跑过。
 - rc1 客户端实际拉取 latest.json 做更新检查的行为（需真机 + 后续版本才有升级路径）。
+
+## 二十二、v1.0.0 前收口（用户 9.6 复审的两处小边界 + 清单补充 + prerelease，2026-11-27）
+
+用户独立复审 rc1（源码 + CI + Release 资产 + 密码学验签），评分从 9.2 升至 **9.6/10**，可进 Phase 4。复审抓出 3 项：① minisign 私钥迁入 Environment（发 v1.0.0 前必做）、② COM 初始化小边界、③ 首帧纯空白字符；另提示 rc1 没带 `--prerelease` 已标 latest，清单补 3 项并纠正 Windows 只有 `.exe`。其中 ① 由父代理另外核查：**不可行**——全盘搜过（整个 `~/workspace`、`~/.config`、`~/.ssh`、`/tmp`），私钥值本地无任何备份，只剩 `minisign.pub` 与 key ID 的提及；GitHub secret 读不回来，仓库级副本是唯一一份，删了就永远签不了新版、旧客户端也永远升不了级。只剩两条路：(a) 留仓库级（用户 17:06 已选过的方案）；(b) 重生成密钥对 + 两版过渡（v1.0.0 带新公钥但用旧私钥签名，v1.0.1 起用新私钥签）。等用户定。**本轮只做 ②③ + 清单 + prerelease，不碰任何 secrets/GitHub Settings/版本号/tag。**
+
+### 1. 修复 A：Windows 文件定位 COM 初始化（platform.rs）
+
+- 核实调用链：`reveal_downloaded_file`（`session_manager.rs:1895`，`pub async fn`，Tokio worker 线程）→ `platform::reveal_path_in_file_manager`（desktop 分支）→ `reveal_with_shell_select`（`platform.rs`，`#[cfg(windows)]`），**全程无任何 COM 初始化**。未初始化的线程调 `SHOpenFolderAndSelectItems` 通常返回 `CO_E_NOTINITIALIZED`，默默回退到只打开父目录、不选中文件。
+- 改法：在 `reveal_with_shell_select` 内、shell 调用前补 `CoInitializeEx(None, COINIT_APARTMENTTHREADED)`，用模块级 `ComApartmentGuard(bool)`（Drop）在函数结束时配对 `CoUninitialize()`。配对规则按返回值（写进代码注释）：`S_OK`（0）才反初始化；`S_FALSE` 表示该线程已有同模型初始化，**不要**反初始化（线程不归我们）；`RPC_E_CHANGED_MODE` 或其他错误继续往下走，shell 失败时走现有回退逻辑。guard 在函数作用域内，任意返回路径（包括 early return）都会 Drop。
+- API 签名对照 vendored windows 0.62.2 逐一核实：`CoInitializeEx(pvreserved: Option<*const c_void>, dwcoinit: COINIT) -> HRESULT`（`Win32/System/Com/mod.rs:334`）、`COINIT_APARTMENTTHREADED: COINIT = COINIT(2)`（同文件 :1802）、`CoUninitialize()`（:572）、`S_OK` / `S_FALSE`（`Win32/Foundation/mod.rs:9912/9911`）。`Win32_System_Com` 与 `Win32_Foundation` feature 已在 Cargo.toml（前者在用 `CoTaskMemFree`），**无需改 Cargo.toml / Cargo.lock**。
+- 实施插曲：第一版编辑把 `open_parent` / `parent` 一段复制了一份（新文本与锚点后原有内容重叠），Windows 交叉 clippy 以 `unused variable` 报错抓出（`open_parent`、`parent_clean` 各 1 处）；删掉重复块后结构恢复，复核 `grep -c` 各为 1。教训与 v6 一致：替换锚点后的原有内容不要再写进新文本。
+- 验证：Windows 交叉 clippy 编过；COM 真跑靠 Phase 4 真机清单 M-08 高亮选中项验收。本机无法加单测（无 Windows 运行时）。
+
+### 2. 修复 B：群聊流式首帧纯空白字符（group_chat.rs，1 行 + 1 单测）
+
+- 根因：`update_group_message_state` 里 `prev_content_was_empty = m.content.is_empty()`（~L2407），而前端 `group-chat.ts:508` 用 `msg.content.trim()` 决定是否渲染 `[data-msg-text-id]`。模型首包若只吐 `"\n"` 或空格，DOM 里没有 text 容器，后续流式分片全被局部更新静默跳过，直到 `Done` 才整段显示。
+- 改法：`is_stream_fast_path` 附近新增纯函数 `content_is_effectively_empty(content: &str) -> bool { content.trim().is_empty() }`（`#[cfg(any(desktop, test))]`，与判定函数同门），调用处改为 `content_is_effectively_empty(&m.content)`。原有 `stream_fast_path_only_when_steady_streaming_non_empty` 单测未动（测判定函数本身，入参已是 bool）。
+- 单测（新增）：`content_is_effectively_empty_treats_whitespace_only_as_empty`——`""`、`"  \n\t "` → true；`"a"`、`"\nhello"` → false。
+
+### 3. prerelease 标志（release.yml，做了，create 路径 only）
+
+- 现状：publish job 里 `gh release create` 在 `else` 分支（Release 不存在时新建），其旁已有 `extra_args` 数组与 `--target` 条件判断，改动干净：同分支加 3 行——`if [[ "$RELEASE_TAG" == *-* ]]; then extra_args+=(--prerelease); fi`。含 `-` 的 tag（如 `v1.0.0-rc1`）自动标 prerelease，不再抢 `latest`；正式版（`v1.0.0`）不带 `-`，不受影响。YAML 经 `yaml.safe_load` 校验通过。
+- 局限（已写进 yml 注释）：只覆盖新建 Release 的 create 路径；Release 已存在时走上面的 `upload` + `edit` 分支，不改其 prerelease 状态——重发已存在的 rc tag 时需手动处理，属极小概率路径。
+
+### 4. 清单补充（phase4-rc1-acceptance-checklist.md，仓库外文件）
+
+- 桌面端补 3 项（用户原话照搬）：Windows / macOS（MAAM-M-01）复制 Cookie 两段确认；Windows（MAAM-M-08）「在文件夹中显示」高亮选中目标文件（顺带验证 COM 点）；Windows（MAAM-M-03）本地 HTTP 代理生效且无 WebView2 启动报错。
+- 纠正一处错误：Windows 安装包只有 `.exe`，没有 `.msi`（标题行 `.exe / .msi` → `.exe`）。
+
+### 5. 验证（本机逐项重跑，全绿）
+
+- `cargo fmt --check`：通过（初版一处 `use` 换行被 fmt 指出，已跑 `cargo fmt` 修正）。
+- `cargo clippy --all-targets -- -D warnings`（Linux）：通过（仅 1 条基线 manifest 警告）。
+- `cargo clippy --target x86_64-pc-windows-gnu --all-targets -- -D warnings`：通过（COM 改动已编过；中途因编辑复制块报 2 处 unused variable，已修，见 §1 插曲）。
+- `cargo test --lib`：**127/127**（126 + 新增 trim 单测 1 条，单独跑过 `content_is_effectively_empty`，ok）。
+- `cargo check --target aarch64-linux-android --lib`：**0 错误 0 警告**。
+- `npm run build`：通过；`npm run test:js`：**30/30**。
+- 环境插曲：验证中途虚拟机替换，apt 装的 Tauri 系统库又丢了（链接报缺 `-lgtk-3` / `-lwebkit2gtk-4.1` 等），按老办法跑 `restore-build-env.sh` 恢复（GTK OK），与代码无关。
+- Gemini 当天仍不可用（未再试，沿用 v6.2 先例）：本轮代码由协调人按核实过的设计直接写，每处改动均对照真实源码与 vendored API 逐行核实。
+
+### 6. 已知未验证项
+
+- COM 初始化真跑：靠 Phase 4 真机清单 M-08 高亮选中项。
+- prerelease 标志真跑：下一次 rc/beta 发布时才触发（v1.0.0 正式版不带 `-`，不受影响）；Release 已存在时的 edit 分支不翻 prerelease 状态。

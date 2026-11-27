@@ -400,6 +400,13 @@ jobs:
             if [ "${{ github.ref_type }}" != "tag" ]; then
               extra_args+=(--target "$GITHUB_SHA")
             fi
+            # 含 `-` 的 tag（如 v1.0.0-rc1）是预发布，自动标 --prerelease，
+            # 避免 rc/beta 被标为 latest；正式版（v1.0.0）不带 `-`，不受影响。
+            # 只覆盖新建 Release 的 create 路径；Release 已存在时走上面的
+            # upload + edit 分支，不改其 prerelease 状态。
+            if [[ "$RELEASE_TAG" == *-* ]]; then
+              extra_args+=(--prerelease)
+            fi
             gh release create "$RELEASE_TAG" "${files[@]}" \
               "${extra_args[@]}" \
               --title "叠号 $RELEASE_TAG" \
