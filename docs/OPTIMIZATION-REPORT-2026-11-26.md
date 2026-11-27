@@ -1191,3 +1191,262 @@ tooltip 按平台显示：macOS `⌘\`，其余 `Ctrl+\`（`IS_MAC`，
 - 未验证：iOS Swift 本机编不到（无 Apple 工具链），Kotlin 本机编不到
   （无 Android SDK）——两项靠 CI（release Android 构建编 Kotlin、
   macOS/iOS 构建编 Swift）。Windows DPAPI 测试靠 CI Windows check 真跑。
+
+## 十七、v6.4 Phase 1A 并发去持锁（2026-11-27，Step 2 前半）
+
+用户评 v6.3.2 **9.2/10** 后定下的收官路线 Phase 1（v6.4）拆两 commit：
+先 1A 并发、再 1B 流式。本节只做 1A——彻底消除生产路径上
+`self.inner.lock().await` 跨 `.await` 持锁。1B（group-msg-stream、
+main.ts 监听、前端局部刷新）未碰。
+
+工作方式：协调人拆三路并行改（session_manager.rs / group_chat.rs /
+quota_sync.rs + a2a.rs + webview.rs + store.rs），核心 API
+（`persist_now`、写线程、`HideSlotOp`、vault 签名）由协调人先行落地
+并验证，三路只改各自文件内的调用点；最后协调人逐行复核全量 diff、
+补两处复核发现的竞态、删两个已无调用者的旧函数、跑全套验证。
+未 commit/push，工作树改动待复核。7 文件 +1208/-506。
+
+### 1. `persist_now` 设计（store.rs）
+
+根源：旧 `persist_locked` 虽已 clone 出 `(path, store)` 交给
+`spawn_blocking`，仍全程攥着 `&mut InnerState` 等磁盘写入和 fsync
+完成——写盘慢（尤其移动端闪存）时整个 `inner` 被堵住，UI 与后台
+同步全停。
+
+- `SessionManager` 新增专用写盘序列化锁
+  `persist_io_lock: tokio::sync::Mutex<()>`。
+- 新增 `SessionManager::persist_now(&self) -> Result<(), String>`：
+  1. 短锁 `inner` 查 `persist_blocked`，blocked 时立刻返回 Err
+     （不等 io 锁），并按旧语义立 notice（"写盘已被阻止"，已立过则
+     不覆盖，避免丢掉启动提示里的备份文件名）；
+  2. 拿 `persist_io_lock` → 短锁重查 blocked 并 clone 出
+     `(path, store)` → 释放 `inner` → `save_store_atomic_async`；
+  3. 写盘失败时释放 io 锁后重锁 `inner` 立 notice（"保存配置失败"）
+     并返回 Err，调用方按需回滚字段。
+- **关键修正（与用户原草图不同）**：克隆必须发生在拿 io 锁之后，
+  不能先克隆再拿锁。先克隆的旧快照可能后落盘、覆盖后克隆的新快照；
+  io 锁内克隆保证写盘顺序与克隆顺序一致，最后一个拿到 io 锁的任务
+  一定读到最新状态。拿锁顺序永远是 io → inner，绝不出现
+  inner → io——`persist_now` 绝不能在持有 `inner` 锁时被调用，
+  否则与持 io 锁等 inner 的路径死锁。
+- `ensure_persist_writer` 的防抖写线程共用同一 `persist_io_lock`
+  （拿 io 锁 → 短锁克隆 → 写盘），避免防抖写与同步 `persist_now`
+  在同一临时文件/rename 上竞争；blocked 时静默跳过本次（写线程
+  失败立 notice 并保留 dirty，下次请求重试）。
+- `persist()` 改为直接调 `persist_now()`；旧 `persist_locked`
+  与旧 `hide_foreground_slot` 在全库 0 调用后删除，相关文档引用
+  已同步改指 `persist_now` / 新 hide 拆分。
+
+### 2. 31 处 `persist_locked` 处理清单
+
+实扫 31 处（用户行号有漂移，以实扫为准）。27 处切 `persist_now`
+（强同步：调用方依赖"写盘成功才返回/才提交"），4 处切已有的防抖
+`request_persist()`（后台同步路径，无调用方等写盘结果）。
+
+`persist_now`（27 处，失败语义一律保留：写盘失败立 notice + 回滚）：
+
+| 位置 | 函数 | 回滚方式 |
+| --- | --- | --- |
+| session_manager.rs | `add_account` | 按 key retain 删刚加的账号（不用 `pop`，防并发误删他人） |
+| session_manager.rs | `update_account_settings` | 按 (provider, uuid) 重定位恢复旧记录；找不到则不恢复（已被并发删除） |
+| session_manager.rs | `remove_account` | 失败时按原逻辑恢复（见下注） |
+| session_manager.rs | `reorder_accounts` | 整表恢复 `previous` |
+| session_manager.rs | `clear_account_data` | 两处：主清理 `?` 直接返回（内存改动保留在锁内，写盘失败即报错）；`pending_cleanup` 清除后 `?` 同样 |
+| session_manager.rs | `update_app_settings` | `settings` 整段恢复 `previous` |
+| session_manager.rs | `resolve_uuid_conflict` | `?` 直接返回 |
+| session_manager.rs | `switch_account_internal`（桌面 paint 提交） | `last_committed` 恢复 `prev_last` |
+| session_manager.rs | `commit_mobile_session` | 三段式：校验/detach → persist → 成功标 committed 并推标题、失败恢复 `last_committed` + detach + notice |
+| session_manager.rs | `continue_with_empty_config`（store.rs） | 恢复 `persist_blocked=true` + `read_only=was_read_only` |
+| group_chat.rs | `create_group_chat` | 按 id retain 删刚追加的记录（不用 `pop`） |
+| group_chat.rs | `update_group_chat` | 按 id 重找记录，恢复 name/members/roles/bindings |
+| group_chat.rs | `update_group_knowledge` | 按 id 重找，恢复 context/skills/roles |
+| group_chat.rs | `append_group_shared_context` | 按 id 重找，恢复 shared_context |
+| group_chat.rs | `delete_group_chat` | 插回原位（`removed_idx.min(len)` 钳制，防并发增删越界） |
+| group_chat.rs | `upsert_external_agent` | 整表恢复 `prev_agents`/`prev_groups` + 锁外回滚 vault（见 §4） |
+| group_chat.rs | `delete_external_agent` | 整表恢复 `prev_agents`/`prev_groups` |
+| group_chat.rs | `update_group_workflow` | 按 id 重找，恢复 mode/hops |
+| group_chat.rs | `reset_group_thread_binding` | 按 id 重找，恢复 bindings |
+| group_chat.rs | `clear_group_messages` | 按 id 重找，恢复 messages |
+| group_chat.rs | `start_group_new_topic` | 按 id 重找，恢复 messages/bindings/context |
+| group_chat.rs | `send_group_message` | `?` 直接返回（消息已入内存队列，失败即报错） |
+| group_chat.rs | `retry_group_message` | 按 (group_id, msg_id) 重找，恢复 status/content/error |
+| group_chat.rs | `sync_group_message_reply` | 按 (group_id, msg_id) 重找，恢复 status/content/error |
+| webview.rs | `wait_paint_and_finalize_desktop` | 前台提交：重锁后先校验 slot 仍是本轮等待的前台位才提交/回退（见 §3 注） |
+| store.rs | `persist()`（公共入口） | 直接调 `persist_now()` |
+
+注：`remove_account` 与 `resolve_uuid_conflict` 沿用原失败分支结构
+（`?` 返回 / 原样恢复），仅把锁内写盘换成锁外 `persist_now`。
+
+`request_persist()`（4 处，后台同步路径，快照照常发、写盘延后，
+写线程失败立 notice 并下次重试）：
+
+- `quota_sync.rs` `apply_logged_out_state`（wrapper 在锁释放后、
+  有快照时请求；`apply_logged_out_state_locked` 是无 `self` 的静态
+  方法，调不了 `request_persist`，故由 wrapper 发）；
+- `quota_sync.rs` `apply_cookie_expiry_summary`（锁内直接
+  `request_persist()`——它是同步调用，不 await，锁内调无妨）；
+- `quota_sync.rs` `apply_detected_metadata`（同 logged_out，wrapper
+  在锁释放后发；仅清页面错误、无 store 改动时也会多一次内容不变的
+  防抖写盘，无害）；
+- `a2a.rs` `run_group_a2a_chain`（后台自治级联，无调用方等写盘结果；
+  原代码把 in-flight 登记绑在"写盘成功"上是为防"已登记却未扇出"的
+  泄漏，改防抖后登记与扇出总是成对发生、失败不再提前返回，该泄漏
+  不变量反而更稳固）。
+
+### 3. hide 拆分（webview.rs）与前台提交竞态
+
+- `HideSlotOp { next_seq: u64 }`（模块级 `pub(super)` 结构体——
+  struct 不能写在 `impl` 块内，首版放错位置编不过，已移出）：
+  只带 `next_seq`，因为移动端插件 `close_active_session` 只需
+  `app` + `switch_seq`。
+- `detach_foreground_slot_locked(&self, app, next_seq, locked)`：
+  锁内纯内存步——清 `pending_external_auth`、复位 `active_view_id`、
+  取出旧槽位；桌面端同步完成 popup 关闭 / webview 隐藏 / 标题与布局
+  （`apply_desktop_layout_locked` 已核实是同步函数，无 await）。
+- `execute_hide_slot(&self, app, op)`：释放锁后调，移动端
+  `close_active_session` 插件 IPC；桌面端无事可做（显式读一次
+  `op.next_seq`，否则非移动端目标报 dead_code 警告——clippy
+  `-D warnings` 下会失败）。
+- 17 处调用点（session_manager.rs 15 + group_chat.rs 2）全部改为
+  detach → 释放锁 → execute；桌面 switch 的两个 detach 点互斥，
+  共用一个 execute（`let hide_op;` 前置声明，两分支各赋值一次，
+  编译器已校验定赋值）。
+- `wait_paint_and_finalize_desktop` 的前台提交新增一道防护（原代码
+  持锁写盘不存在此窗口）：`persist_now` 期间用户可能已切走，重锁后
+  先校验 slot 仍是本轮等待的前台位（account_key + view_instance_id
+  + 未 committed）才提交/回退；`last_committed` 回退时也只在仍是本
+  账号时执行。残留：slot 已切走 + 写盘成功的竞态下，磁盘上的
+  `last_committed` 会短暂滞留为旧账号（内存与磁盘一致，仅提示性字段，
+  后来者的提交会覆盖），已接受。
+- `ForegroundCommit` 枚举的 `Done` variant 含整份 `ManagerSnapshot`，
+  触发 `clippy::large_enum_variant`——`Done` 负载改为 `Box<...>`，
+  构造处 `Box::new`、匹配处 `*tuple` 解包。
+
+### 4. Vault 移出锁（group_chat.rs / session_manager.rs / storage.rs）
+
+- `migrate_agent_keys_to_vault` 签名改为
+  `(&mut [ExternalAgentRecord], vault)`：调用方先短锁 clone 成员列表
+  → 锁外迁移 → 锁内按 id 合并写回 `api_key`（迁移只改 `api_key`）。
+  调用点：`load_or_migrate_store`、`restore_config_from_backup`、
+  `set_test_vault`（测试入口）、`run_startup_tasks` 移动端迁移块。
+- `upsert_external_agent` / `delete_external_agent` 按六步重排：
+  1. 短锁算 existing_pos/created_at/旧 Key/旧 Key 引用/生效 Key；
+  2. 锁外 `normalize`（纯函数）；3. 锁外写 vault（失败直接返回，
+     不动内存与磁盘）；4. 短锁 clone prevs 并应用内存修改；
+  5. 锁外 `persist_now`，失败时重锁恢复内存 clones、再锁外回滚
+     vault（有旧 Key 则写回旧 Key，无则删除刚写条目）；
+  6. 成功后 kind 改 local_cli 时锁外清理旧 vault 条目（失败忽略，
+     与原来一致）。`effective_api_key` 在 normalize 之前算（旧 Key
+     已是 normalize 过的形式，与原逻辑等价）。
+- `run_startup_tasks` 移动端迁移：短锁 clone → 锁外迁移 → 锁内按 id
+  合并 `api_key` + `notice`；迁移失败立即 `emit_snapshot`（见 §5）。
+
+### 5. emit_snapshot 补漏（已核实，不是重复推）
+
+`run_startup_tasks` 约 419 行设置迁移失败 `notice` 后，原先不推事件。
+核实：该 notice 今天并非丢失——函数末尾的最终块在 `notice.is_some()`
+时置 `candidate = None` 并在 else 分支推快照——但它要等
+`retry_pending_cleanups`（可耗时数秒）跑完才推。补漏是在迁移失败时
+立即推一次；末尾的最终快照仍会正常推（内容相同、前端渲染幂等，
+不是重复处理）。
+
+### 6. 配额/传输辅助函数与标题同步
+
+- `quota_sync.rs` `probe_meta_account_center_email`（约 90–107 行）
+  与 `copy_account_cookie`（Windows 分支）：`read_windows_cookies_for_url`
+  签名改为 `(app, app_data_dir, warm_webview_label, proxy_url, key, url)`，
+  不再接 `&InnerState`；末尾的 `verify_desktop_profile_binding` /
+  `read_windows_webview_cookies` 异步尾巴在锁外执行。代理与热池 label
+  分两次短锁读，中间热池可能变化；label 过期只会退回建临时 webview
+  的老分支，不影响正确性。
+- `apply_detected_metadata_locked` 体内已无 `.await`（`is_view_instance_valid`、
+  `snapshot_from_locked`、`resolve_provider` 均为同步），但保持 `async`——
+  session_manager.rs 的测试在多处直接以 `.await` 调用它（`apply_logged_out_state_locked`
+  同理），改同步会破坏测试编译。两者体内 0 个真实 `.await`（grep 核实，
+  仅注释文字提到 `.await`）。
+- `group_chat.rs` `resolve_member_transport_locked` 改为同步 fn，
+  调用点去 `.await`。
+- `commit_mobile_session` 三段式重写：校验/detach → `persist_now` →
+  成功标 committed、再推 `update_account_title`（已移到锁外）、最后发快照；
+  失败恢复 `last_committed` + detach + notice + 发快照。
+- 复核补抓（任务书只点了约 2846 行那一处）：`update_account_settings`
+  尾部另有一处 `update_account_title(...).await` 也在持锁时调（移动端
+  插件 IPC）。已移出锁：锁内只算标题与 seq，快照与标题同步一律在锁释放
+  后做（桌面端 `set_title` 是同步调用，移出锁外行为不变）。
+
+### 7. 协调人复核发现并修复的两个竞态
+
+复核全量 diff 时发现两处"旧下标跨 await 复用"（原代码持锁连续，
+下标不可能失效；拆锁后步骤之间其他任务可增删记录，下标会错指他人
+记录、甚至越界 panic）：
+
+- `upsert_external_agent` 第 4 步沿用第 1 步算的 `existing_pos` 下标，
+  中间隔着 normalize + vault 写两个锁外 await。修复：第 4 步按
+  `record.id` 重新定位；若原记录已被并发删除则拒绝写入
+  （"该外部成员已被移除，请重试"，第 3 步刚写的 vault 条目成孤儿，
+  下次编辑/删除时清理，与原来同类残留一致）。
+- `update_account_settings` 重锁后沿用 persist 前算的 `index` 下标
+  取账号（`accounts[index].clone()` 与标题处的 `accounts[index].alias`）。
+  修复：重锁后按 (provider_id, uuid) 重新定位，找不到则报错。
+- 其余 1A 改动点已逐一核对：所有回滚均按 id/key 重找（`create_group_chat`
+  用 retain-by-id、`delete_group_chat` 用钳制插回、`reorder_accounts`
+  整表恢复、`clear_account_data` 同块内用 idx 无跨 await），无同类问题。
+  失败路径整表恢复（upsert/delete 的 prev clones）仍可能覆盖并发改动，
+  但只在写盘失败时触发，已接受（与原来持锁时的失败路径等价）。
+
+### 8. 回归单测（新增 2 个，session_manager.rs tests）
+
+- `persist_now_concurrent_writes_last_state_wins_and_inner_stays_free`：
+  8 个任务各加一个账号后调 `persist_now`；期间主任务反复加锁读 `inner`
+  必须立刻成功（写盘 IO 不持锁）；结束后续盘必须含全部 8 个账号——
+  只有"拿 io 锁后克隆"的顺序能保证这点（旧的"先克隆、后拿锁"做不到）。
+- `persist_now_short_circuits_when_persist_blocked`：blocked 时返回 Err、
+  磁盘原样不动、立 notice；解除阻止后再次调用即成功写盘且含最新改动。
+
+### 9. 验证结果（全部本机跑，逐项）
+
+- `cargo fmt --check`：通过。
+- `cargo clippy --all-targets -- -D warnings`（Linux）：通过。仅 1 条
+  基线 manifest 警告（unused dependency `tauri-plugin-account-session`，
+  与 1A 无关，改动未碰 Cargo.toml）。
+- `cargo clippy --target x86_64-pc-windows-gnu --all-targets -- -D warnings`：
+  通过（同上 1 条基线警告）。首轮报错 2 处，均为 Windows-only 代码、
+  Linux 编不过不暴露：① quota_sync.rs `warm_pool.get(key)` 应为
+  `get(&key)`（E0308 类型不匹配）；② session_manager.rs
+  `copy_account_cookie` 的 `&app` 是 needless borrow（`app` 已是
+  `&AppHandle`）。两处已修，复跑通过。
+- `cargo test --lib`：**120/120**（118 + 新增 2 个）。
+- `cargo check --target aarch64-linux-android --lib`：0 错误，**43 条警告
+  = 基线**。中间一度 55 条（+12，全是 1A 新引的：4 个 unused variable +
+  8 个 unused_mut，均因拆锁后重锁块里只剩 `#[cfg(desktop)]` 的改动）：
+  `valid_members` / `removed_key` 改绑 `_` 前缀（只在桌面端用）、
+  `detach_foreground_slot_locked` 的 `app` 在 `#[cfg(mobile)]` 下显式
+  读一次、`clear_account_data` 的重锁加 `#[cfg(desktop)]`、7 处重锁加
+  `#[allow(unused_mut)]` 附原因注释。修后回到 43 条。
+- `npm run build`、`npm run test:js`（20 pass / 0 fail）：通过。
+- 1B 代码零改动（diff 中 `update_group_message_state` /
+  `group-msg-stream` / `data-msg-text-id` 0 处）。
+
+### 10. 残留锁内 await 清单（逐一核实，均安全）
+
+- `persist_now` / `persist_writer_loop`：写盘 await 期间持有的是
+  `persist_io_lock`（`Mutex<()>`），不是 `inner`；拿锁顺序永远
+  io → inner，无任何路径在持 `inner` 时拿 io，不存在死锁。
+- `apply_logged_out_state_locked` / `apply_detected_metadata_locked`：
+  仍是 `async`（测试以 `.await` 调用），但体内 0 个真实 `.await`——
+  future 永不挂起，锁不会在挂起点上被持有。
+- `get_snapshot().await` 各调用点：调用方均不持锁（`get_snapshot`
+  内部自己短锁）；`emit_snapshot` 是同步函数。
+- `sleep` / `spawn` 任务内的 await：均不在持锁作用域内。
+- 测试代码内持锁跨 await（如新 persist 测试）：仅测试，不影响生产。
+- `persist_locked` / `hide_foreground_slot`：已删除，全库 0 调用
+  （grep 核实，仅剩两处文档注释提及旧名，已改指新入口）。
+
+### 11. 未验证
+
+- iOS Swift、Kotlin：本轮未改动（Kotlin/Swift 文件 0 行 diff），
+  无需验证。Windows DPAPI 真跑与移动端插件 IPC 真跑靠 CI 与 Phase 4
+  真机验收。
+- `HideSlotOp` 的移动端执行路径（`execute_hide_slot` →
+  `close_active_session`）本机编不到移动端目标，只在
+  `#[cfg(mobile)]` 分支内，靠 CI 移动端构建验证。

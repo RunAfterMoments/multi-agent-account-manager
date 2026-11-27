@@ -386,10 +386,9 @@ impl SessionManager {
           2,
         );
         // 跨链去重：并行跑着的两条接力链可能同时点名同一成员；已在
-        // 途中的目标不再重复扇出。这里只过滤、不登记——登记放在
-        // persist 成功之后，且只登记真正进入 spawned 的非 LocalCli
-        // 目标（LocalCli 在下面 continue 掉、未进 spawned；写盘失败
-        // 时提前返回，提前登记也会泄漏）。
+        // 途中的目标不再重复扇出。这里只过滤、不登记——登记放在下面
+        // 与扇出成对发生，且只登记真正进入 spawned 的非 LocalCli
+        // 目标（LocalCli 在下面 continue 掉、未进 spawned）。
         let next_targets: Vec<AccountKey> = {
           let in_flight = locked
             .a2a_relay_in_flight
@@ -480,12 +479,14 @@ impl SessionManager {
           locked.notice =
             Some("A2A 接力已暂停：有本地 CLI 成员需你确认后点「重试」才会执行本地命令".to_string());
         }
-        if Self::persist_locked(&mut locked).await.is_err() {
-          return;
-        }
+        // 1A：接力链是后台任务，无调用方等写盘结果；锁内不再同步写盘，
+        // 改走防抖。写盘失败不再提前返回——登记与扇出总是成对发生，
+        // 不存在“已登记却未扇出”的泄漏；写线程失败会立 notice 并在
+        // 下次请求时重试，内存里的接力消息不受影响。
+        self.request_persist();
         // 登记在途目标：只登记真正进入 spawned 的（LocalCli 已在
-        // 上面 continue 掉），且在 persist 成功之后——写盘失败时
-        // 提前返回，提前登记的目标永远等不到释放。
+        // 上面 continue 掉）。登记与下面的扇出成对发生，写盘走防抖
+        // 不再阻塞本路径，故不再以写盘成功为前提。
         {
           let in_flight = locked
             .a2a_relay_in_flight

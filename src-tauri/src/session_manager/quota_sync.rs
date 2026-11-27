@@ -86,7 +86,7 @@ impl SessionManager {
       return;
     };
 
-    let (proxy_raw, profile_dir, has_win_cookies) = {
+    let (proxy_raw, profile_dir) = {
       let locked = self.inner.lock().await;
       if !Self::is_view_instance_valid(&locked, &key, view_instance_id) {
         return;
@@ -101,15 +101,44 @@ impl SessionManager {
       };
       let proxy_str = acc.proxy_url.clone().unwrap_or_default();
       let p_dir = locked.app_data_dir.join("profiles").join(&key.uuid);
-      #[cfg(windows)]
-      let win_ok = self
-        .read_windows_cookies_for_url(&app, &locked, &key, meta_url.clone())
-        .await
-        .is_ok_and(|(hdr, _)| !hdr.trim().is_empty());
-      #[cfg(not(windows))]
-      let win_ok = true;
-      (proxy_str, p_dir, win_ok)
+      (proxy_str, p_dir)
     };
+
+    // 1A：Windows Cookie 读取在锁外执行（原先在锁内 await）。
+    // 代理与热池 label 在这里短锁重读；与上一个短锁之间账号几乎
+    // 不可能被改，即使变了也只影响这次尽力而为的 Cookie 读取。
+    #[cfg(windows)]
+    let has_win_cookies = {
+      let (app_data_dir, warm_label, proxy_url_opt) = {
+        let locked = self.inner.lock().await;
+        (
+          locked.app_data_dir.clone(),
+          locked
+            .warm_pool
+            .get(&key)
+            .map(|entry| entry.webview_label.clone()),
+          locked
+            .store
+            .accounts
+            .iter()
+            .find(|a| a.provider_id == key.provider_id && a.uuid == key.uuid)
+            .and_then(|a| a.proxy_url.clone()),
+        )
+      };
+      self
+        .read_windows_cookies_for_url(
+          &app,
+          &app_data_dir,
+          warm_label,
+          proxy_url_opt,
+          &key,
+          meta_url.clone(),
+        )
+        .await
+        .is_ok_and(|(hdr, _)| !hdr.trim().is_empty())
+    };
+    #[cfg(not(windows))]
+    let has_win_cookies = true;
 
     #[cfg(target_os = "macos")]
     {
@@ -628,6 +657,8 @@ impl SessionManager {
     }
   }
 
+  // 注意：本函数体内已无 .await，但保持 async——session_manager.rs
+  // 的测试直接以 `.await` 调用它，改同步 fn 会破坏测试编译。
   pub(super) async fn apply_logged_out_state_locked(
     locked: &mut InnerState,
     key: &AccountKey,
@@ -671,10 +702,9 @@ impl SessionManager {
       target.quota_percent = None;
       target.cookie_expires_at_ms = None;
       target.cookie_session_only = false;
-
-      if Self::persist_locked(&mut *locked).await.is_err() {
-        return None;
-      }
+      // 1A：锁内不再同步写盘。调用方（apply_logged_out_state）在锁
+      // 释放后对返回的快照 request_persist；写盘失败时写线程立
+      // notice 并保留重试，快照照常返回。
     }
 
     Some(Self::snapshot_from_locked(locked))
@@ -690,6 +720,12 @@ impl SessionManager {
       let mut locked = self.inner.lock().await;
       Self::apply_logged_out_state_locked(&mut locked, &key, view_instance_id).await
     };
+
+    // 1A：锁内不再同步写盘；有快照即内存有改动，走防抖写盘。
+    // （仅清页面错误、无 store 改动时也会多一次内容不变的写盘，无害。）
+    if snap_opt.is_some() {
+      self.request_persist();
+    }
 
     if let Some(snap) = snap_opt {
       self.emit_snapshot(app, &snap);
@@ -729,9 +765,8 @@ impl SessionManager {
       }
       target.cookie_expires_at_ms = summary.expires_at_ms;
       target.cookie_session_only = summary.session_only;
-      if Self::persist_locked(&mut locked).await.is_err() {
-        return;
-      }
+      // 1A：后台同步路径，锁内不再同步写盘，改走防抖；快照照常返回。
+      self.request_persist();
       Some(Self::snapshot_from_locked(&locked))
     };
 
@@ -926,13 +961,12 @@ impl SessionManager {
     let needs_cookie_check = became_authenticated
       || (target.cookie_expires_at_ms.is_none() && !target.cookie_session_only);
 
-    let snap_opt = if changed {
-      if Self::persist_locked(&mut *locked).await.is_ok() {
-        Some(Self::snapshot_from_locked(locked))
-      } else {
-        None
-      }
-    } else if cleared_err {
+    // 1A：锁内不再同步写盘。调用方（apply_detected_metadata）在锁释放
+    // 后对返回的快照 request_persist；写盘失败时写线程立 notice 并
+    // 保留重试，快照照常返回。
+    // 注意：本函数体内已无 .await，但保持 async——session_manager.rs
+    // 的测试直接以 `.await` 调用它，改同步 fn 会破坏测试编译。
+    let snap_opt = if changed || cleared_err {
       Some(Self::snapshot_from_locked(locked))
     } else {
       None
@@ -989,6 +1023,12 @@ impl SessionManager {
       )
       .await
     };
+
+    // 1A：锁内不再同步写盘；有快照即内存有改动，走防抖写盘。
+    // （仅清页面错误、无 store 改动时也会多一次内容不变的写盘，无害。）
+    if snap_opt.is_some() {
+      self.request_persist();
+    }
 
     if let Some(title) = fg_title {
       #[cfg(desktop)]

@@ -110,7 +110,7 @@ pub struct ManagerSnapshot {
   pub active_group_id: Option<String>,
   pub external_agents: Vec<ExternalAgentView>,
   pub account_errors: Vec<AccountPageError>,
-  /// 配置加载失败或版本过高时为 true：写盘已被阻止（见 `persist_locked`）。
+  /// 配置加载失败或版本过高时为 true：写盘已被阻止（见 `persist_now`）。
   pub persist_blocked: bool,
   /// 配置 version 高于当前 STORE_VERSION 时为 true：只读。
   pub read_only: bool,
@@ -171,7 +171,7 @@ struct InnerState {
   store: AccountsStoreFile,
   conflicts: Vec<ConflictItem>,
   /// 配置加载失败或版本过高时为 true：
-  /// 所有写盘都必须经 `persist_locked` 拒绝，
+  /// 所有写盘都必须经 `persist_now` 拒绝，
   /// 直到用户明确选择「以空配置继续」或「从备份恢复」。
   persist_blocked: bool,
   read_only: bool,
@@ -240,6 +240,11 @@ pub struct SessionManager {
   persist_notify: Arc<tokio::sync::Notify>,
   /// 写线程只启动一次（`run_startup_tasks` / 测试入口共用）。
   persist_writer_started: AtomicBool,
+  /// 写盘序列化锁：`persist_now` 与防抖写线程共用，保证并发写盘
+  /// 严格串行；快照克隆在持锁后做，后一次写盘读到的是最新状态，
+  /// 不会用旧快照覆盖新快照。只在写盘路径上拿，绝不与 `inner`
+  /// 同时持有（拿锁顺序永远是 io → inner，不存在 inner → io）。
+  persist_io_lock: tokio::sync::Mutex<()>,
   /// 仅测试：防抖写线程成功写盘的次数，用于断言合并效果。
   #[cfg(test)]
   persist_write_count: AtomicU64,
@@ -334,6 +339,7 @@ impl SessionManager {
       persist_epoch: AtomicU64::new(0),
       persist_notify: Arc::new(tokio::sync::Notify::new()),
       persist_writer_started: AtomicBool::new(false),
+      persist_io_lock: tokio::sync::Mutex::new(()),
       #[cfg(test)]
       persist_write_count: AtomicU64::new(0),
     }
@@ -346,9 +352,24 @@ impl SessionManager {
   #[cfg(test)]
   pub async fn set_test_vault(&mut self, vault: crate::key_vault::ApiKeyVault) {
     self.api_key_vault = vault;
+    // 1A：迁移在锁外跑——先短锁克隆成员列表，锁外迁移，再锁内按 id
+    // 合并写回 api_key（迁移只改 api_key，不碰其他字段）。
+    let mut agents = {
+      let locked = self.inner.lock().await;
+      locked.store.external_agents.clone()
+    };
+    let _ = crate::storage::migrate_agent_keys_to_vault(&mut agents, &self.api_key_vault).await;
     let mut locked = self.inner.lock().await;
-    let _ =
-      crate::storage::migrate_agent_keys_to_vault(&mut locked.store, &self.api_key_vault).await;
+    for agent in agents {
+      if let Some(live) = locked
+        .store
+        .external_agents
+        .iter_mut()
+        .find(|e| e.id == agent.id)
+      {
+        live.api_key = agent.api_key;
+      }
+    }
   }
 
   #[cfg_attr(not(desktop), allow(dead_code))]
@@ -405,21 +426,52 @@ impl SessionManager {
       //（iOS 插件调用要主队列调度），这里已是 spawn 的异步任务。
       // 有旧明文 Key 时迁移成功后 request_persist() 写盘剥离明文；
       // 失败则立 notice，下次启动重试（磁盘原文件不动，Key 不丢）。
-      let has_legacy_plaintext = {
+      // 1A：迁移在锁外跑——短锁克隆成员列表，锁外迁移，再锁内按 id
+      // 合并写回 api_key。
+      let (has_legacy_plaintext, mut agents) = {
         let locked = self.inner.lock().await;
-        locked
-          .store
-          .external_agents
-          .iter()
-          .any(|a| !a.api_key.is_empty())
+        (
+          locked
+            .store
+            .external_agents
+            .iter()
+            .any(|a| !a.api_key.is_empty()),
+          locked.store.external_agents.clone(),
+        )
       };
-      let mut locked = self.inner.lock().await;
-      if !crate::storage::migrate_agent_keys_to_vault(&mut locked.store, &self.api_key_vault).await
-      {
-        locked.notice =
-          Some("API Key 未能迁移到系统凭据库，已保留原配置，下次启动重试".to_string());
-      } else if has_legacy_plaintext {
-        self.request_persist();
+      let migrated_ok =
+        crate::storage::migrate_agent_keys_to_vault(&mut agents, &self.api_key_vault).await;
+      let snap_opt = {
+        let mut locked = self.inner.lock().await;
+        for agent in agents {
+          if let Some(live) = locked
+            .store
+            .external_agents
+            .iter_mut()
+            .find(|e| e.id == agent.id)
+          {
+            live.api_key = agent.api_key;
+          }
+        }
+        if !migrated_ok {
+          locked.notice =
+            Some("API Key 未能迁移到系统凭据库，已保留原配置，下次启动重试".to_string());
+          Some(Self::snapshot_from_locked(&locked))
+        } else {
+          None
+        }
+      };
+      if migrated_ok {
+        if has_legacy_plaintext {
+          self.request_persist();
+        }
+      } else if let Some(snap) = snap_opt {
+        // 补漏：迁移失败的 notice 以前只写内存、不推事件；若前端已拉完
+        // 初始状态，提示要等到 run_startup_tasks 末尾的最终快照才出现
+        //（中间 retry_pending_cleanups 可能耗时数秒）。失败时立即推一次。
+        // 末尾的最终快照仍会正常推（notice 已立，candidate 为 None），
+        // 内容相同、前端渲染幂等，不是重复处理。
+        self.emit_snapshot(app, &snap);
       }
     }
     #[cfg(desktop)]
@@ -550,14 +602,14 @@ impl SessionManager {
     let next_seq = self.current_seq.fetch_add(1, Ordering::SeqCst) + 1;
 
     #[cfg(desktop)]
-    let warm_restore = {
+    let (warm_restore, hide_op) = {
       let mut locked = self.inner.lock().await;
       let spec =
         resolve_provider(&provider_id).ok_or_else(|| "未找到对应的服务配置".to_string())?;
       locked.active_group_id = None;
       locked.selected_provider_id = provider_id.clone();
-      self.hide_foreground_slot(app, next_seq, &mut locked).await;
-      if spec.info.enabled && locked.conflicts.is_empty() {
+      let hide_op = self.detach_foreground_slot_locked(app, next_seq, &mut locked);
+      let restore = if spec.info.enabled && locked.conflicts.is_empty() {
         locked
           .last_active_per_provider
           .get(&provider_id)
@@ -576,8 +628,14 @@ impl SessionManager {
           })
       } else {
         None
-      }
+      };
+      (restore, hide_op)
     };
+
+    #[cfg(desktop)]
+    if let Some(op) = hide_op {
+      self.execute_hide_slot(app, op).await;
+    }
 
     #[cfg(desktop)]
     if let Some(restore_key) = warm_restore {
@@ -586,12 +644,18 @@ impl SessionManager {
 
     #[cfg(not(desktop))]
     {
-      let mut locked = self.inner.lock().await;
-      let _ = resolve_provider(&provider_id).ok_or_else(|| "未找到对应的服务配置".to_string())?;
-      locked.active_group_id = None;
-      locked.selected_provider_id = provider_id;
-      self.hide_foreground_slot(app, next_seq, &mut locked).await;
-      return Ok(Self::snapshot_from_locked(&locked));
+      let (hide_op, snap) = {
+        let mut locked = self.inner.lock().await;
+        let _ = resolve_provider(&provider_id).ok_or_else(|| "未找到对应的服务配置".to_string())?;
+        locked.active_group_id = None;
+        locked.selected_provider_id = provider_id;
+        let hide_op = self.detach_foreground_slot_locked(app, next_seq, &mut locked);
+        (hide_op, Self::snapshot_from_locked(&locked))
+      };
+      if let Some(op) = hide_op {
+        self.execute_hide_slot(app, op).await;
+      }
+      return Ok(snap);
     }
 
     #[cfg(desktop)]
@@ -692,13 +756,23 @@ impl SessionManager {
         cookie_expires_at_ms: None,
         cookie_session_only: false,
       });
-      if let Err(err) = Self::persist_locked(&mut locked).await {
-        locked.store.accounts.pop();
+      let created_key = AccountKey {
+        provider_id: provider_id.clone(),
+        uuid: uuid.clone(),
+      };
+      let dir = locked.app_data_dir.join("profiles").join(&uuid);
+      drop(locked);
+      if let Err(err) = self.persist_now().await {
+        let mut locked = self.inner.lock().await;
+        locked
+          .store
+          .accounts
+          .retain(|a| !(a.provider_id == created_key.provider_id && a.uuid == created_key.uuid));
         return Err(err);
       }
+      let mut locked = self.inner.lock().await;
       locked.selected_provider_id = provider_id.clone();
-      let dir = locked.app_data_dir.join("profiles").join(&uuid);
-      (AccountKey { provider_id, uuid }, dir)
+      (created_key, dir)
     };
 
     if let (Some(specs), Some(url)) = (parsed_cookie_specs.as_ref(), url_opt.as_ref()) {
@@ -822,10 +896,32 @@ impl SessionManager {
       return Ok(Self::snapshot_from_locked(&locked));
     }
     let previous = std::mem::replace(&mut locked.store.accounts[index], updated);
-    if let Err(err) = Self::persist_locked(&mut locked).await {
-      locked.store.accounts[index] = previous;
+    drop(locked);
+    if let Err(err) = self.persist_now().await {
+      let mut locked = self.inner.lock().await;
+      if let Some(pos) = locked
+        .store
+        .accounts
+        .iter()
+        .position(|a| a.provider_id == provider_id && a.uuid == uuid)
+      {
+        locked.store.accounts[pos] = previous;
+      }
       return Err(err);
     }
+    // mut 只在桌面端需要（下面的写操作全是 #[cfg(desktop)]，其余只读）。
+    #[allow(unused_mut)]
+    let mut locked = self.inner.lock().await;
+
+    // 注意：index 是 persist 前算的下标，persist 期间其他任务可能增删
+    // 账号导致下标失效（错指他人记录、甚至越界 panic）；按
+    // (provider_id, uuid) 重新定位，找不到则报错。
+    let index = locked
+      .store
+      .accounts
+      .iter()
+      .position(|a| a.provider_id == provider_id && a.uuid == uuid)
+      .ok_or_else(|| "该账号已被移除，请重试".to_string())?;
 
     #[cfg(desktop)]
     if proxy_changed || timezone_changed {
@@ -843,12 +939,15 @@ impl SessionManager {
       }
       if was_active {
         let next_seq = self.current_seq.fetch_add(1, Ordering::SeqCst) + 1;
-        self.hide_foreground_slot(app, next_seq, &mut locked).await;
+        let hide_op = self.detach_foreground_slot_locked(app, next_seq, &mut locked);
         locked.notice = None;
         let account = locked.store.accounts[index].clone();
         let app_data_dir = locked.app_data_dir.clone();
         let view_instance_id = self.view_counter.fetch_add(1, Ordering::SeqCst);
         drop(locked);
+        if let Some(op) = hide_op {
+          self.execute_hide_slot(app, op).await;
+        }
         return self
           .open_desktop_session(
             app,
@@ -862,27 +961,39 @@ impl SessionManager {
       }
     }
 
-    if let Some(slot) = &locked.active_slot {
+    // 1A：移动端 update_account_title 是插件 IPC await，绝不能在持锁时
+    // 调；桌面端 set_title 是同步调用，移出锁外也不影响行为。锁内只算
+    // 标题与 seq，标题同步一律在锁释放后做。
+    let title_opt = if let Some(slot) = &locked.active_slot {
       if slot.committed
         && slot.account_key.provider_id == provider_id
         && slot.account_key.uuid == uuid
       {
-        let title = format!(
-          "{} · {}",
-          spec.info.short_name, locked.store.accounts[index].alias
-        );
-        #[cfg(desktop)]
-        if let Some(main_win) = app.get_window("main") {
-          let _ = main_win.set_title(&title);
-        }
-        #[cfg(mobile)]
-        {
-          let _ = crate::platform::mobile::update_account_title(app, slot.switch_seq, &title).await;
-        }
+        Some((
+          format!(
+            "{} · {}",
+            spec.info.short_name, locked.store.accounts[index].alias
+          ),
+          slot.switch_seq,
+        ))
+      } else {
+        None
       }
+    } else {
+      None
+    };
+    let snap = Self::snapshot_from_locked(&locked);
+    drop(locked);
+    if let Some((title, _seq)) = title_opt {
+      #[cfg(desktop)]
+      if let Some(main_win) = app.get_window("main") {
+        let _ = main_win.set_title(&title);
+      }
+      #[cfg(mobile)]
+      let _ = crate::platform::mobile::update_account_title(app, _seq, &title).await;
     }
 
-    Ok(Self::snapshot_from_locked(&locked))
+    Ok(snap)
   }
 
   pub async fn copy_account_cookie(
@@ -927,10 +1038,25 @@ impl SessionManager {
     }
     #[cfg(windows)]
     {
-      let res = self
-        .read_windows_cookies_for_url(app, &locked, &key, url)
-        .await;
+      // 1A：先短锁克隆出 Cookie 读取所需的输入，再释放锁后 await。
+      // 原先在锁内 await（读临时 webview 的 Cookie 是异步 IO）。
+      let (app_data_dir, warm_label, proxy_url_opt) = (
+        locked.app_data_dir.clone(),
+        locked
+          .warm_pool
+          .get(&key)
+          .map(|entry| entry.webview_label.clone()),
+        locked
+          .store
+          .accounts
+          .iter()
+          .find(|account| account.provider_id == key.provider_id && account.uuid == key.uuid)
+          .and_then(|account| account.proxy_url.clone()),
+      );
       drop(locked);
+      let res = self
+        .read_windows_cookies_for_url(app, &app_data_dir, warm_label, proxy_url_opt, &key, url)
+        .await;
       let (header, summary) = res?;
       self.apply_cookie_expiry_summary(app, &key, summary).await;
       platform::write_cookie_clipboard(app, header).await
@@ -985,20 +1111,25 @@ impl SessionManager {
     .map_err(|_| "读取账号 Cookie 中断".to_string())?
   }
 
+  /// 1A：锁外版——调用方先短锁克隆出 `app_data_dir` / 热池 webview
+  /// label / 账号代理，本函数不再碰 `inner` 锁；末尾的
+  /// `verify_desktop_profile_binding` / `read_windows_webview_cookies`
+  /// 本来就是异步调用，以前被迫在锁内 await，现在在锁外执行。
+  /// 注意：warm label 与代理分两次短锁读，中间热池可能变化；label
+  /// 过期只会退回建临时 webview 的老分支，不影响正确性。
   #[cfg(windows)]
   async fn read_windows_cookies_for_url(
     &self,
     app: &AppHandle,
-    locked: &InnerState,
+    app_data_dir: &Path,
+    warm_webview_label: Option<String>,
+    proxy_url: Option<String>,
     key: &AccountKey,
     url: Url,
   ) -> Result<(String, platform::CookieExpirySummary), String> {
-    let profile_dir = locked.app_data_dir.join("profiles").join(&key.uuid);
+    let profile_dir = app_data_dir.join("profiles").join(&key.uuid);
     let uuid = Uuid::parse_str(&key.uuid).map_err(|_| "账号资料标识无效".to_string())?;
-    let existing = locked
-      .warm_pool
-      .get(key)
-      .and_then(|entry| app.get_webview(&entry.webview_label));
+    let existing = warm_webview_label.and_then(|label| app.get_webview(&label));
     let temporary = existing.is_none();
     let webview = match existing {
       Some(webview) => webview,
@@ -1006,14 +1137,7 @@ impl SessionManager {
         if !profile_dir.is_dir() {
           return Err("该账号暂无可复制的 Cookie，请先登录".to_string());
         }
-        let account = locked
-          .store
-          .accounts
-          .iter()
-          .find(|account| account.provider_id == key.provider_id && account.uuid == key.uuid)
-          .ok_or_else(|| "未找到可用的账号".to_string())?;
-        let proxy =
-          platform::parse_account_proxy(account.proxy_url.as_deref().unwrap_or_default())?;
+        let proxy = platform::parse_account_proxy(proxy_url.as_deref().unwrap_or_default())?;
         let window = app
           .get_window("main")
           .ok_or_else(|| "主窗口不存在".to_string())?;
@@ -1323,7 +1447,7 @@ impl SessionManager {
       uuid: uuid.clone(),
     };
 
-    let closed_desktop_view = {
+    let (closed_desktop_view, hide_op) = {
       let mut locked = self.inner.lock().await;
       if !locked.conflicts.is_empty() {
         return Err("存在 UUID 归属冲突，请先完成归属裁决".to_string());
@@ -1362,20 +1486,24 @@ impl SessionManager {
       if !locked.store.pending_cleanup.contains(&key) {
         locked.store.pending_cleanup.push(key.clone());
       }
-      Self::persist_locked(&mut locked).await?;
+      drop(locked);
+      self.persist_now().await?;
+      let mut locked = self.inner.lock().await;
 
       let active_matches = locked
         .active_slot
         .as_ref()
         .map(|s| s.account_key == key)
         .unwrap_or(false);
-      if active_matches {
+      let hide_op = if active_matches {
         let next_seq = self.current_seq.fetch_add(1, Ordering::SeqCst) + 1;
-        self.hide_foreground_slot(app, next_seq, &mut locked).await;
-      }
+        self.detach_foreground_slot_locked(app, next_seq, &mut locked)
+      } else {
+        None
+      };
 
       #[cfg(desktop)]
-      {
+      let closed = {
         locked.prewarm_failed.remove(&key);
         locked.cookie_checked_at.remove(&key);
         if let Some(warm_entry) = locked.warm_pool.remove(&key) {
@@ -1385,12 +1513,15 @@ impl SessionManager {
         } else {
           false
         }
-      }
+      };
       #[cfg(not(desktop))]
-      {
-        false
-      }
+      let closed = false;
+      (closed, hide_op)
     };
+
+    if let Some(op) = hide_op {
+      self.execute_hide_slot(app, op).await;
+    }
 
     if closed_desktop_view {
       tokio::time::sleep(std::time::Duration::from_millis(120)).await;
@@ -1459,11 +1590,13 @@ impl SessionManager {
     for (slot_idx, record) in slot_indices.into_iter().zip(reordered) {
       locked.store.accounts[slot_idx] = record;
     }
-    if let Err(err) = Self::persist_locked(&mut locked).await {
+    drop(locked);
+    if let Err(err) = self.persist_now().await {
+      let mut locked = self.inner.lock().await;
       locked.store.accounts = previous;
       return Err(err);
     }
-
+    let locked = self.inner.lock().await;
     Ok(Self::snapshot_from_locked(&locked))
   }
 
@@ -1510,17 +1643,20 @@ impl SessionManager {
           Self::close_warm_entry(app, entry);
         }
         if was_active {
-          self.hide_foreground_slot(app, next_seq, &mut locked).await;
+          let hide_op = self.detach_foreground_slot_locked(app, next_seq, &mut locked);
           let app_data_dir = locked.app_data_dir.clone();
           let vid = self.view_counter.fetch_add(1, Ordering::SeqCst);
-          Some((acc, app_data_dir, vid))
+          Some((acc, app_data_dir, vid, hide_op))
         } else {
           Self::apply_desktop_layout_locked(app, &locked);
           None
         }
       };
 
-      if let Some((account, app_data_dir, vid)) = action {
+      if let Some((account, app_data_dir, vid, hide_op)) = action {
+        if let Some(op) = hide_op {
+          self.execute_hide_slot(app, op).await;
+        }
         return self
           .open_desktop_session(app, account, app_data_dir, next_seq, vid, false)
           .await;
@@ -1558,7 +1694,7 @@ impl SessionManager {
       uuid: uuid.clone(),
     };
 
-    let (was_active, closed_desktop_view) = {
+    let (was_active, closed_desktop_view, hide_op) = {
       let mut locked = self.inner.lock().await;
       if !locked.conflicts.is_empty() {
         return Err("存在 UUID 归属冲突，请先完成归属裁决".to_string());
@@ -1574,10 +1710,12 @@ impl SessionManager {
         .active_slot
         .as_ref()
         .is_some_and(|s| s.account_key == key);
-      if active_matches {
+      let hide_op = if active_matches {
         let next_seq = self.current_seq.fetch_add(1, Ordering::SeqCst) + 1;
-        self.hide_foreground_slot(app, next_seq, &mut locked).await;
-      }
+        self.detach_foreground_slot_locked(app, next_seq, &mut locked)
+      } else {
+        None
+      };
 
       locked.store.accounts[idx].auth_state = AuthState::LoggedOut;
       locked.store.accounts[idx].quota_detail = None;
@@ -1591,7 +1729,11 @@ impl SessionManager {
       if !locked.store.pending_cleanup.contains(&key) {
         locked.store.pending_cleanup.push(key.clone());
       }
-      Self::persist_locked(&mut locked).await?;
+      drop(locked);
+      self.persist_now().await?;
+      // 重锁只为桌面端关热池用；移动端不用，cfg 掉避免 unused 警告。
+      #[cfg(desktop)]
+      let mut locked = self.inner.lock().await;
 
       #[cfg(desktop)]
       let closed = {
@@ -1609,8 +1751,12 @@ impl SessionManager {
       #[cfg(not(desktop))]
       let closed = false;
 
-      (active_matches, closed)
+      (active_matches, closed, hide_op)
     };
+
+    if let Some(op) = hide_op {
+      self.execute_hide_slot(app, op).await;
+    }
 
     if closed_desktop_view {
       tokio::time::sleep(std::time::Duration::from_millis(150)).await;
@@ -1621,7 +1767,9 @@ impl SessionManager {
         let snap = {
           let mut locked = self.inner.lock().await;
           locked.store.pending_cleanup.retain(|k| k != &key);
-          Self::persist_locked(&mut locked).await?;
+          drop(locked);
+          self.persist_now().await?;
+          let locked = self.inner.lock().await;
           Self::snapshot_from_locked(&locked)
         };
         if was_active {
@@ -1692,7 +1840,9 @@ impl SessionManager {
         locked.store.settings.disable_auto_update_check = v;
       }
       locked.store.settings.auto_approve_commands = next_auto_approve_commands;
-      if let Err(err) = Self::persist_locked(&mut locked).await {
+      drop(locked);
+      if let Err(err) = self.persist_now().await {
+        let mut locked = self.inner.lock().await;
         locked.store.settings = previous;
         return Err(err);
       }
@@ -1703,6 +1853,7 @@ impl SessionManager {
       self
         .auto_approve_commands
         .store(next_auto_approve_commands, Ordering::SeqCst);
+      let mut locked = self.inner.lock().await;
       locked.global_shortcut_active = global_shortcut_active;
       locked.global_shortcut_error = global_shortcut_error;
       #[cfg(desktop)]
@@ -1845,7 +1996,9 @@ impl SessionManager {
     if locked.conflicts.is_empty() {
       locked.notice = None;
     }
-    Self::persist_locked(&mut locked).await?;
+    drop(locked);
+    self.persist_now().await?;
+    let locked = self.inner.lock().await;
     Ok(Self::snapshot_from_locked(&locked))
   }
 
@@ -2100,6 +2253,9 @@ impl SessionManager {
         Abort(ManagerSnapshot),
       }
 
+      // 桌面 switch 的 detach 点（pending 清理分支与主路径）互斥，
+      // 任一走到 plan 后的路径都已赋值一次；let-else 分支在块内就地执行。
+      let hide_op;
       let plan = {
         let mut locked = self.inner.lock().await;
         if !locked.conflicts.is_empty() {
@@ -2111,7 +2267,7 @@ impl SessionManager {
           return Err(format!("{} 尚未开放应用内嵌", spec.info.name));
         }
         if locked.store.pending_cleanup.contains(&key) {
-          self.hide_foreground_slot(app, next_seq, &mut locked).await;
+          hide_op = self.detach_foreground_slot_locked(app, next_seq, &mut locked);
           locked.notice = Some("该账号正在清理本地资料，请稍后重试或重新创建".to_string());
           DesktopSwitchPlan::Abort(Self::snapshot_from_locked(&locked))
         } else {
@@ -2122,16 +2278,21 @@ impl SessionManager {
             .find(|a| a.provider_id == key.provider_id && a.uuid == key.uuid)
             .cloned()
           else {
-            self.hide_foreground_slot(app, next_seq, &mut locked).await;
+            let hide_op = self.detach_foreground_slot_locked(app, next_seq, &mut locked);
             locked.notice = Some("账号归属核对失败，已回到管理页".to_string());
-            return Ok(Self::snapshot_from_locked(&locked));
+            let snap = Self::snapshot_from_locked(&locked);
+            drop(locked);
+            if let Some(op) = hide_op {
+              self.execute_hide_slot(app, op).await;
+            }
+            return Ok(snap);
           };
 
           locked.active_group_id = None;
           locked.selected_provider_id = key.provider_id.clone();
           locked.notice = None;
           locked.prewarm_failed.remove(&key);
-          self.hide_foreground_slot(app, next_seq, &mut locked).await;
+          hide_op = self.detach_foreground_slot_locked(app, next_seq, &mut locked);
 
           let warm_state = locked.warm_pool.get(&key).and_then(|entry| {
             if app.get_webview(&entry.webview_label).is_some() {
@@ -2194,11 +2355,14 @@ impl SessionManager {
             } else if paint_ready {
               let prev_last = locked.store.last_committed.clone();
               locked.store.last_committed = Some(key.clone());
-              if let Err(err) = Self::persist_locked(&mut locked).await {
+              drop(locked);
+              if let Err(err) = self.persist_now().await {
+                let mut locked = self.inner.lock().await;
                 locked.store.last_committed = prev_last;
                 locked.notice = Some(format!("提交账号记录写盘失败: {err}"));
                 DesktopSwitchPlan::Abort(Self::snapshot_from_locked(&locked))
               } else {
+                let mut locked = self.inner.lock().await;
                 locked
                   .last_active_per_provider
                   .insert(key.provider_id.clone(), key.clone());
@@ -2257,6 +2421,10 @@ impl SessionManager {
           }
         }
       };
+
+      if let Some(op) = hide_op {
+        self.execute_hide_slot(app, op).await;
+      }
 
       match plan {
         DesktopSwitchPlan::Abort(snap) => Ok(snap),
@@ -2323,7 +2491,7 @@ impl SessionManager {
     #[cfg(mobile)]
     {
       let view_instance_id = self.view_counter.fetch_add(1, Ordering::SeqCst);
-      let account_record = {
+      let (account_record, hide_op) = {
         let mut locked = self.inner.lock().await;
         if !locked.conflicts.is_empty() {
           return Err("存在 UUID 归属冲突，已停留在管理页".to_string());
@@ -2334,9 +2502,14 @@ impl SessionManager {
           return Err(format!("{} 尚未开放应用内嵌", spec.info.name));
         }
         if locked.store.pending_cleanup.contains(&key) {
-          self.hide_foreground_slot(app, next_seq, &mut locked).await;
+          let hide_op = self.detach_foreground_slot_locked(app, next_seq, &mut locked);
           locked.notice = Some("该账号正在清理本地资料，请稍后重试或重新创建".to_string());
-          return Ok(Self::snapshot_from_locked(&locked));
+          let snap = Self::snapshot_from_locked(&locked);
+          drop(locked);
+          if let Some(op) = hide_op {
+            self.execute_hide_slot(app, op).await;
+          }
+          return Ok(snap);
         }
         let Some(acc) = locked
           .store
@@ -2345,17 +2518,26 @@ impl SessionManager {
           .find(|a| a.provider_id == key.provider_id && a.uuid == key.uuid)
           .cloned()
         else {
-          self.hide_foreground_slot(app, next_seq, &mut locked).await;
+          let hide_op = self.detach_foreground_slot_locked(app, next_seq, &mut locked);
           locked.notice = Some("账号归属核对失败，已回到管理页".to_string());
-          return Ok(Self::snapshot_from_locked(&locked));
+          let snap = Self::snapshot_from_locked(&locked);
+          drop(locked);
+          if let Some(op) = hide_op {
+            self.execute_hide_slot(app, op).await;
+          }
+          return Ok(snap);
         };
         platform::parse_account_proxy(acc.proxy_url.as_deref().unwrap_or_default())?;
         locked.active_group_id = None;
         locked.selected_provider_id = key.provider_id;
         locked.notice = None;
-        self.hide_foreground_slot(app, next_seq, &mut locked).await;
-        acc
+        let hide_op = self.detach_foreground_slot_locked(app, next_seq, &mut locked);
+        (acc, hide_op)
       };
+
+      if let Some(op) = hide_op {
+        self.execute_hide_slot(app, op).await;
+      }
 
       self
         .open_mobile_session(
@@ -2786,7 +2968,9 @@ impl SessionManager {
       return;
     }
 
-    let snap_opt = {
+    // 校验段：锁内只做内存判断与 detach；execute 必须在锁释放后。
+    // 同时把 last_committed 改为新值并带出 prev_last，供写盘失败时恢复。
+    let (spec, acc, prev_last) = {
       let mut locked = self.inner.lock().await;
       if self.current_seq.load(Ordering::SeqCst) != expected_seq {
         return;
@@ -2798,9 +2982,11 @@ impl SessionManager {
         return;
       }
       if !locked.conflicts.is_empty() || locked.store.pending_cleanup.contains(&key) {
-        self
-          .hide_foreground_slot(app, expected_seq, &mut locked)
-          .await;
+        let hide_op = self.detach_foreground_slot_locked(app, expected_seq, &mut locked);
+        drop(locked);
+        if let Some(op) = hide_op {
+          self.execute_hide_slot(app, op).await;
+        }
         return;
       }
       let Some(acc) = locked
@@ -2810,9 +2996,11 @@ impl SessionManager {
         .find(|a| a.provider_id == key.provider_id && a.uuid == key.uuid)
         .cloned()
       else {
-        self
-          .hide_foreground_slot(app, expected_seq, &mut locked)
-          .await;
+        let hide_op = self.detach_foreground_slot_locked(app, expected_seq, &mut locked);
+        drop(locked);
+        if let Some(op) = hide_op {
+          self.execute_hide_slot(app, op).await;
+        }
         return;
       };
 
@@ -2831,25 +3019,41 @@ impl SessionManager {
 
       let prev_last = locked.store.last_committed.clone();
       locked.store.last_committed = Some(key.clone());
-      if let Err(err) = Self::persist_locked(&mut locked).await {
-        locked.store.last_committed = prev_last;
-        self
-          .hide_foreground_slot(app, expected_seq, &mut locked)
-          .await;
-        locked.notice = Some(format!("提交账号记录写盘失败，已回退管理页: {err}"));
-        Some(Self::snapshot_from_locked(&locked))
-      } else {
-        if let Some(slot) = &mut locked.active_slot {
-          slot.committed = true;
-        }
-        let title = format!("{} · {}", spec.info.short_name, acc.alias);
-        let _ = crate::platform::mobile::update_account_title(app, expected_seq, &title).await;
-        Some(Self::snapshot_from_locked(&locked))
-      }
+      (spec, acc, prev_last)
     };
 
-    if let Some(snap) = snap_opt {
-      self.emit_snapshot(app, &snap);
+    match self.persist_now().await {
+      Err(err) => {
+        // 失败分支：重锁恢复 last_committed → detach（锁内）→ 释放锁 →
+        // execute → 再重锁立 notice、取快照、发出。
+        let hide_op = {
+          let mut locked = self.inner.lock().await;
+          locked.store.last_committed = prev_last;
+          self.detach_foreground_slot_locked(app, expected_seq, &mut locked)
+        };
+        if let Some(op) = hide_op {
+          self.execute_hide_slot(app, op).await;
+        }
+        let snap = {
+          let mut locked = self.inner.lock().await;
+          locked.notice = Some(format!("提交账号记录写盘失败，已回退管理页: {err}"));
+          Self::snapshot_from_locked(&locked)
+        };
+        self.emit_snapshot(app, &snap);
+      }
+      Ok(()) => {
+        // 成功分支：先标 committed、再推标题、最后发快照。
+        let title = {
+          let mut locked = self.inner.lock().await;
+          if let Some(slot) = &mut locked.active_slot {
+            slot.committed = true;
+          }
+          format!("{} · {}", spec.info.short_name, acc.alias)
+        };
+        let _ = crate::platform::mobile::update_account_title(app, expected_seq, &title).await;
+        let snap = self.get_snapshot().await;
+        self.emit_snapshot(app, &snap);
+      }
     }
   }
 }
@@ -4703,6 +4907,109 @@ mod tests {
       .get_snapshot()
       .await;
     assert!(!reloaded.settings.minimize_to_tray);
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+  }
+
+  /// 1A：并发 `persist_now` 不阻塞 `inner`，且最终磁盘内容等于最后一次状态。
+  /// 8 个任务各加一个账号后调 `persist_now`；`persist_now` 在 io 锁内克隆，
+  /// 写盘顺序与克隆顺序一致，最后一个拿到 io 锁的任务克隆到全部 8 次变更，
+  /// 故磁盘最终一定含全部 8 个账号（旧的“先克隆、后拿锁”顺序做不到这点）。
+  /// 期间主任务反复加锁读 `inner` 必须立刻成功（写盘 IO 不持锁）。
+  #[tokio::test]
+  async fn persist_now_concurrent_writes_last_state_wins_and_inner_stays_free() {
+    let temp_dir = std::env::temp_dir().join(format!("maam-persist-now-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&temp_dir).unwrap();
+    let mgr = std::sync::Arc::new(SessionManager::new(temp_dir.clone()).await);
+    let store_path = temp_dir.join("accounts.json");
+
+    let mut handles = Vec::new();
+    for i in 0..8u32 {
+      let mgr = std::sync::Arc::clone(&mgr);
+      handles.push(tokio::task::spawn(async move {
+        {
+          let mut locked = mgr.inner.lock().await;
+          locked.store.accounts.push(make_test_account(
+            ProviderId::muse(),
+            &format!("00000000-0000-4000-8000-00000000000{i}"),
+            &format!("task-{i}"),
+          ));
+        }
+        mgr.persist_now().await.expect("并发 persist_now 应成功");
+      }));
+    }
+    // 写盘进行中时 inner 必须能立刻加上锁（不被写盘 IO 堵住）。
+    let probe = tokio::time::timeout(std::time::Duration::from_secs(5), mgr.inner.lock()).await;
+    assert!(probe.is_ok(), "persist_now 写盘期间 inner 应可立即加锁");
+    drop(probe.unwrap());
+    for handle in handles {
+      handle.await.expect("任务不应 panic");
+    }
+
+    let reloaded = SessionManager::new(temp_dir.clone())
+      .await
+      .get_snapshot()
+      .await;
+    assert_eq!(reloaded.accounts.len(), 8, "磁盘最终应含全部 8 个账号");
+    for i in 0..8u32 {
+      assert!(
+        reloaded
+          .accounts
+          .iter()
+          .any(|a| a.alias == format!("task-{i}")),
+        "磁盘应含 task-{i}"
+      );
+    }
+    assert!(store_path.exists());
+    let _ = std::fs::remove_dir_all(&temp_dir);
+  }
+
+  /// 1A：`persist_now` 的 `persist_blocked` 短路——blocked 时不写盘、
+  /// 返回 Err、立 notice；解除阻止后再次调用即成功写盘。
+  #[tokio::test]
+  async fn persist_now_short_circuits_when_persist_blocked() {
+    let temp_dir =
+      std::env::temp_dir().join(format!("maam-persist-now-blocked-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&temp_dir).unwrap();
+    let mgr = std::sync::Arc::new(SessionManager::new(temp_dir.clone()).await);
+    let store_path = temp_dir.join("accounts.json");
+
+    // 先成功写一次，磁盘有文件。
+    assert!(mgr.persist_now().await.is_ok());
+    assert!(store_path.exists());
+    let before = std::fs::read(&store_path).unwrap();
+
+    // 模拟配置损坏导致的阻止状态。
+    {
+      let mut locked = mgr.inner.lock().await;
+      locked.persist_blocked = true;
+      locked.store.settings.minimize_to_tray = true;
+    }
+    let err = mgr.persist_now().await.expect_err("blocked 时应返回 Err");
+    assert!(err.contains("写盘已被阻止"), "Err 应说明写盘被阻止: {err}");
+    // 磁盘原样不动（内存里的改动没落盘）。
+    assert_eq!(std::fs::read(&store_path).unwrap(), before);
+    assert!(
+      mgr
+        .get_snapshot()
+        .await
+        .notice
+        .unwrap_or_default()
+        .contains("写盘已被阻止"),
+      "blocked 时应立 notice"
+    );
+
+    // 解除阻止后再次调用，写盘成功且含最新改动。
+    {
+      let mut locked = mgr.inner.lock().await;
+      locked.persist_blocked = false;
+    }
+    assert!(mgr.persist_now().await.is_ok());
+    let reloaded = SessionManager::new(temp_dir.clone())
+      .await
+      .get_snapshot()
+      .await;
+    assert!(reloaded.settings.minimize_to_tray);
 
     let _ = std::fs::remove_dir_all(&temp_dir);
   }

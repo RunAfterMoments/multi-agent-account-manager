@@ -2,7 +2,7 @@
 //!
 //! Moved verbatim from `session_manager.rs`: the warm-pool helpers
 //! (`close_warm_entry`, `group_needs_auth_members`, `evict_warm_pool_if_needed`,
-//! `reclaim_idle_desktop_webviews`, `hide_foreground_slot`,
+//! `reclaim_idle_desktop_webviews`, `detach_foreground_slot_locked` / `execute_hide_slot`,
 //! `set_right_webview_input_frozen`, `apply_desktop_layout_locked`,
 //! `recompute_desktop_bounds`), the account-webview builders
 //! (`build_desktop_account_webview`, `attach_desktop_account_webview`,
@@ -38,6 +38,12 @@ use tauri::AppHandle;
 use tauri::Manager;
 use url::Url;
 use uuid::Uuid;
+
+/// 移动端在锁外关闭当前活动会话时携带的参数（仅需 switch_seq）。
+/// 桌面端在 detach 里已同步完成隐藏，execute 无事可做。
+pub(super) struct HideSlotOp {
+  next_seq: u64,
+}
 
 impl SessionManager {
   #[cfg(desktop)]
@@ -160,15 +166,24 @@ impl SessionManager {
     }
   }
 
-  pub(super) async fn hide_foreground_slot(
+  /// 1A：旧 `hide_foreground_slot` 的锁内纯内存步——清
+  /// `pending_external_auth`、复位 `active_view_id`、取出旧槽位；
+  /// 桌面端同步完成 popup 关闭 / webview 隐藏 / 标题与布局。
+  /// 移动端若有旧槽位则返回 `Some(op)`，调用方释放 `inner` 锁后
+  /// 再调 `execute_hide_slot`；无旧槽位返回 `None`，不用执行第二步。
+  pub(super) fn detach_foreground_slot_locked(
     &self,
     app: &AppHandle,
     next_seq: u64,
     locked: &mut InnerState,
-  ) {
+  ) -> Option<HideSlotOp> {
+    // 移动端不用 app（关闭会话在锁外的 execute_hide_slot 里做）；
+    // 显式读一次，避免移动端目标报 app 从未读取的警告。
+    #[cfg(mobile)]
+    let _ = app;
     locked.pending_external_auth = None;
     self.active_view_id.store(0, Ordering::SeqCst);
-    if let Some(old_slot) = locked.active_slot.take() {
+    let had_slot = if let Some(old_slot) = locked.active_slot.take() {
       #[cfg(desktop)]
       {
         let _ = next_seq;
@@ -186,15 +201,47 @@ impl SessionManager {
       #[cfg(mobile)]
       {
         let _ = old_slot;
-        let _ = crate::platform::mobile::close_active_session(app, next_seq).await;
       }
-    }
+      true
+    } else {
+      false
+    };
     #[cfg(desktop)]
     {
       if let Some(main_win) = app.get_window("main") {
         let _ = main_win.set_title(APP_TITLE);
       }
       Self::apply_desktop_layout_locked(app, locked);
+    }
+    #[cfg(mobile)]
+    {
+      if had_slot {
+        Some(HideSlotOp { next_seq })
+      } else {
+        None
+      }
+    }
+    #[cfg(not(mobile))]
+    {
+      let _ = had_slot;
+      None
+    }
+  }
+
+  /// 1A：旧 `hide_foreground_slot` 的锁外执行步——移动端关闭当前活动
+  /// 会话（插件 IPC，需 await，必须在释放 `inner` 锁后调用）。
+  /// 桌面端在 detach 里已同步完成，调用后直接返回。
+  pub(super) async fn execute_hide_slot(&self, app: &AppHandle, op: HideSlotOp) {
+    #[cfg(mobile)]
+    {
+      let _ = crate::platform::mobile::close_active_session(app, op.next_seq).await;
+    }
+    #[cfg(not(mobile))]
+    {
+      // 桌面端无事可做；显式读一次字段，避免非移动端目标报
+      // `next_seq` 从未读取的 dead_code 警告。
+      let _ = app;
+      let _ = op.next_seq;
     }
   }
 
@@ -1247,7 +1294,30 @@ impl SessionManager {
       return;
     }
 
-    let (snap_opt, start_watcher, probe_notify_opt) = {
+    // 1A：前台提交的写盘不再在锁内同步做。锁内只记 last_committed 并
+    // 备好提交所需数据，释放锁后 persist_now，成功再重锁提交、失败
+    // 再重锁回退。persist 期间用户可能已切走，故重锁后先校验 slot
+    // 仍是本轮等待的前台位才动它。
+    enum ForegroundCommit {
+      // Done variant 含整份 ManagerSnapshot，体积远大于 NeedsPersist；
+      // 装箱避免 clippy::large_enum_variant（快照本身已是堆上数据为主，
+      // 这里多一层指针无实际开销）。
+      Done(
+        Box<(
+          Option<ManagerSnapshot>,
+          bool,
+          Option<Arc<tokio::sync::Notify>>,
+        )>,
+      ),
+      NeedsPersist {
+        prev_last: Option<AccountKey>,
+        need_watcher: bool,
+        probe_notify: Arc<tokio::sync::Notify>,
+        title: String,
+      },
+    }
+
+    let outcome = {
       let mut locked = self.inner.lock().await;
       if !locked.conflicts.is_empty() || locked.store.pending_cleanup.contains(&key) {
         if let Some(entry) = locked.warm_pool.remove(&key) {
@@ -1299,44 +1369,83 @@ impl SessionManager {
       if is_foreground_waiting {
         let prev_last = locked.store.last_committed.clone();
         locked.store.last_committed = Some(key.clone());
-        if let Err(err) = Self::persist_locked(&mut locked).await {
-          locked.store.last_committed = prev_last;
-          locked.active_slot = None;
-          self.active_view_id.store(0, Ordering::SeqCst);
-          locked.notice = Some(format!("提交账号记录写盘失败，已回退管理页: {err}"));
-          Self::apply_desktop_layout_locked(app, &locked);
-          (Some(Self::snapshot_from_locked(&locked)), false, None)
-        } else {
-          if let Some(slot) = &mut locked.active_slot {
-            slot.committed = true;
+        let short_name = resolve_provider(&key.provider_id)
+          .map(|s| s.info.short_name)
+          .unwrap_or_else(|| key.provider_id.as_str().to_string());
+        ForegroundCommit::NeedsPersist {
+          prev_last,
+          need_watcher,
+          probe_notify,
+          title: format!("{short_name} · {}", acc.alias),
+        }
+      } else {
+        ForegroundCommit::Done(Box::new((
+          Some(Self::snapshot_from_locked(&locked)),
+          need_watcher,
+          Some(probe_notify),
+        )))
+      }
+    };
+
+    // 用户主动前台提交：调用方依赖“写盘成功才提交”，故走强同步
+    // persist_now（已释放锁），失败语义按原逻辑保留（回退 + notice）。
+    let (snap_opt, start_watcher, probe_notify_opt) = match outcome {
+      ForegroundCommit::Done(tuple) => *tuple,
+      ForegroundCommit::NeedsPersist {
+        prev_last,
+        need_watcher,
+        probe_notify,
+        title,
+      } => match self.persist_now().await {
+        Ok(()) => {
+          let mut locked = self.inner.lock().await;
+          // 只有 slot 仍是本轮等待的前台位才提交：persist 期间用户
+          // 可能已切到别的账号，提交错位 slot 会 corrupt 状态。
+          // watcher 与提交无关（按 entry 走），两种情况都照常返回。
+          if locked.active_slot.as_ref().is_some_and(|s| {
+            s.account_key == key && s.view_instance_id == view_instance_id && !s.committed
+          }) {
+            if let Some(slot) = &mut locked.active_slot {
+              slot.committed = true;
+            }
+            if let Some(entry) = locked.warm_pool.get_mut(&key) {
+              entry.last_used_ms = now_ms();
+            }
+            locked
+              .last_active_per_provider
+              .insert(key.provider_id.clone(), key.clone());
+            if let Some(main_win) = app.get_window("main") {
+              let _ = main_win.set_title(&title);
+            }
+            Self::apply_desktop_layout_locked(app, &locked);
           }
-          if let Some(entry) = locked.warm_pool.get_mut(&key) {
-            entry.last_used_ms = now_ms();
-          }
-          locked
-            .last_active_per_provider
-            .insert(key.provider_id.clone(), key.clone());
-          let short_name = resolve_provider(&key.provider_id)
-            .map(|s| s.info.short_name)
-            .unwrap_or_else(|| key.provider_id.as_str().to_string());
-          let title = format!("{short_name} · {}", acc.alias);
-          if let Some(main_win) = app.get_window("main") {
-            let _ = main_win.set_title(&title);
-          }
-          Self::apply_desktop_layout_locked(app, &locked);
           (
             Some(Self::snapshot_from_locked(&locked)),
             need_watcher,
             Some(probe_notify),
           )
         }
-      } else {
-        (
-          Some(Self::snapshot_from_locked(&locked)),
-          need_watcher,
-          Some(probe_notify),
-        )
-      }
+        Err(err) => {
+          let mut locked = self.inner.lock().await;
+          // 只回退仍属于本轮的位：persist 期间用户已切走时不许动新
+          // slot；last_committed 只有仍是本账号时才回退，避免覆盖
+          // 后来者的提交。
+          if locked
+            .active_slot
+            .as_ref()
+            .is_some_and(|s| s.account_key == key && s.view_instance_id == view_instance_id)
+          {
+            locked.store.last_committed = prev_last;
+            locked.active_slot = None;
+            self.active_view_id.store(0, Ordering::SeqCst);
+          } else if locked.store.last_committed.as_ref() == Some(&key) {
+            locked.store.last_committed = prev_last;
+          }
+          locked.notice = Some(format!("提交账号记录写盘失败，已回退管理页: {err}"));
+          Self::apply_desktop_layout_locked(app, &locked);
+          (Some(Self::snapshot_from_locked(&locked)), false, None)
+        }
+      },
     };
 
     if let Some(probe_notify) = probe_notify_opt {

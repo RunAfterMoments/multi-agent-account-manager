@@ -1305,7 +1305,7 @@ pub fn save_store_atomic(path: &Path, store: &AccountsStoreFile) -> Result<(), S
 /// 异步版 `save_store_atomic`：序列化与写盘在 `spawn_blocking` 中进行，
 /// 不占用异步运行时的工作线程。调用者须在调用前克隆好 store；
 /// 防抖写线程在写盘期间不持有 `SessionManager::inner` 锁
-/// （`persist_locked` 在写盘期间仍持锁，见其文档）。
+/// （写盘路径均先克隆快照再释放锁，不在持锁期间写盘）。
 pub async fn save_store_atomic_async(
   path: PathBuf,
   store: AccountsStoreFile,
@@ -1438,7 +1438,8 @@ pub async fn load_or_migrate_store(
   // migrate_keys=false 时连同写回一并跳过：明文 Key 尚未进 vault，
   // 此时写盘会把 api_key（skip_serializing）剥离，崩溃即丢 Key。
   if migrate_keys {
-    let key_migration_failed = !migrate_agent_keys_to_vault(&mut store, vault).await;
+    let key_migration_failed =
+      !migrate_agent_keys_to_vault(&mut store.external_agents, vault).await;
     if key_migration_failed {
       return LoadedAccountsStore {
         store,
@@ -1480,12 +1481,15 @@ pub async fn load_or_migrate_store(
 /// 但内存为空（v5/v6 备份，Key 只在 vault 里）→ 从 vault 取回内存。
 /// 返回 false 表示有写入失败：调用方不要把剥离了 Key 的配置写盘，
 /// 否则明文 Key 永久丢失（api_key 标了 skip_serializing，写盘即丢）。
+/// 1A：入参改为 `&mut [ExternalAgentRecord]`——调用方先在锁外克隆
+/// 出成员列表、锁外跑迁移、再锁内按 id 合并写回 `api_key`，避免
+/// 持 `inner` 锁等 vault 异步调用。
 pub async fn migrate_agent_keys_to_vault(
-  store: &mut AccountsStoreFile,
+  agents: &mut [ExternalAgentRecord],
   vault: &crate::key_vault::ApiKeyVault,
 ) -> bool {
   let mut ok = true;
-  for agent in &mut store.external_agents {
+  for agent in agents {
     if let Some(key_ref) = agent.api_key_ref.clone() {
       if !agent.api_key.is_empty() {
         if vault.store_key(&key_ref, &agent.api_key).await.is_err() {
@@ -1838,7 +1842,7 @@ mod tests {
     );
     // 补跑迁移（run_startup_tasks 移动端分支同款调用）：Key 进 vault。
     let mut store = loaded.store;
-    assert!(super::migrate_agent_keys_to_vault(&mut store, &vault).await);
+    assert!(super::migrate_agent_keys_to_vault(&mut store.external_agents, &vault).await);
     assert_eq!(
       vault
         .load_key("maam-api-key:00000000-0000-4000-8000-000000000053")

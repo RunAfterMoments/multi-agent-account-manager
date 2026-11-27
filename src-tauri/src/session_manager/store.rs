@@ -1,7 +1,7 @@
 //! Config store + persistence (P2-11 split).
 //!
 //! Moved verbatim from `session_manager.rs`: the store/persist unit —
-//! `snapshot_from_locked`, `persist_locked` / `persist`, the P0-1 unblock
+//! `snapshot_from_locked`, `persist_now` / `persist`, the P0-1 unblock
 //! paths (`continue_with_empty_config`, `backup_candidates`,
 //! `restore_config_from_backup`), snapshot emission, the debounced persist
 //! writer (`request_persist` / `ensure_persist_writer` / `spawn_persist_writer`
@@ -83,52 +83,95 @@ impl SessionManager {
     }
   }
 
-  /// 全库唯一的写盘收敛点（除加载器自身的迁移写盘外）。
-  /// persist_blocked 时拒绝写盘并通过 notice 提示；写盘失败时写日志并提示。
-  /// 调用方持有 `inner` 锁时用本方法；不持锁时用 `persist()`。
-  /// P1-8：序列化与写盘在 `spawn_blocking` 中进行
-  /// （`save_store_atomic_async`，临时文件 0600 落盘），不阻塞异步运行时；
-  /// 但 `inner` 锁在写盘期间仍被持有——火后即忘的写盘请走防抖路径
-  /// `request_persist()`，写线程短暂持锁克隆后释放锁再写盘。
-  pub(super) async fn persist_locked(locked: &mut InnerState) -> Result<(), String> {
-    if locked.persist_blocked {
-      let reason = if locked.read_only {
-        "配置版本高于当前版本，已设为只读，写盘已被阻止；请升级应用，或选择「以空配置继续」"
+  /// 不持 `inner` 锁的同步写盘入口（1A）：短锁检查 `persist_blocked`
+  /// 后立刻释放，再拿 `persist_io_lock`、短锁克隆快照、写盘。
+  /// 失败语义：blocked 时立 notice 并返回
+  /// Err；写盘失败时立 notice 并返回 Err。调用方绝不能在持有
+  /// `inner` 锁时调用本方法（否则与持 io 锁等 inner 的路径死锁）。
+  /// 顺序说明：先短锁查 blocked（blocked 时立刻返回，不等 io 锁），
+  /// 再拿 io 锁、短锁重查 blocked 并克隆——克隆必须发生在拿 io 锁
+  /// 之后，否则先克隆的旧快照可能后落盘、覆盖后克隆的新快照。
+  pub(super) async fn persist_now(&self) -> Result<(), String> {
+    // 1. 短锁查 blocked：blocked 时立刻返回，不等 io 锁。
+    let blocked_reason: Option<String> = {
+      let locked = self.inner.lock().await;
+      if locked.persist_blocked {
+        Some(
+          if locked.read_only {
+            "配置版本高于当前版本，已设为只读，写盘已被阻止；请升级应用，或选择「以空配置继续」"
+          } else {
+            "配置加载失败，写盘已被阻止，请先选择「以空配置继续」或「从备份恢复」"
+          }
+          .to_string(),
+        )
       } else {
-        "配置加载失败，写盘已被阻止，请先选择「以空配置继续」或「从备份恢复」"
-      };
+        None
+      }
+    };
+    if let Some(reason) = blocked_reason {
       eprintln!("[叠号] 写盘被阻止: {reason}");
       // 启动提示已说明备份文件名与两个选择时不再覆盖，
       // 避免丢掉备份信息。
+      let mut locked = self.inner.lock().await;
       if !locked
         .notice
         .as_deref()
         .is_some_and(|n| n.contains("写盘已被阻止"))
       {
-        locked.notice = Some(reason.to_string());
+        locked.notice = Some(reason.clone());
       }
-      return Err(reason.to_string());
+      return Err(reason);
     }
-    let path = locked.store_path.clone();
-    let store = locked.store.clone();
-    match crate::storage::save_store_atomic_async(path, store).await {
+
+    // 2. 拿 io 锁，短锁重查 blocked 并克隆快照，写盘。
+    // io 锁在整个写盘期间持有，写盘失败的 notice 在锁释放后立。
+    let write_result = {
+      let _io_guard = self.persist_io_lock.lock().await;
+      let snapshot = {
+        let locked = self.inner.lock().await;
+        if locked.persist_blocked {
+          let reason = if locked.read_only {
+            "配置版本高于当前版本，已设为只读，写盘已被阻止；请升级应用，或选择「以空配置继续」"
+          } else {
+            "配置加载失败，写盘已被阻止，请先选择「以空配置继续」或「从备份恢复」"
+          }
+          .to_string();
+          drop(locked);
+          // 拿 io 锁期间被其他任务阻止了写盘：blocked 时立 notice
+          // 后返回 Err（io → inner 顺序）。
+          let mut locked = self.inner.lock().await;
+          if !locked
+            .notice
+            .as_deref()
+            .is_some_and(|n| n.contains("写盘已被阻止"))
+          {
+            locked.notice = Some(reason.clone());
+          }
+          return Err(reason);
+        }
+        (locked.store_path.clone(), locked.store.clone())
+      };
+      let (path, store) = snapshot;
+      crate::storage::save_store_atomic_async(path, store).await
+    };
+    match write_result {
       Ok(()) => Ok(()),
       Err(err) => {
         eprintln!("[叠号] 保存配置失败: {err}");
+        let mut locked = self.inner.lock().await;
         locked.notice = Some(format!("保存配置失败: {err}"));
         Err(err)
       }
     }
   }
 
-  /// 不持锁时的写盘入口，内部加锁后走 `persist_locked`。
-  /// 库内调用方持锁时直接走 `persist_locked`；
+  /// 不持锁时的写盘入口，内部走 `persist_now`（短锁查 blocked →
+  /// io 锁内克隆写盘）；
   /// 本方法是对外暴露的唯一写盘入口，
   /// 供测试与后续不持锁的调用方使用。
   #[allow(dead_code)]
   pub async fn persist(&self) -> Result<(), String> {
-    let mut locked = self.inner.lock().await;
-    Self::persist_locked(&mut locked).await
+    self.persist_now().await
   }
 
   /// 用户明确选择「以空配置继续」：
@@ -146,11 +189,16 @@ impl SessionManager {
     locked.persist_blocked = false;
     locked.read_only = false;
     locked.notice = None;
-    if let Err(err) = Self::persist_locked(&mut locked).await {
+    // 1A：锁内不再同步写盘；先释放锁再 persist_now（其内部短锁查
+    // blocked——此处刚置 false，可正常写盘），失败时重锁恢复阻止态。
+    drop(locked);
+    if let Err(err) = self.persist_now().await {
+      let mut locked = self.inner.lock().await;
       locked.persist_blocked = true;
       locked.read_only = was_read_only;
       return Err(err);
     }
+    let locked = self.inner.lock().await;
     Ok(Self::snapshot_from_locked(&locked))
   }
 
@@ -235,7 +283,8 @@ impl SessionManager {
       // 里，须先取回内存，否则恢复后重启前全部 401；旧备份的明文 Key
       // 须先写入 vault，否则 save_store_atomic 剥离 api_key 后永久丢失。
       // 写入失败时不写盘，换下一个候选。
-      if !migrate_agent_keys_to_vault(&mut loaded.store, &self.api_key_vault).await {
+      if !migrate_agent_keys_to_vault(&mut loaded.store.external_agents, &self.api_key_vault).await
+      {
         last_err = "API Key 写入系统凭据库失败，已停止恢复该备份（原备份未动）".to_string();
         continue;
       }
@@ -312,7 +361,7 @@ impl SessionManager {
   /// `spawn_blocking` 写盘；失败时写 notice 并保留 dirty，等下一次
   /// 请求重试。行为变化：防抖路径的写盘不再同步发生；进程在最后一次
   /// 修改后 300ms 内退出可能丢最后一次自动保存（用户主动操作走同步
-  /// `persist_locked`，不受影响）。
+  /// `persist_now`，不受影响）。
   /// P0-1：写盘被阻止（配置损坏/高版本只读）时跳过本次写盘，否则
   /// 防抖写盘会把内存里的空配置覆盖到损坏/高版本文件上。
   pub(super) async fn persist_writer_loop(self: &Arc<Self>, app: Option<AppHandle>) {
@@ -324,18 +373,25 @@ impl SessionManager {
           _ = self.persist_notify.notified() => {}
         }
       }
-      let (path, store, blocked) = {
-        let locked = self.inner.lock().await;
-        (
-          locked.store_path.clone(),
-          locked.store.clone(),
-          locked.persist_blocked,
-        )
+      // 1A：防抖写与同步 persist_now 共用 persist_io_lock，避免两路
+      // 写盘在同一临时文件/rename 上竞争；克隆在拿 io 锁之后做，
+      // 防旧快照后落盘覆盖新快照。
+      let write_result = {
+        let _io_guard = self.persist_io_lock.lock().await;
+        let (path, store, blocked) = {
+          let locked = self.inner.lock().await;
+          (
+            locked.store_path.clone(),
+            locked.store.clone(),
+            locked.persist_blocked,
+          )
+        };
+        if blocked {
+          continue;
+        }
+        crate::storage::save_store_atomic_async(path, store).await
       };
-      if blocked {
-        continue;
-      }
-      match crate::storage::save_store_atomic_async(path, store).await {
+      match write_result {
         Ok(()) => {
           #[cfg(test)]
           self.persist_write_count.fetch_add(1, Ordering::SeqCst);

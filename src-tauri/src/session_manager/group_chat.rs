@@ -9,7 +9,8 @@
 //! sibling submodules keep calling them via `Self::` / `self.` — methods
 //! belong to the type, not the file. Calls into the parent's webview
 //! lifecycle (`apply_desktop_layout_locked`, `close_warm_entry`,
-//! `hide_foreground_slot`) and the A2A module resolve through the type.
+//! `detach_foreground_slot_locked` / `execute_hide_slot`) and the A2A module
+//! resolve through the type.
 
 #[cfg(desktop)]
 use super::{
@@ -377,7 +378,7 @@ impl SessionManager {
     group_id: Option<String>,
   ) -> Result<ManagerSnapshot, String> {
     let next_seq = self.current_seq.fetch_add(1, Ordering::SeqCst) + 1;
-    let (snap, group_name) = {
+    let (snap, group_name, hide_op) = {
       let mut locked = self.inner.lock().await;
       let cleaned_id = group_id
         .map(|s| s.trim().to_string())
@@ -396,7 +397,7 @@ impl SessionManager {
         None => locked.store.group_chats.first().cloned(),
       };
 
-      self.hide_foreground_slot(app, next_seq, &mut locked).await;
+      let hide_op = self.detach_foreground_slot_locked(app, next_seq, &mut locked);
       locked.notice = None;
       locked.active_group_id = resolved.as_ref().map(|g| g.id.clone());
       #[cfg(desktop)]
@@ -404,8 +405,12 @@ impl SessionManager {
       (
         Self::snapshot_from_locked(&locked),
         resolved.map(|g| g.name),
+        hide_op,
       )
     };
+    if let Some(op) = hide_op {
+      self.execute_hide_slot(app, op).await;
+    }
 
     Self::set_group_window_title(app, group_name.as_deref());
     Ok(snap)
@@ -426,7 +431,8 @@ impl SessionManager {
     }
 
     let next_seq = self.current_seq.fetch_add(1, Ordering::SeqCst) + 1;
-    let (snap, final_name) = {
+    let final_name = clean_name.to_string();
+    let new_id = {
       let mut locked = self.inner.lock().await;
       let valid_members = Self::normalize_group_members(&locked, members, None)?;
       let record = GroupChatRecord {
@@ -444,18 +450,26 @@ impl SessionManager {
       };
       let new_id = record.id.clone();
       locked.store.group_chats.push(record);
-      if let Err(err) = Self::persist_locked(&mut locked).await {
-        locked.store.group_chats.pop();
-        return Err(err);
-      }
-
-      self.hide_foreground_slot(app, next_seq, &mut locked).await;
+      new_id
+    };
+    if let Err(err) = self.persist_now().await {
+      // 写盘失败：按 id 移除刚追加的记录（不用 pop，避免并发下误删他人记录）。
+      let mut locked = self.inner.lock().await;
+      locked.store.group_chats.retain(|g| g.id != new_id);
+      return Err(err);
+    }
+    let (snap, hide_op) = {
+      let mut locked = self.inner.lock().await;
+      let hide_op = self.detach_foreground_slot_locked(app, next_seq, &mut locked);
       locked.active_group_id = Some(new_id);
       locked.notice = None;
       #[cfg(desktop)]
       Self::apply_desktop_layout_locked(app, &locked);
-      (Self::snapshot_from_locked(&locked), clean_name.to_string())
+      (Self::snapshot_from_locked(&locked), hide_op)
     };
+    if let Some(op) = hide_op {
+      self.execute_hide_slot(app, op).await;
+    }
 
     Self::set_group_window_title(app, Some(&final_name));
     Ok(snap)
@@ -476,7 +490,7 @@ impl SessionManager {
       return Err("群聊名称不能超过 32 个字".to_string());
     }
 
-    let (snap, active_name) = {
+    let (prev_name, prev_roles, prev_bindings, existing_members, _valid_members) = {
       let mut locked = self.inner.lock().await;
       let idx = locked
         .store
@@ -498,18 +512,37 @@ impl SessionManager {
       locked.store.group_chats[idx]
         .thread_bindings
         .retain(|tb| valid_members.contains(&tb.member));
-      if let Err(err) = Self::persist_locked(&mut locked).await {
-        locked.store.group_chats[idx].name = prev_name;
-        locked.store.group_chats[idx].members = existing_members;
-        locked.store.group_chats[idx].member_roles = prev_roles;
-        locked.store.group_chats[idx].thread_bindings = prev_bindings;
-        return Err(err);
+      (
+        prev_name,
+        prev_roles,
+        prev_bindings,
+        existing_members,
+        valid_members,
+      )
+    };
+    if let Err(err) = self.persist_now().await {
+      let mut locked = self.inner.lock().await;
+      if let Some(g) = locked
+        .store
+        .group_chats
+        .iter_mut()
+        .find(|g| g.id == group_id)
+      {
+        g.name = prev_name;
+        g.members = existing_members;
+        g.member_roles = prev_roles;
+        g.thread_bindings = prev_bindings;
       }
-
+      return Err(err);
+    }
+    let (snap, active_name) = {
+      // mut 只在桌面端需要（下面的改动全是 #[cfg(desktop)]）。
+      #[allow(unused_mut)]
+      let mut locked = self.inner.lock().await;
       #[cfg(desktop)]
       locked
         .group_context_synced
-        .retain(|(gid, k), _| gid != &group_id || valid_members.contains(k));
+        .retain(|(gid, k), _| gid != &group_id || _valid_members.contains(k));
 
       let is_active = locked.active_group_id.as_deref() == Some(group_id.as_str());
       (
@@ -563,50 +596,64 @@ impl SessionManager {
       });
     }
 
-    let mut locked = self.inner.lock().await;
-    let idx = locked
-      .store
-      .group_chats
-      .iter()
-      .position(|g| g.id == group_id)
-      .ok_or_else(|| "未找到对应的群聊".to_string())?;
-    let members = locked.store.group_chats[idx].members.clone();
+    let (prev_ctx, prev_skills, prev_roles) = {
+      let mut locked = self.inner.lock().await;
+      let idx = locked
+        .store
+        .group_chats
+        .iter()
+        .position(|g| g.id == group_id)
+        .ok_or_else(|| "未找到对应的群聊".to_string())?;
+      let members = locked.store.group_chats[idx].members.clone();
 
-    let mut clean_roles: Vec<GroupMemberRole> = Vec::new();
-    for mr in member_roles {
-      let Some(uuid) = normalize_uuid(&mr.member.uuid) else {
-        continue;
-      };
-      let key = AccountKey {
-        provider_id: mr.member.provider_id,
-        uuid,
-      };
-      let role_str: String = mr.role.trim().chars().take(120).collect();
-      if role_str.is_empty()
-        || !members.contains(&key)
-        || clean_roles.iter().any(|existing| existing.member == key)
-      {
-        continue;
+      let mut clean_roles: Vec<GroupMemberRole> = Vec::new();
+      for mr in member_roles {
+        let Some(uuid) = normalize_uuid(&mr.member.uuid) else {
+          continue;
+        };
+        let key = AccountKey {
+          provider_id: mr.member.provider_id,
+          uuid,
+        };
+        let role_str: String = mr.role.trim().chars().take(120).collect();
+        if role_str.is_empty()
+          || !members.contains(&key)
+          || clean_roles.iter().any(|existing| existing.member == key)
+        {
+          continue;
+        }
+        clean_roles.push(GroupMemberRole {
+          member: key,
+          role: role_str,
+        });
       }
-      clean_roles.push(GroupMemberRole {
-        member: key,
-        role: role_str,
-      });
-    }
 
-    let prev_ctx = locked.store.group_chats[idx].shared_context.clone();
-    let prev_skills = locked.store.group_chats[idx].shared_skills.clone();
-    let prev_roles = locked.store.group_chats[idx].member_roles.clone();
-    locked.store.group_chats[idx].shared_context = clean_context;
-    locked.store.group_chats[idx].shared_skills = clean_skills;
-    locked.store.group_chats[idx].member_roles = clean_roles;
-    if let Err(err) = Self::persist_locked(&mut locked).await {
-      locked.store.group_chats[idx].shared_context = prev_ctx;
-      locked.store.group_chats[idx].shared_skills = prev_skills;
-      locked.store.group_chats[idx].member_roles = prev_roles;
+      let prev_ctx = locked.store.group_chats[idx].shared_context.clone();
+      let prev_skills = locked.store.group_chats[idx].shared_skills.clone();
+      let prev_roles = locked.store.group_chats[idx].member_roles.clone();
+      locked.store.group_chats[idx].shared_context = clean_context;
+      locked.store.group_chats[idx].shared_skills = clean_skills;
+      locked.store.group_chats[idx].member_roles = clean_roles;
+      (prev_ctx, prev_skills, prev_roles)
+    };
+    if let Err(err) = self.persist_now().await {
+      let mut locked = self.inner.lock().await;
+      if let Some(g) = locked
+        .store
+        .group_chats
+        .iter_mut()
+        .find(|g| g.id == group_id)
+      {
+        g.shared_context = prev_ctx;
+        g.shared_skills = prev_skills;
+        g.member_roles = prev_roles;
+      }
       return Err(err);
     }
 
+    // mut 只在桌面端需要（下面的改动全是 #[cfg(desktop)]）。
+    #[allow(unused_mut)]
+    let mut locked = self.inner.lock().await;
     #[cfg(desktop)]
     locked
       .group_context_synced
@@ -625,33 +672,47 @@ impl SessionManager {
       return Err("沉淀内容不能为空".to_string());
     }
 
-    let mut locked = self.inner.lock().await;
-    let idx = locked
-      .store
-      .group_chats
-      .iter()
-      .position(|g| g.id == group_id)
-      .ok_or_else(|| "未找到对应的群聊".to_string())?;
+    let prev = {
+      let mut locked = self.inner.lock().await;
+      let idx = locked
+        .store
+        .group_chats
+        .iter()
+        .position(|g| g.id == group_id)
+        .ok_or_else(|| "未找到对应的群聊".to_string())?;
 
-    let prev = locked.store.group_chats[idx].shared_context.clone();
-    let combined = if prev.trim().is_empty() {
-      clean_snippet.to_string()
-    } else {
-      format!("{}\n\n{}", prev.trim(), clean_snippet)
-    };
-    let final_ctx: String = if combined.chars().count() > 8000 {
-      let skip = combined.chars().count() - 8000;
-      combined.chars().skip(skip).collect()
-    } else {
-      combined
-    };
+      let prev = locked.store.group_chats[idx].shared_context.clone();
+      let combined = if prev.trim().is_empty() {
+        clean_snippet.to_string()
+      } else {
+        format!("{}\n\n{}", prev.trim(), clean_snippet)
+      };
+      let final_ctx: String = if combined.chars().count() > 8000 {
+        let skip = combined.chars().count() - 8000;
+        combined.chars().skip(skip).collect()
+      } else {
+        combined
+      };
 
-    locked.store.group_chats[idx].shared_context = final_ctx;
-    if let Err(err) = Self::persist_locked(&mut locked).await {
-      locked.store.group_chats[idx].shared_context = prev;
+      locked.store.group_chats[idx].shared_context = final_ctx;
+      prev
+    };
+    if let Err(err) = self.persist_now().await {
+      let mut locked = self.inner.lock().await;
+      if let Some(g) = locked
+        .store
+        .group_chats
+        .iter_mut()
+        .find(|g| g.id == group_id)
+      {
+        g.shared_context = prev;
+      }
       return Err(err);
     }
 
+    // mut 只在桌面端需要（下面的改动全是 #[cfg(desktop)]）。
+    #[allow(unused_mut)]
+    let mut locked = self.inner.lock().await;
     #[cfg(desktop)]
     locked
       .group_context_synced
@@ -665,7 +726,7 @@ impl SessionManager {
     app: &AppHandle,
     group_id: String,
   ) -> Result<ManagerSnapshot, String> {
-    let (snap, next_title, is_group_view) = {
+    let (removed, removed_idx) = {
       let mut locked = self.inner.lock().await;
       let idx = locked
         .store
@@ -673,11 +734,17 @@ impl SessionManager {
         .iter()
         .position(|g| g.id == group_id)
         .ok_or_else(|| "未找到对应的群聊".to_string())?;
-      let removed = locked.store.group_chats.remove(idx);
-      if let Err(err) = Self::persist_locked(&mut locked).await {
-        locked.store.group_chats.insert(idx, removed);
-        return Err(err);
-      }
+      (locked.store.group_chats.remove(idx), idx)
+    };
+    if let Err(err) = self.persist_now().await {
+      let mut locked = self.inner.lock().await;
+      // 失败回滚：插回原位（若期间有并发增删，钳制到合法范围）。
+      let at = removed_idx.min(locked.store.group_chats.len());
+      locked.store.group_chats.insert(at, removed);
+      return Err(err);
+    }
+    let (snap, next_title, is_group_view) = {
+      let mut locked = self.inner.lock().await;
       #[cfg(desktop)]
       locked
         .group_context_synced
@@ -715,22 +782,50 @@ impl SessionManager {
     timeout_secs: Option<u64>,
     idle_timeout_secs: Option<u64>,
   ) -> Result<ManagerSnapshot, String> {
-    let mut locked = self.inner.lock().await;
-    let existing_pos = id.as_deref().and_then(normalize_uuid).and_then(|norm_id| {
-      locked
-        .store
-        .external_agents
-        .iter()
-        .position(|e| e.id == norm_id)
-    });
-    let created_at = existing_pos.map(|pos| locked.store.external_agents[pos].created_at_ms);
+    // 1. 短锁：算 existing_pos、created_at、prev_api_key、prev_key_ref；
+    // P1-7：编辑时 Key 留空表示不修改，沿用内存里的旧 Key——这里先算出
+    // 生效的 api_key（旧 Key 已是 normalize 过的形式，与原逻辑等价）。
+    let (existing_pos, created_at, prev_api_key, prev_key_ref, effective_api_key) = {
+      let locked = self.inner.lock().await;
+      let existing_pos = id.as_deref().and_then(normalize_uuid).and_then(|norm_id| {
+        locked
+          .store
+          .external_agents
+          .iter()
+          .position(|e| e.id == norm_id)
+      });
+      let created_at = existing_pos.map(|pos| locked.store.external_agents[pos].created_at_ms);
+      // P1-7 缺陷修复：先记下编辑前的旧 Key 与旧 Key 引用——写盘失败时回滚 vault；
+      // kind 改为 local_cli 后，旧 vault 条目成孤儿，保存成功后清理。
+      let prev_api_key: Option<Zeroizing<String>> =
+        existing_pos.map(|pos| locked.store.external_agents[pos].api_key.clone());
+      let prev_key_ref: Option<String> =
+        existing_pos.and_then(|pos| locked.store.external_agents[pos].api_key_ref.clone());
+      let effective_api_key: String =
+        if kind == ExternalAgentKind::OpenaiApi && api_key.trim().is_empty() {
+          match &prev_api_key {
+            Some(old) => old.as_str().to_string(),
+            None => api_key.clone(),
+          }
+        } else {
+          api_key.clone()
+        };
+      (
+        existing_pos,
+        created_at,
+        prev_api_key,
+        prev_key_ref,
+        effective_api_key,
+      )
+    };
 
-    let mut record = group_transport::normalize_external_agent_input(
+    // 2. 锁外 normalize（纯函数），用上一步取到的 created_at 与处理好的 api_key。
+    let record = group_transport::normalize_external_agent_input(
       id.as_deref(),
       kind,
       &name,
       &base_url,
-      &api_key,
+      &effective_api_key,
       &model,
       &command,
       args,
@@ -739,83 +834,88 @@ impl SessionManager {
       idle_timeout_secs,
       created_at,
     )?;
-
-    // P1-7 缺陷修复：先记下编辑前的旧 Key 与旧 Key 引用——写盘失败时回滚 vault；
-    // kind 改为 local_cli 后，旧 vault 条目成孤儿，保存成功后清理。
-    let prev_api_key: Option<Zeroizing<String>> =
-      existing_pos.map(|pos| locked.store.external_agents[pos].api_key.clone());
-    let prev_key_ref: Option<String> =
-      existing_pos.and_then(|pos| locked.store.external_agents[pos].api_key_ref.clone());
     let record_key_ref = record.api_key_ref.clone();
 
-    // P1-7：编辑时 Key 留空表示不修改，沿用内存里的旧 Key；
-    // 新 Key 或沿用的旧 Key：落盘前必须先进 vault，否则重启后丢失。
-    // vault 写入失败直接返回，不动内存与磁盘。
-    if kind == ExternalAgentKind::OpenaiApi {
-      if api_key.trim().is_empty() {
-        if let Some(pos) = existing_pos {
-          record.api_key = locked.store.external_agents[pos].api_key.clone();
-        }
-      }
-      if !record.api_key.is_empty() {
-        if let Some(key_ref) = record.api_key_ref.clone() {
-          let vault = &self.api_key_vault;
-          vault
-            .store_key(&key_ref, &record.api_key)
-            .await
-            .map_err(|e| format!("保存 API Key 到系统凭据库失败：{e}"))?;
-        }
-      }
-    };
-
+    // 3. 锁外写 vault：新 Key 或沿用的旧 Key，落盘前必须先进 vault，
+    // 否则重启后丢失。写入失败直接返回，不动内存与磁盘。
     // P1-7 缺陷修复：本次是否真的写了 vault（写盘失败回滚时只回滚写过的）。
     let vault_written = kind == ExternalAgentKind::OpenaiApi
       && !record.api_key.is_empty()
       && record.api_key_ref.is_some();
+    if vault_written {
+      if let Some(key_ref) = record.api_key_ref.clone() {
+        self
+          .api_key_vault
+          .store_key(&key_ref, &record.api_key)
+          .await
+          .map_err(|e| format!("保存 API Key 到系统凭据库失败：{e}"))?;
+      }
+    }
 
-    let prev_agents = locked.store.external_agents.clone();
-    let prev_groups = locked.store.group_chats.clone();
-    if let Some(pos) = existing_pos {
-      let old_key = locked.store.external_agents[pos].account_key();
-      let new_key = record.account_key();
-      locked.store.external_agents[pos] = record;
-      if old_key != new_key {
-        for group in &mut locked.store.group_chats {
-          for m in &mut group.members {
-            if *m == old_key {
-              *m = new_key.clone();
+    // 4. 短锁：clone prevs，应用内存修改（替换/追加 + 群成员引用修正）。
+    // 注意：existing_pos 是第 1 步算的下标，第 2–3 步在锁外 await 期间
+    // 其他任务可能增删成员导致下标失效（错指他人记录、甚至越界 panic）；
+    // 这里按 record.id 重新定位。若原记录已被并发删除则拒绝写入。
+    let (prev_agents, prev_groups) = {
+      let mut locked = self.inner.lock().await;
+      let prev_agents = locked.store.external_agents.clone();
+      let prev_groups = locked.store.group_chats.clone();
+      let pos = locked
+        .store
+        .external_agents
+        .iter()
+        .position(|e| e.id == record.id);
+      if existing_pos.is_some() && pos.is_none() {
+        // 并发删除：记录已不在，拒绝写入（第 3 步刚写的 vault 条目会成
+        // 孤儿，下次编辑/删除时清理，与原来同类残留一致）。
+        return Err("该外部成员已被移除，请重试".to_string());
+      }
+      if let Some(pos) = pos {
+        let old_key = locked.store.external_agents[pos].account_key();
+        let new_key = record.account_key();
+        locked.store.external_agents[pos] = record;
+        if old_key != new_key {
+          for group in &mut locked.store.group_chats {
+            for m in &mut group.members {
+              if *m == old_key {
+                *m = new_key.clone();
+              }
             }
-          }
-          for mr in &mut group.member_roles {
-            if mr.member == old_key {
-              mr.member = new_key.clone();
+            for mr in &mut group.member_roles {
+              if mr.member == old_key {
+                mr.member = new_key.clone();
+              }
             }
-          }
-          for tb in &mut group.thread_bindings {
-            if tb.member == old_key {
-              tb.member = new_key.clone();
+            for tb in &mut group.thread_bindings {
+              if tb.member == old_key {
+                tb.member = new_key.clone();
+              }
             }
           }
         }
+      } else {
+        locked.store.external_agents.push(record);
       }
-    } else {
-      locked.store.external_agents.push(record);
-    }
+      (prev_agents, prev_groups)
+    };
 
-    if let Err(err) = Self::persist_locked(&mut locked).await {
-      locked.store.external_agents = prev_agents;
-      locked.store.group_chats = prev_groups;
+    // 5. 锁外写盘；失败时重锁恢复内存 clones，再锁外回滚 vault。
+    if let Err(err) = self.persist_now().await {
+      {
+        let mut locked = self.inner.lock().await;
+        locked.store.external_agents = prev_agents;
+        locked.store.group_chats = prev_groups;
+      }
       // P1-7 缺陷修复：写盘失败回滚 vault，否则新 Key 残留在 vault 里，
       // 与内存/磁盘的旧记录不一致，下次启动会用“编辑失败”的新 Key。
       if vault_written {
         if let Some(key_ref) = record_key_ref {
-          let vault = &self.api_key_vault;
           match prev_api_key {
             Some(old) if !old.is_empty() => {
-              let _ = vault.store_key(&key_ref, &old).await;
+              let _ = self.api_key_vault.store_key(&key_ref, &old).await;
             }
             _ => {
-              vault.delete_key(&key_ref).await;
+              self.api_key_vault.delete_key(&key_ref).await;
             }
           }
         }
@@ -823,52 +923,61 @@ impl SessionManager {
       return Err(err);
     }
 
-    // P1-7 缺陷修复：kind 改为 local_cli 后旧 vault 条目成孤儿，保存成功后清理。
+    // 6. 成功后：kind 改为 local_cli 后旧 vault 条目成孤儿，锁外清理
+    // （失败忽略，与原来一致）。
     if kind != ExternalAgentKind::OpenaiApi {
       if let Some(key_ref) = prev_key_ref {
         self.api_key_vault.delete_key(&key_ref).await;
       }
     }
 
+    let locked = self.inner.lock().await;
     Ok(Self::snapshot_from_locked(&locked))
   }
 
   pub async fn delete_external_agent(&self, id: String) -> Result<ManagerSnapshot, String> {
     let norm_id = normalize_uuid(&id).ok_or_else(|| "外部成员 ID 格式非法".to_string())?;
-    let mut locked = self.inner.lock().await;
-    let pos = locked
-      .store
-      .external_agents
-      .iter()
-      .position(|e| e.id == norm_id)
-      .ok_or_else(|| "未找到对应的外部成员".to_string())?;
-    let removed_key = locked.store.external_agents[pos].account_key();
-    let removed_key_ref = locked.store.external_agents[pos].api_key_ref.clone();
-    let prev_agents = locked.store.external_agents.clone();
-    let prev_groups = locked.store.group_chats.clone();
+    let (_removed_key, removed_key_ref, prev_agents, prev_groups) = {
+      let mut locked = self.inner.lock().await;
+      let pos = locked
+        .store
+        .external_agents
+        .iter()
+        .position(|e| e.id == norm_id)
+        .ok_or_else(|| "未找到对应的外部成员".to_string())?;
+      let removed_key = locked.store.external_agents[pos].account_key();
+      let removed_key_ref = locked.store.external_agents[pos].api_key_ref.clone();
+      let prev_agents = locked.store.external_agents.clone();
+      let prev_groups = locked.store.group_chats.clone();
 
-    locked.store.external_agents.remove(pos);
-    for group in &mut locked.store.group_chats {
-      group.members.retain(|m| m != &removed_key);
-      group.member_roles.retain(|mr| mr.member != removed_key);
-      group.thread_bindings.retain(|tb| tb.member != removed_key);
-    }
-
-    if let Err(err) = Self::persist_locked(&mut locked).await {
+      locked.store.external_agents.remove(pos);
+      for group in &mut locked.store.group_chats {
+        group.members.retain(|m| m != &removed_key);
+        group.member_roles.retain(|mr| mr.member != removed_key);
+        group.thread_bindings.retain(|tb| tb.member != removed_key);
+      }
+      (removed_key, removed_key_ref, prev_agents, prev_groups)
+    };
+    if let Err(err) = self.persist_now().await {
+      let mut locked = self.inner.lock().await;
       locked.store.external_agents = prev_agents;
       locked.store.group_chats = prev_groups;
       return Err(err);
     }
 
     // P1-7：保存成功后同步删除 vault 里的 Key，失败忽略，不阻塞删除。
+    // 锁外删除。
     if let Some(key_ref) = removed_key_ref {
       self.api_key_vault.delete_key(&key_ref).await;
     }
 
+    // mut 只在桌面端需要（下面的改动全是 #[cfg(desktop)]）。
+    #[allow(unused_mut)]
+    let mut locked = self.inner.lock().await;
     #[cfg(desktop)]
     locked
       .group_context_synced
-      .retain(|(_, k), _| k != &removed_key);
+      .retain(|(_, k), _| k != &_removed_key);
 
     Ok(Self::snapshot_from_locked(&locked))
   }
@@ -895,24 +1004,35 @@ impl SessionManager {
     max_relay_hops: u8,
   ) -> Result<ManagerSnapshot, String> {
     let clamped_hops = max_relay_hops.clamp(1, 3);
-    let mut locked = self.inner.lock().await;
-    let idx = locked
-      .store
-      .group_chats
-      .iter()
-      .position(|g| g.id == group_id)
-      .ok_or_else(|| "未找到对应的群聊".to_string())?;
-    let prev_mode = locked.store.group_chats[idx].workflow_mode;
-    let prev_hops = locked.store.group_chats[idx].max_relay_hops;
-    locked.store.group_chats[idx].workflow_mode = workflow_mode;
-    locked.store.group_chats[idx].max_relay_hops = clamped_hops;
-
-    if let Err(err) = Self::persist_locked(&mut locked).await {
-      locked.store.group_chats[idx].workflow_mode = prev_mode;
-      locked.store.group_chats[idx].max_relay_hops = prev_hops;
+    let (prev_mode, prev_hops) = {
+      let mut locked = self.inner.lock().await;
+      let idx = locked
+        .store
+        .group_chats
+        .iter()
+        .position(|g| g.id == group_id)
+        .ok_or_else(|| "未找到对应的群聊".to_string())?;
+      let prev_mode = locked.store.group_chats[idx].workflow_mode;
+      let prev_hops = locked.store.group_chats[idx].max_relay_hops;
+      locked.store.group_chats[idx].workflow_mode = workflow_mode;
+      locked.store.group_chats[idx].max_relay_hops = clamped_hops;
+      (prev_mode, prev_hops)
+    };
+    if let Err(err) = self.persist_now().await {
+      let mut locked = self.inner.lock().await;
+      if let Some(g) = locked
+        .store
+        .group_chats
+        .iter_mut()
+        .find(|g| g.id == group_id)
+      {
+        g.workflow_mode = prev_mode;
+        g.max_relay_hops = prev_hops;
+      }
       return Err(err);
     }
 
+    let locked = self.inner.lock().await;
     Ok(Self::snapshot_from_locked(&locked))
   }
 
@@ -926,21 +1046,35 @@ impl SessionManager {
       provider_id: member.provider_id,
       uuid: norm_uuid,
     };
-    let mut locked = self.inner.lock().await;
-    let idx = locked
-      .store
-      .group_chats
-      .iter()
-      .position(|g| g.id == group_id)
-      .ok_or_else(|| "未找到对应的群聊".to_string())?;
-    let prev_bindings = locked.store.group_chats[idx].thread_bindings.clone();
-    locked.store.group_chats[idx]
-      .thread_bindings
-      .retain(|tb| tb.member != target_key);
-    if let Err(err) = Self::persist_locked(&mut locked).await {
-      locked.store.group_chats[idx].thread_bindings = prev_bindings;
+    let prev_bindings = {
+      let mut locked = self.inner.lock().await;
+      let idx = locked
+        .store
+        .group_chats
+        .iter()
+        .position(|g| g.id == group_id)
+        .ok_or_else(|| "未找到对应的群聊".to_string())?;
+      let prev_bindings = locked.store.group_chats[idx].thread_bindings.clone();
+      locked.store.group_chats[idx]
+        .thread_bindings
+        .retain(|tb| tb.member != target_key);
+      prev_bindings
+    };
+    if let Err(err) = self.persist_now().await {
+      let mut locked = self.inner.lock().await;
+      if let Some(g) = locked
+        .store
+        .group_chats
+        .iter_mut()
+        .find(|g| g.id == group_id)
+      {
+        g.thread_bindings = prev_bindings;
+      }
       return Err(err);
     }
+    // mut 只在桌面端需要（下面的改动全是 #[cfg(desktop)]）。
+    #[allow(unused_mut)]
+    let mut locked = self.inner.lock().await;
     #[cfg(desktop)]
     locked.group_context_synced.remove(&(group_id, target_key));
     Ok(Self::snapshot_from_locked(&locked))
@@ -974,18 +1108,31 @@ impl SessionManager {
   }
 
   pub async fn clear_group_messages(&self, group_id: String) -> Result<ManagerSnapshot, String> {
-    let mut locked = self.inner.lock().await;
-    let idx = locked
-      .store
-      .group_chats
-      .iter()
-      .position(|g| g.id == group_id)
-      .ok_or_else(|| "未找到对应的群聊".to_string())?;
-    let prev = std::mem::take(&mut locked.store.group_chats[idx].messages);
-    if let Err(err) = Self::persist_locked(&mut locked).await {
-      locked.store.group_chats[idx].messages = prev;
+    let prev = {
+      let mut locked = self.inner.lock().await;
+      let idx = locked
+        .store
+        .group_chats
+        .iter()
+        .position(|g| g.id == group_id)
+        .ok_or_else(|| "未找到对应的群聊".to_string())?;
+      std::mem::take(&mut locked.store.group_chats[idx].messages)
+    };
+    if let Err(err) = self.persist_now().await {
+      let mut locked = self.inner.lock().await;
+      if let Some(g) = locked
+        .store
+        .group_chats
+        .iter_mut()
+        .find(|g| g.id == group_id)
+      {
+        g.messages = prev;
+      }
       return Err(err);
     }
+    // mut 只在桌面端需要（下面的改动全是 #[cfg(desktop)]）。
+    #[allow(unused_mut)]
+    let mut locked = self.inner.lock().await;
     #[cfg(desktop)]
     locked
       .group_context_synced
@@ -998,34 +1145,45 @@ impl SessionManager {
     group_id: String,
     keep_shared_context: bool,
   ) -> Result<ManagerSnapshot, String> {
-    let mut locked = self.inner.lock().await;
-    let idx = locked
-      .store
-      .group_chats
-      .iter()
-      .position(|g| g.id == group_id)
-      .ok_or_else(|| "未找到对应的群聊".to_string())?;
-    if locked.store.group_chats[idx].messages.iter().any(|m| {
-      matches!(
-        m.status,
-        GroupReplyStatus::Queued | GroupReplyStatus::Sending | GroupReplyStatus::Streaming
-      )
-    }) {
-      return Err("有成员正在回复，请等待完成后再开启新话题".to_string());
-    }
-    let prev_msgs = std::mem::take(&mut locked.store.group_chats[idx].messages);
-    let prev_bindings = std::mem::take(&mut locked.store.group_chats[idx].thread_bindings);
-    let prev_ctx = locked.store.group_chats[idx].shared_context.clone();
-    if !keep_shared_context {
-      locked.store.group_chats[idx].shared_context.clear();
-    }
-    if let Err(err) = Self::persist_locked(&mut locked).await {
-      let g = &mut locked.store.group_chats[idx];
-      g.messages = prev_msgs;
-      g.thread_bindings = prev_bindings;
-      g.shared_context = prev_ctx;
+    let (prev_msgs, prev_bindings, prev_ctx) = {
+      let mut locked = self.inner.lock().await;
+      let idx = locked
+        .store
+        .group_chats
+        .iter()
+        .position(|g| g.id == group_id)
+        .ok_or_else(|| "未找到对应的群聊".to_string())?;
+      if locked.store.group_chats[idx].messages.iter().any(|m| {
+        matches!(
+          m.status,
+          GroupReplyStatus::Queued | GroupReplyStatus::Sending | GroupReplyStatus::Streaming
+        )
+      }) {
+        return Err("有成员正在回复，请等待完成后再开启新话题".to_string());
+      }
+      let prev_msgs = std::mem::take(&mut locked.store.group_chats[idx].messages);
+      let prev_bindings = std::mem::take(&mut locked.store.group_chats[idx].thread_bindings);
+      let prev_ctx = locked.store.group_chats[idx].shared_context.clone();
+      if !keep_shared_context {
+        locked.store.group_chats[idx].shared_context.clear();
+      }
+      (prev_msgs, prev_bindings, prev_ctx)
+    };
+    if let Err(err) = self.persist_now().await {
+      let mut locked = self.inner.lock().await;
+      if let Some(g) = locked
+        .store
+        .group_chats
+        .iter_mut()
+        .find(|g| g.id == group_id)
+      {
+        g.messages = prev_msgs;
+        g.thread_bindings = prev_bindings;
+        g.shared_context = prev_ctx;
+      }
       return Err(err);
     }
+    let mut locked = self.inner.lock().await;
     #[cfg(desktop)]
     locked
       .group_context_synced
@@ -1362,7 +1520,7 @@ impl SessionManager {
         return Err("单条群聊消息不能超过 4000 字".to_string());
       }
 
-      let (snap, user_msg_id, workflow_mode, dispatch_jobs) = {
+      let (user_msg_id, workflow_mode, dispatch_jobs) = {
         let mut locked = self.inner.lock().await;
         if !locked.conflicts.is_empty() {
           return Err("存在 UUID 归属冲突，请先处理冲突后再发消息".to_string());
@@ -1451,13 +1609,12 @@ impl SessionManager {
           msgs.drain(..excess);
         }
 
-        Self::persist_locked(&mut locked).await?;
-        (
-          Self::snapshot_from_locked(&locked),
-          user_id,
-          workflow_mode,
-          jobs,
-        )
+        (user_id, workflow_mode, jobs)
+      };
+      self.persist_now().await?;
+      let snap = {
+        let locked = self.inner.lock().await;
+        Self::snapshot_from_locked(&locked)
       };
 
       self.emit_snapshot(app, &snap);
@@ -1704,7 +1861,17 @@ impl SessionManager {
 
     #[cfg(desktop)]
     {
-      let (snap, member_key, user_msg_id, raw_content, stage_label, hop_depth, auto_ch) = {
+      let (
+        member_key,
+        user_msg_id,
+        raw_content,
+        stage_label,
+        hop_depth,
+        auto_ch,
+        prev_status,
+        prev_content,
+        prev_error,
+      ) = {
         let mut locked = self.inner.lock().await;
         if !locked.conflicts.is_empty() {
           return Err("存在 UUID 归属冲突，请先处理冲突后再重试".to_string());
@@ -1772,23 +1939,36 @@ impl SessionManager {
         let prev_content = std::mem::take(&mut msg_mut.content);
         let prev_error = msg_mut.error.take();
         msg_mut.status = GroupReplyStatus::Queued;
-        if let Err(err) = Self::persist_locked(&mut locked).await {
-          let msg_revert = &mut locked.store.group_chats[g_idx].messages[msg_idx];
-          msg_revert.status = prev_status;
-          msg_revert.content = prev_content;
-          msg_revert.error = prev_error;
-          return Err(err);
-        }
-
         (
-          Self::snapshot_from_locked(&locked),
           member_key,
           user_msg_id,
           raw_content,
           stage_label,
           hop_depth,
           auto_ch,
+          prev_status,
+          prev_content,
+          prev_error,
         )
+      };
+      if let Err(err) = self.persist_now().await {
+        let mut locked = self.inner.lock().await;
+        if let Some(m) = locked
+          .store
+          .group_chats
+          .iter_mut()
+          .find(|g| g.id == group_id)
+          .and_then(|g| g.messages.iter_mut().find(|m| m.id == msg_id))
+        {
+          m.status = prev_status;
+          m.content = prev_content;
+          m.error = prev_error;
+        }
+        return Err(err);
+      }
+      let snap = {
+        let locked = self.inner.lock().await;
+        Self::snapshot_from_locked(&locked)
       };
 
       self.emit_snapshot(app, &snap);
@@ -1924,7 +2104,7 @@ impl SessionManager {
         return Err(err_hint.to_string());
       }
 
-      let snap = {
+      let (prev_status, prev_content, prev_error) = {
         let mut locked = self.inner.lock().await;
         let g = locked
           .store
@@ -1941,21 +2121,26 @@ impl SessionManager {
         let prev_content = std::mem::replace(&mut m.content, final_text);
         let prev_error = m.error.take();
         m.status = GroupReplyStatus::Done;
-        if let Err(err) = Self::persist_locked(&mut locked).await {
-          if let Some(g_rev) = locked
-            .store
-            .group_chats
-            .iter_mut()
-            .find(|g| g.id == group_id)
-          {
-            if let Some(m_rev) = g_rev.messages.iter_mut().find(|m| m.id == msg_id) {
-              m_rev.status = prev_status;
-              m_rev.content = prev_content;
-              m_rev.error = prev_error;
-            }
+        (prev_status, prev_content, prev_error)
+      };
+      if let Err(err) = self.persist_now().await {
+        let mut locked = self.inner.lock().await;
+        if let Some(g_rev) = locked
+          .store
+          .group_chats
+          .iter_mut()
+          .find(|g| g.id == group_id)
+        {
+          if let Some(m_rev) = g_rev.messages.iter_mut().find(|m| m.id == msg_id) {
+            m_rev.status = prev_status;
+            m_rev.content = prev_content;
+            m_rev.error = prev_error;
           }
-          return Err(err);
         }
+        return Err(err);
+      }
+      let snap = {
+        let locked = self.inner.lock().await;
         Self::snapshot_from_locked(&locked)
       };
 
@@ -2469,7 +2654,7 @@ impl SessionManager {
   }
 
   #[cfg(desktop)]
-  pub(super) async fn resolve_member_transport_locked(
+  pub(super) fn resolve_member_transport_locked(
     locked: &InnerState,
     key: &AccountKey,
   ) -> Result<ResolvedMemberTransport, String> {
@@ -3036,7 +3221,7 @@ impl SessionManager {
   ) -> Option<String> {
     let transport = {
       let locked = self.inner.lock().await;
-      Self::resolve_member_transport_locked(&locked, member_key).await
+      Self::resolve_member_transport_locked(&locked, member_key)
     };
 
     let transport = match transport {
