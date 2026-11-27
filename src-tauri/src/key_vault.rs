@@ -668,6 +668,8 @@ mod tests {
         err.contains("Secret Service"),
         "Linux 报错应提示 Secret Service: {err}"
       );
+      #[cfg(target_os = "macos")]
+      assert!(err.contains("钥匙串"), "macOS 报错应提示钥匙串: {err}");
       assert!(!vault.fallback_path().exists(), "报错时不得写回退文件");
     }
     #[cfg(target_os = "windows")]
